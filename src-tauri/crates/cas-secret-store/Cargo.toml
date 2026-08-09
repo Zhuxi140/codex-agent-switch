@@ -1,0 +1,10 @@
+[package]
+name = "cas-secret-store"
+version = "0.1.0"
+edition = "2024"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security_Credentials",
+] }

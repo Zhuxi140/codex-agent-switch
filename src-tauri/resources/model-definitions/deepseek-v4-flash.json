@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "providerPresetId": "deepseek",
+  "modelId": "deepseek-v4-flash",
+  "displayName": "DeepSeek V4 Flash",
+  "lifecycle": "ACTIVE",
+  "contextWindow": 1000000,
+  "maxOutputTokens": null,
+  "reasoning": {
+    "status": "SUPPORTED",
+    "supportedEfforts": ["low", "medium", "high"],
+    "defaultEffort": "high"
+  },
+  "compatibility": {
+    "level": "NATIVE",
+    "source": "OFFICIAL_CODEX",
+    "minimumCodexVersion": "0.144.0",
+    "verifiedAt": null
+  },
+  "capabilities": [
+    {
+      "name": "RESPONSES_API",
+      "status": "SUPPORTED",
+      "source": "OFFICIAL_PROVIDER",
+      "confidence": "AUTHORITATIVE"
+    },
+    {
+      "name": "TOOL_CALLING",
+      "status": "SUPPORTED",
+      "source": "OFFICIAL_PROVIDER",
+      "confidence": "AUTHORITATIVE"
+    },
+    {
+      "name": "PARALLEL_TOOL_CALLING",
+      "status": "SUPPORTED",
+      "source": "CAS_BUILT_IN",
+      "confidence": "INFERRED"
+    },
+    {
+      "name": "REASONING",
+      "status": "SUPPORTED",
+      "source": "OFFICIAL_PROVIDER",
+      "confidence": "AUTHORITATIVE"
+    },
+    {
+      "name": "CODEX_MULTI_AGENT",
+      "status": "SUPPORTED",
+      "source": "RUNTIME_PROBE",
+      "confidence": "VERIFIED"
+    }
+  ]
+}

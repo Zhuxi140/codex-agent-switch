@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.npm-cache/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.env
+.env.*
+*.db
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.pfx
