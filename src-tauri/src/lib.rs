@@ -21,16 +21,19 @@ use codex_environment::CodexEnvironment;
 use configuration::{
     ConfigurationApplyPreview, ConfigurationApplyRequest, ConfigurationApplyResponse,
     ConfigurationService, ConfigurationStatus, ConfigurationStatusResponse, DiagnosticsResponse,
-    DiagnosticsRunRequest, SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest,
-    SnapshotListResponse, SnapshotRestoreRequest, SnapshotRestoreResponse,
+    DiagnosticsRunRequest, RuntimeModeResponse, RuntimeModeSwitchRequest, SnapshotDetailResponse,
+    SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse, SnapshotRestoreRequest,
+    SnapshotRestoreResponse,
 };
 use model::{
-    ModelAddRequest, ModelDetailResponse, ModelGetRequest, ModelListRequest, ModelService,
-    ModelSummary,
+    ModelAddRequest, ModelConnectionTestResponse, ModelDeleteRequest, ModelDetailResponse,
+    ModelGetRequest, ModelListRequest, ModelService, ModelSetEnabledRequest, ModelSummary,
+    ModelTestConnectionRequest, ModelUpdateRequest,
 };
 use provider::{
-    ApiError, ProviderCreateRequest, ProviderDetailResponse, ProviderGetRequest,
-    ProviderListRequest, ProviderService, ProviderSummary,
+    ApiError, DeleteResult, ProviderCreateRequest, ProviderDeleteRequest, ProviderDetailResponse,
+    ProviderGetRequest, ProviderListRequest, ProviderService, ProviderSummary,
+    ProviderUpdateRequest,
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 
@@ -63,7 +66,7 @@ fn app_get_bootstrap(
 
     Ok(AppBootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        ipc_schema_version: 1,
+        ipc_schema_version: 2,
         codex: CodexEnvironmentSummary {
             detected: environment.detected,
             version: environment.version,
@@ -129,6 +132,22 @@ fn provider_get(
 }
 
 #[tauri::command]
+fn provider_update(
+    state: tauri::State<'_, ProviderService>,
+    request: ProviderUpdateRequest,
+) -> Result<ProviderDetailResponse, ApiError> {
+    state.update(request)
+}
+
+#[tauri::command]
+fn provider_delete(
+    state: tauri::State<'_, ProviderService>,
+    request: ProviderDeleteRequest,
+) -> Result<DeleteResult, ApiError> {
+    state.delete(request)
+}
+
+#[tauri::command]
 fn model_list(
     state: tauri::State<'_, ModelService>,
     request: ModelListRequest,
@@ -150,6 +169,38 @@ fn model_add(
     request: ModelAddRequest,
 ) -> Result<ModelDetailResponse, ApiError> {
     state.add(request)
+}
+
+#[tauri::command]
+fn model_update(
+    state: tauri::State<'_, ModelService>,
+    request: ModelUpdateRequest,
+) -> Result<ModelDetailResponse, ApiError> {
+    state.update(request)
+}
+
+#[tauri::command]
+fn model_set_enabled(
+    state: tauri::State<'_, ModelService>,
+    request: ModelSetEnabledRequest,
+) -> Result<ModelDetailResponse, ApiError> {
+    state.set_enabled(request)
+}
+
+#[tauri::command]
+fn model_delete(
+    state: tauri::State<'_, ModelService>,
+    request: ModelDeleteRequest,
+) -> Result<(), ApiError> {
+    state.delete(request)
+}
+
+#[tauri::command]
+async fn model_test_connection(
+    state: tauri::State<'_, ModelService>,
+    request: ModelTestConnectionRequest,
+) -> Result<ModelConnectionTestResponse, ApiError> {
+    state.test_connection(request).await
 }
 
 #[tauri::command]
@@ -244,6 +295,21 @@ fn configuration_apply(
 }
 
 #[tauri::command]
+fn runtime_mode_get(
+    state: tauri::State<'_, ConfigurationService>,
+) -> Result<RuntimeModeResponse, ApiError> {
+    state.runtime_mode().map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn runtime_mode_switch(
+    state: tauri::State<'_, ConfigurationService>,
+    request: RuntimeModeSwitchRequest,
+) -> Result<ConfigurationApplyResponse, ApiError> {
+    state.switch_runtime_mode(request).map_err(ApiError::from)
+}
+
+#[tauri::command]
 fn snapshot_list(
     state: tauri::State<'_, ConfigurationService>,
     request: SnapshotListRequest,
@@ -278,6 +344,7 @@ fn diagnostics_run(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let data_home = app.path().app_local_data_dir()?;
             let database_path = data_home.join("cas.db");
@@ -296,9 +363,15 @@ pub fn run() {
             provider_create,
             provider_list,
             provider_get,
+            provider_update,
+            provider_delete,
             model_list,
             model_get,
             model_add,
+            model_update,
+            model_set_enabled,
+            model_delete,
+            model_test_connection,
             agent_preset_list,
             agent_list,
             agent_get,
@@ -311,6 +384,8 @@ pub fn run() {
             configuration_get_status,
             configuration_preview_apply,
             configuration_apply,
+            runtime_mode_get,
+            runtime_mode_switch,
             snapshot_list,
             snapshot_get,
             snapshot_restore,

@@ -14,8 +14,10 @@ use uuid::Uuid;
 
 use crate::codex_config::{
     AgentProjection, ConfigError, ProviderProjection, document_semantic,
-    provider_projection_semantic, remove_provider_projection, render_agent_projection,
-    restore_provider_projection, upsert_provider_projection,
+    model_catalog_projection_semantic, provider_projection_semantic,
+    remove_model_catalog_projection, remove_provider_projection, render_agent_projection,
+    restore_model_catalog_projection, restore_provider_projection, upsert_model_catalog_projection,
+    upsert_provider_projection,
 };
 use crate::codex_environment::{self, CodexEnvironment};
 use crate::persistence::{PersistenceError, open_database};
@@ -28,7 +30,9 @@ use crate::settings::{
 const PROVIDER_RESOURCE: &str = "CODEX_PROVIDER";
 const AGENT_RESOURCE: &str = "CODEX_AGENT";
 const MODEL_CATALOG_RESOURCE: &str = "MODEL_CATALOG";
+const SESSION_CATALOG_RESOURCE: &str = "CODEX_SESSION_CATALOG";
 const CONFIG_RELATIVE_PATH: &str = "config.toml";
+const MIXED_CATALOG_KEY: &str = "mixed-v1";
 const ACTIVE_TRANSACTION_STATUSES: [&str; 5] = [
     "PREPARED",
     "WRITING",
@@ -206,6 +210,58 @@ impl ConfigurationService {
         })
     }
 
+    pub(crate) fn runtime_mode(&self) -> Result<RuntimeModeResponse, ConfigurationError> {
+        let connection = open_database(&self.database_path)?;
+        Ok(RuntimeModeResponse {
+            active_agent_id: load_active_agent_id(&connection)?,
+        })
+    }
+
+    pub(crate) fn switch_runtime_mode(
+        &self,
+        request: RuntimeModeSwitchRequest,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
+        let active_agent_id = request
+            .active_agent_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map(|_| value)
+                    .map_err(|_| ConfigurationError::ActiveAgentNotFound)
+            })
+            .transpose()?;
+        let _operation = self.operation_guard()?;
+        let _process_lock = ProcessLock::acquire(&self.data_home.join("configuration.lock"))?;
+        let connection = open_database(&self.database_path)?;
+        ensure_no_active_transaction(&connection)?;
+        if let Some(agent_id) = active_agent_id.as_deref() {
+            let exists = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1 AND managed = 1)",
+                [agent_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                return Err(ConfigurationError::ActiveAgentNotFound);
+            }
+        }
+        let previous_agent_id = load_active_agent_id(&connection)?;
+        set_active_agent_id(&connection, active_agent_id.as_deref())?;
+        drop(connection);
+
+        let result = self.apply_without_locks(ConfigurationApplyRequest::default());
+        let succeeded = matches!(
+            result.as_ref().map(|response| response.status),
+            Ok(ApplyStatus::Applied | ApplyStatus::NoChanges)
+        );
+        if !succeeded {
+            set_active_agent_id(
+                &open_database(&self.database_path)?,
+                previous_agent_id.as_deref(),
+            )?;
+        }
+        result
+    }
+
     pub(crate) fn apply(
         &self,
         request: ConfigurationApplyRequest,
@@ -213,15 +269,16 @@ impl ConfigurationService {
         let _operation = self.operation_guard()?;
         let _process_lock = ProcessLock::acquire(&self.data_home.join("configuration.lock"))?;
         let connection = open_database(&self.database_path)?;
-        if let Some(transaction) = active_transaction(&connection)? {
-            return Err(if transaction.status == "RECOVERY_REQUIRED" {
-                ConfigurationError::RecoveryRequired
-            } else {
-                ConfigurationError::OperationInProgress
-            });
-        }
+        ensure_no_active_transaction(&connection)?;
         drop(connection);
 
+        self.apply_without_locks(request)
+    }
+
+    fn apply_without_locks(
+        &self,
+        request: ConfigurationApplyRequest,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
         let preview = self.compile_preview()?;
         if request
             .expected_desired_state_hash
@@ -483,7 +540,7 @@ impl ConfigurationService {
         } else {
             DiagnosticIssue::warning(
                 "CODEX_CONFIG_NOT_WRITABLE",
-                "config.toml 不存在或当前不可写；Apply 会在执行时再次验证。",
+                "config.toml 不存在或当前不可写；配置同步时会再次验证。",
             )
         });
         Ok(DiagnosticSection::new(
@@ -529,7 +586,11 @@ impl ConfigurationService {
                 .as_slice(),
         );
 
-        if !helper_path.is_absolute() || !helper_path.is_file() {
+        if desired
+            .iter()
+            .any(|resource| resource.resource_type == PROVIDER_RESOURCE)
+            && (!helper_path.is_absolute() || !helper_path.is_file())
+        {
             blockers.push(DiagnosticIssue::error(
                 "HELPER_NOT_AVAILABLE",
                 "未找到可执行的 cas-helper 绝对路径。",
@@ -572,6 +633,14 @@ impl ConfigurationService {
                     .provider_projection()
                     .expect("provider resource must have a projection");
                 final_config = upsert_provider_projection(&final_config, &provider)?;
+            } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
+                final_config = upsert_model_catalog_projection(
+                    &final_config,
+                    resource
+                        .session_catalog_path
+                        .as_deref()
+                        .expect("session catalog resource must have a path"),
+                )?;
             }
         }
 
@@ -580,7 +649,10 @@ impl ConfigurationService {
             .filter(|resource| {
                 matches!(
                     resource.resource_type.as_str(),
-                    PROVIDER_RESOURCE | AGENT_RESOURCE | MODEL_CATALOG_RESOURCE
+                    PROVIDER_RESOURCE
+                        | AGENT_RESOURCE
+                        | MODEL_CATALOG_RESOURCE
+                        | SESSION_CATALOG_RESOURCE
                 ) && !desired_keys
                     .contains(&(resource.resource_type.clone(), resource.logical_key.clone()))
             })
@@ -599,7 +671,7 @@ impl ConfigurationService {
                 warnings.push(DiagnosticIssue::warning(
                     "MANAGED_RESOURCE_DRIFT",
                     format!(
-                        "{} 已在磁盘上缺失，Apply 将清理其所有权记录。",
+                        "{} 已在磁盘上缺失，配置同步时将清理其所有权记录。",
                         resource.logical_key
                     ),
                 ));
@@ -614,6 +686,8 @@ impl ConfigurationService {
                 && let Some(provider_id) = resource.logical_key.strip_prefix("model_providers.")
             {
                 final_config = remove_provider_projection(&final_config, provider_id)?;
+            } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
+                final_config = remove_model_catalog_projection(&final_config)?;
             }
         }
 
@@ -641,11 +715,11 @@ impl ConfigurationService {
         let changed_files = preview
             .changes
             .iter()
-            .filter(|change| change.resource_type != PROVIDER_RESOURCE)
+            .filter(|change| !is_config_fragment(&change.resource_type))
             .map(|change| (change.resource_type.as_str(), change.logical_key.as_str()))
             .collect::<HashSet<_>>();
         for resource in &preview.desired {
-            if resource.resource_type != PROVIDER_RESOURCE
+            if !is_config_fragment(&resource.resource_type)
                 && changed_files.contains(&(
                     resource.resource_type.as_str(),
                     resource.logical_key.as_str(),
@@ -658,7 +732,7 @@ impl ConfigurationService {
             }
         }
         for resource in &preview.stale_managed {
-            if resource.resource_type != PROVIDER_RESOURCE
+            if !is_config_fragment(&resource.resource_type)
                 && let Some(relative_path) = managed_relative_path(resource)
             {
                 let path = safe_join(&preview.codex_home, relative_path)?;
@@ -951,6 +1025,18 @@ pub(crate) struct ConfigurationApplyRequest {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeModeResponse {
+    active_agent_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeModeSwitchRequest {
+    active_agent_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ConfigurationApplyResponse {
     transaction_id: String,
     status: ApplyStatus,
@@ -975,7 +1061,7 @@ impl ConfigurationApplyResponse {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ApplyStatus {
     Applied,
@@ -1076,6 +1162,7 @@ struct DesiredResource {
     origin_entity_type: String,
     origin_entity_id: String,
     provider: Option<OwnedProviderProjection>,
+    session_catalog_path: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -1153,6 +1240,7 @@ pub(crate) enum ConfigurationError {
     OperationInProgress,
     RecoveryRequired,
     DesiredStateChanged,
+    ActiveAgentNotFound,
     ApplyBlocked(String),
     SnapshotNotFound,
     InvalidSnapshotCursor,
@@ -1168,6 +1256,7 @@ impl ConfigurationError {
             Self::OperationInProgress => "OPERATION_IN_PROGRESS",
             Self::RecoveryRequired => "APPLY_RECOVERY_REQUIRED",
             Self::DesiredStateChanged => "DESIRED_STATE_CHANGED",
+            Self::ActiveAgentNotFound => "AGENT_NOT_FOUND",
             Self::ApplyBlocked(_) => "APPLY_CONFLICT",
             Self::SnapshotNotFound => "SNAPSHOT_NOT_FOUND",
             Self::InvalidSnapshotCursor => "VALIDATION_ERROR",
@@ -1187,7 +1276,8 @@ impl ConfigurationError {
             Self::OperationInProgress => "已有配置操作正在执行。",
             Self::RecoveryRequired => "检测到未完成事务，需要先恢复。",
             Self::DesiredStateChanged => "预览后 Desired State 已变化，请重新预览。",
-            Self::ApplyBlocked(_) => "磁盘配置存在冲突，Apply 已中止。",
+            Self::ActiveAgentNotFound => "要启用的 Agent 不存在或不由 CAS 管理。",
+            Self::ApplyBlocked(_) => "磁盘配置存在冲突，配置同步已中止。",
             Self::SnapshotNotFound => "Snapshot 不存在。",
             Self::InvalidSnapshotCursor => "Snapshot cursor 无效。",
             Self::InvalidSnapshot => "Snapshot 内容无效。",
@@ -1275,196 +1365,200 @@ fn load_desired_resources(
     codex_home: &Path,
     helper_path: &Path,
 ) -> Result<DesiredLoad, ConfigurationError> {
+    let Some(active_agent_id) = load_active_agent_id(connection)? else {
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
+    };
     let helper_command = helper_path.to_string_lossy().into_owned();
     let mut resources = Vec::new();
     let mut blockers = Vec::new();
     let mut warnings = Vec::new();
-    let mut provider_ids = HashMap::<String, String>::new();
-
-    let mut provider_statement = connection.prepare(
-        "SELECT p.id, p.provider_key, p.name, p.base_url, c.id
-         FROM providers p
-         LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
-         WHERE p.enabled = 1
-         ORDER BY p.provider_key",
-    )?;
-    let providers = provider_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (entity_id, provider_key, name, base_url, credential_id) in providers {
-        let codex_provider_id = format!("cas_{provider_key}");
-        provider_ids.insert(entity_id.clone(), codex_provider_id.clone());
-        if credential_id.is_none() {
-            blockers.push(DiagnosticIssue::error(
-                "PROVIDER_CREDENTIAL_MISSING",
-                format!("Provider {name} 缺少 Credential。"),
-            ));
-        }
-        let projection = OwnedProviderProjection {
-            provider_id: codex_provider_id.clone(),
-            display_name: name.clone(),
-            base_url,
-            helper_command: helper_command.clone(),
-            credential_id: credential_id.unwrap_or_default(),
-        };
-        let rendered = upsert_provider_projection("", &projection.borrowed())?;
-        let semantic = provider_projection_semantic(&rendered, &codex_provider_id)?
-            .ok_or(ConfigurationError::InvalidSnapshot)?;
-        resources.push(DesiredResource {
-            resource_type: PROVIDER_RESOURCE.to_owned(),
-            logical_key: format!("model_providers.{codex_provider_id}"),
-            relative_path: CONFIG_RELATIVE_PATH.to_owned(),
-            target_path: codex_home.join(CONFIG_RELATIVE_PATH),
-            semantic,
-            content: None,
-            summary: format!("配置 Responses Provider {name}"),
-            origin_entity_type: "PROVIDER".to_owned(),
-            origin_entity_id: entity_id,
-            provider: Some(projection),
-        });
-    }
-
-    let (catalog_resources, catalog_paths) = load_model_catalog_resources(connection, codex_home)?;
-    resources.extend(catalog_resources);
-
-    let mut agent_statement = connection.prepare(
-        "SELECT a.id, a.agent_key, a.description, a.instruction, a.sandbox_policy,
-                a.reasoning_policy, m.model_id, m.enabled, m.compatibility_level,
-                p.id, p.name, p.enabled, b.id
+    let agent = connection
+        .query_row(
+            "SELECT a.id, a.agent_key, a.description, a.instruction, a.sandbox_policy,
+                a.reasoning_policy, a.managed, b.id, m.id, m.model_id, m.enabled,
+                m.compatibility_level, p.id, p.provider_key, p.name, p.base_url,
+                p.enabled, c.id
          FROM agents a
          LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
          LEFT JOIN models m ON m.id = b.model_id
          LEFT JOIN providers p ON p.id = m.provider_id
-         WHERE a.enabled = 1 AND a.managed = 1
-         ORDER BY a.agent_key",
-    )?;
-    let agents = agent_statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<i64>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    for (
+         LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
+         WHERE a.id = ?1",
+            [&active_agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, Option<i64>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or(ConfigurationError::ActiveAgentNotFound)?;
+    let (
         entity_id,
         agent_key,
         description,
         instruction,
         sandbox_policy,
         reasoning_policy,
+        managed,
+        binding_id,
+        model_entity_id,
         model_id,
         model_enabled,
         compatibility,
         provider_entity_id,
+        provider_key,
         provider_name,
+        base_url,
         provider_enabled,
-        binding_id,
-    ) in agents
-    {
-        if binding_id.is_none() || model_id.is_none() || provider_entity_id.is_none() {
-            blockers.push(DiagnosticIssue::error(
-                "AGENT_MODEL_BINDING_MISSING",
-                format!("Agent {agent_key} 尚未绑定 Model。"),
-            ));
-            continue;
-        }
-        if model_enabled != Some(1) || provider_enabled != Some(1) {
-            blockers.push(DiagnosticIssue::error(
-                "AGENT_MODEL_UNAVAILABLE",
-                format!("Agent {agent_key} 绑定的 Model 或 Provider 未启用。"),
-            ));
-            continue;
-        }
-        let compatibility = compatibility.unwrap_or_else(|| "UNKNOWN".to_owned());
-        if matches!(compatibility.as_str(), "UNSUPPORTED" | "GATEWAY_REQUIRED") {
-            blockers.push(DiagnosticIssue::error(
-                "AGENT_MODEL_INCOMPATIBLE",
-                format!("Agent {agent_key} 绑定的 Model 与当前接入方式不兼容。"),
-            ));
-            continue;
-        }
-        if compatibility == "UNKNOWN" {
-            warnings.push(DiagnosticIssue::warning(
-                "AGENT_MODEL_COMPATIBILITY_UNKNOWN",
-                format!("Agent {agent_key} 的 Model 兼容性尚未验证。"),
-            ));
-        }
-        let provider_entity_id = provider_entity_id.expect("checked above");
-        let Some(provider_id) = provider_ids.get(&provider_entity_id) else {
-            blockers.push(DiagnosticIssue::error(
-                "AGENT_PROVIDER_UNAVAILABLE",
-                format!(
-                    "Agent {agent_key} 的 Provider {} 不可用。",
-                    provider_name.unwrap_or_default()
-                ),
-            ));
-            continue;
-        };
-        let Some(model_catalog_path) = catalog_paths.get(&provider_entity_id) else {
-            blockers.push(DiagnosticIssue::error(
-                "MODEL_CATALOG_UNAVAILABLE",
-                format!("Agent {agent_key} 缺少 Codex Runtime Model Catalog。"),
-            ));
-            continue;
-        };
-        let reasoning_effort = match reasoning_policy.as_str() {
-            "LOW" => Some("low"),
-            "MEDIUM" => Some("medium"),
-            "HIGH" => Some("high"),
-            _ => None,
-        };
-        let sandbox_mode = match sandbox_policy.as_str() {
-            "READ_ONLY" => Some("read-only"),
-            "WORKSPACE_WRITE" => Some("workspace-write"),
-            "DANGER_FULL_ACCESS" => Some("danger-full-access"),
-            _ => None,
-        };
-        let projection = AgentProjection {
-            agent_key: &agent_key,
-            description: &description,
-            model_id: model_id.as_deref().expect("checked above"),
-            provider_id,
-            reasoning_effort,
-            sandbox_mode,
-            developer_instructions: &instruction,
-            model_catalog_path: Some(model_catalog_path),
-        };
-        let content = render_agent_projection(&projection)?;
-        let semantic = document_semantic(&content)?;
-        let relative_path = format!("agents/cas-{agent_key}.toml");
-        resources.push(DesiredResource {
-            resource_type: AGENT_RESOURCE.to_owned(),
-            logical_key: agent_key.clone(),
-            target_path: safe_join(codex_home, &relative_path)?,
-            relative_path,
-            semantic,
-            content: Some(content),
-            summary: format!("配置 Agent {agent_key} 的 Model 绑定"),
-            origin_entity_type: "AGENT".to_owned(),
-            origin_entity_id: entity_id,
-            provider: None,
-        });
+        credential_id,
+    ) = agent;
+    if !managed {
+        return Err(ConfigurationError::ActiveAgentNotFound);
     }
+    if binding_id.is_none()
+        || model_entity_id.is_none()
+        || model_id.is_none()
+        || provider_entity_id.is_none()
+    {
+        blockers.push(DiagnosticIssue::error(
+            "AGENT_MODEL_BINDING_MISSING",
+            format!("Agent {agent_key} 尚未绑定 Model。"),
+        ));
+        return Ok((resources, blockers, warnings));
+    }
+    if model_enabled != Some(1) || provider_enabled != Some(1) {
+        blockers.push(DiagnosticIssue::error(
+            "AGENT_MODEL_UNAVAILABLE",
+            format!("Agent {agent_key} 绑定的 Model 或 Provider 未启用。"),
+        ));
+        return Ok((resources, blockers, warnings));
+    }
+    let compatibility = compatibility.unwrap_or_else(|| "UNKNOWN".to_owned());
+    if matches!(compatibility.as_str(), "UNSUPPORTED" | "GATEWAY_REQUIRED") {
+        blockers.push(DiagnosticIssue::error(
+            "AGENT_MODEL_INCOMPATIBLE",
+            format!("Agent {agent_key} 绑定的 Model 与当前接入方式不兼容。"),
+        ));
+        return Ok((resources, blockers, warnings));
+    }
+    if compatibility == "UNKNOWN" {
+        warnings.push(DiagnosticIssue::warning(
+            "AGENT_MODEL_COMPATIBILITY_UNKNOWN",
+            format!("Agent {agent_key} 的 Model 兼容性尚未验证。"),
+        ));
+    }
+
+    let provider_entity_id = provider_entity_id.expect("checked above");
+    let provider_key = provider_key.expect("provider exists when model is bound");
+    let provider_name = provider_name.expect("provider exists when model is bound");
+    let codex_provider_id = format!("cas_{provider_key}");
+    if credential_id.is_none() {
+        blockers.push(DiagnosticIssue::error(
+            "PROVIDER_CREDENTIAL_MISSING",
+            format!("Provider {provider_name} 缺少 Credential。"),
+        ));
+    }
+    let provider_projection = OwnedProviderProjection {
+        provider_id: codex_provider_id.clone(),
+        display_name: provider_name.clone(),
+        base_url: base_url.expect("provider exists when model is bound"),
+        helper_command,
+        credential_id: credential_id.unwrap_or_default(),
+    };
+    let rendered = upsert_provider_projection("", &provider_projection.borrowed())?;
+    let semantic = provider_projection_semantic(&rendered, &codex_provider_id)?
+        .ok_or(ConfigurationError::InvalidSnapshot)?;
+    resources.push(DesiredResource {
+        resource_type: PROVIDER_RESOURCE.to_owned(),
+        logical_key: format!("model_providers.{codex_provider_id}"),
+        relative_path: CONFIG_RELATIVE_PATH.to_owned(),
+        target_path: codex_home.join(CONFIG_RELATIVE_PATH),
+        semantic,
+        content: None,
+        summary: format!("配置 Responses Provider {provider_name}"),
+        origin_entity_type: "PROVIDER".to_owned(),
+        origin_entity_id: provider_entity_id.clone(),
+        provider: Some(provider_projection),
+        session_catalog_path: None,
+    });
+
+    let (catalog_resources, catalog_paths, catalog_models) =
+        load_model_catalog_resources(connection, codex_home, &entity_id)?;
+    resources.extend(catalog_resources);
+    match load_mixed_catalog_resources(codex_home, &catalog_models) {
+        Ok(mixed_resources) => {
+            resources.extend(mixed_resources);
+            warnings.push(DiagnosticIssue::warning(
+                "PRIMARY_SESSION_V1_COMPATIBILITY",
+                "使用子 Agent 模式时，Primary Session 将使用 CAS 生成的 V1 兼容 Catalog。",
+            ));
+        }
+        Err(issue) => blockers.push(issue),
+    }
+
+    let Some(model_catalog_path) = catalog_paths.get(&provider_entity_id) else {
+        blockers.push(DiagnosticIssue::error(
+            "MODEL_CATALOG_UNAVAILABLE",
+            format!("Agent {agent_key} 缺少 Codex Runtime Model Catalog。"),
+        ));
+        return Ok((resources, blockers, warnings));
+    };
+    let reasoning_effort = match reasoning_policy.as_str() {
+        "LOW" => Some("low"),
+        "MEDIUM" => Some("medium"),
+        "HIGH" => Some("high"),
+        _ => None,
+    };
+    let sandbox_mode = match sandbox_policy.as_str() {
+        "READ_ONLY" => Some("read-only"),
+        "WORKSPACE_WRITE" => Some("workspace-write"),
+        "DANGER_FULL_ACCESS" => Some("danger-full-access"),
+        _ => None,
+    };
+    let projection = AgentProjection {
+        agent_key: &agent_key,
+        description: &description,
+        model_id: model_id.as_deref().expect("checked above"),
+        provider_id: &codex_provider_id,
+        reasoning_effort,
+        sandbox_mode,
+        developer_instructions: &instruction,
+        model_catalog_path: Some(model_catalog_path),
+    };
+    let content = render_agent_projection(&projection)?;
+    let semantic = document_semantic(&content)?;
+    let relative_path = format!("agents/cas-{agent_key}.toml");
+    resources.push(DesiredResource {
+        resource_type: AGENT_RESOURCE.to_owned(),
+        logical_key: agent_key.clone(),
+        target_path: safe_join(codex_home, &relative_path)?,
+        relative_path,
+        semantic,
+        content: Some(content),
+        summary: format!("配置当前 Agent {agent_key}"),
+        origin_entity_type: "AGENT".to_owned(),
+        origin_entity_id: entity_id,
+        provider: None,
+        session_catalog_path: None,
+    });
 
     Ok((resources, blockers, warnings))
 }
@@ -1472,7 +1566,15 @@ fn load_desired_resources(
 fn load_model_catalog_resources(
     connection: &Connection,
     codex_home: &Path,
-) -> Result<(Vec<DesiredResource>, HashMap<String, PathBuf>), ConfigurationError> {
+    active_agent_id: &str,
+) -> Result<
+    (
+        Vec<DesiredResource>,
+        HashMap<String, PathBuf>,
+        Vec<serde_json::Value>,
+    ),
+    ConfigurationError,
+> {
     let mut statement = connection.prepare(
         "SELECT DISTINCT p.id, p.provider_key, m.id, m.model_id, m.display_name,
                 m.context_window, m.reasoning_supported, m.default_reasoning,
@@ -1492,11 +1594,11 @@ fn load_model_catalog_resources(
          JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
          JOIN models m ON m.id = b.model_id AND m.enabled = 1
          JOIN providers p ON p.id = m.provider_id AND p.enabled = 1
-         WHERE a.enabled = 1 AND a.managed = 1
+         WHERE a.id = ?1 AND a.managed = 1
          ORDER BY p.provider_key, m.model_id",
     )?;
     let rows = statement
-        .query_map([], |row| {
+        .query_map([active_agent_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1513,6 +1615,7 @@ fn load_model_catalog_resources(
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut catalogs = BTreeMap::<String, (String, Vec<serde_json::Value>)>::new();
+    let mut catalog_models = Vec::new();
     for (
         provider_entity_id,
         provider_key,
@@ -1537,6 +1640,7 @@ fn load_model_catalog_resources(
             supports_parallel_tools,
             supports_multi_agent,
         );
+        catalog_models.push(model.clone());
         catalogs
             .entry(provider_entity_id)
             .or_insert_with(|| (provider_key, Vec::new()))
@@ -1564,9 +1668,115 @@ fn load_model_catalog_resources(
             origin_entity_type: "PROVIDER".to_owned(),
             origin_entity_id: provider_entity_id,
             provider: None,
+            session_catalog_path: None,
         });
     }
-    Ok((resources, paths))
+    Ok((resources, paths, catalog_models))
+}
+
+fn load_mixed_catalog_resources(
+    codex_home: &Path,
+    catalog_models: &[serde_json::Value],
+) -> Result<Vec<DesiredResource>, DiagnosticIssue> {
+    let cache_path = codex_home.join("models_cache.json");
+    let cache = fs::read_to_string(&cache_path).map_err(|_| {
+        DiagnosticIssue::error(
+            "PRIMARY_MODEL_CATALOG_UNAVAILABLE",
+            "未找到 Codex models_cache.json，无法生成跨 Provider 兼容 Catalog。请先正常启动并登录一次 Codex。",
+        )
+    })?;
+    let cache = serde_json::from_str::<serde_json::Value>(&cache).map_err(|_| {
+        DiagnosticIssue::error(
+            "PRIMARY_MODEL_CATALOG_INVALID",
+            "Codex models_cache.json 无法解析，不能安全生成跨 Provider 兼容 Catalog。",
+        )
+    })?;
+    let upstream_models = cache
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            DiagnosticIssue::error(
+                "PRIMARY_MODEL_CATALOG_INVALID",
+                "Codex models_cache.json 缺少 models 数组。",
+            )
+        })?;
+
+    let mut models = Vec::new();
+    let mut slugs = HashSet::new();
+    for mut model in upstream_models.iter().cloned() {
+        let object = model.as_object_mut().ok_or_else(|| {
+            DiagnosticIssue::error(
+                "PRIMARY_MODEL_CATALOG_INVALID",
+                "Codex models_cache.json 包含无效 Model 条目。",
+            )
+        })?;
+        let slug = object
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                DiagnosticIssue::error(
+                    "PRIMARY_MODEL_CATALOG_INVALID",
+                    "Codex models_cache.json 的 Model 条目缺少 slug。",
+                )
+            })?
+            .to_owned();
+        object.insert("multi_agent_version".to_owned(), "v1".into());
+        object.remove("tool_mode");
+        object.insert("shell_type".to_owned(), "shell_command".into());
+        if slugs.insert(slug) {
+            models.push(model);
+        }
+    }
+    for model in catalog_models {
+        let Some(slug) = model.get("slug").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if slugs.insert(slug.to_owned()) {
+            models.push(model.clone());
+        }
+    }
+
+    let relative_path = format!("cas/model-catalogs/{MIXED_CATALOG_KEY}.json");
+    let target_path = codex_home.join(&relative_path);
+    let mut content = serde_json::to_string_pretty(&serde_json::json!({ "models": models }))
+        .expect("serializing JSON values cannot fail");
+    content.push('\n');
+    let semantic = serde_json::to_string(
+        &serde_json::from_str::<serde_json::Value>(&content)
+            .expect("generated model catalog must be valid JSON"),
+    )
+    .expect("serializing JSON values cannot fail");
+    let session_semantic = serde_json::to_string(&target_path.to_string_lossy().into_owned())
+        .expect("serializing a path string cannot fail");
+
+    Ok(vec![
+        DesiredResource {
+            resource_type: MODEL_CATALOG_RESOURCE.to_owned(),
+            logical_key: MIXED_CATALOG_KEY.to_owned(),
+            relative_path,
+            target_path: target_path.clone(),
+            semantic,
+            content: Some(content),
+            summary: "生成 Primary 与第三方 Subagent 共用的 V1 兼容 Catalog".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: MIXED_CATALOG_KEY.to_owned(),
+            provider: None,
+            session_catalog_path: None,
+        },
+        DesiredResource {
+            resource_type: SESSION_CATALOG_RESOURCE.to_owned(),
+            logical_key: "model_catalog_json".to_owned(),
+            relative_path: CONFIG_RELATIVE_PATH.to_owned(),
+            target_path: codex_home.join(CONFIG_RELATIVE_PATH),
+            semantic: session_semantic,
+            content: None,
+            summary: "让 Primary Session 加载跨 Provider V1 兼容 Catalog".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: MIXED_CATALOG_KEY.to_owned(),
+            provider: None,
+            session_catalog_path: Some(target_path),
+        },
+    ])
 }
 
 fn load_model_reasoning_efforts(
@@ -1702,6 +1912,9 @@ fn current_semantic(
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         return Ok(provider_projection_semantic(existing_config, provider_id)?);
     }
+    if resource.resource_type == SESSION_CATALOG_RESOURCE {
+        return Ok(model_catalog_projection_semantic(existing_config)?);
+    }
     if resource.target_path.is_file() {
         let content = fs::read_to_string(&resource.target_path)?;
         return Ok(Some(if resource.resource_type == MODEL_CATALOG_RESOURCE {
@@ -1725,6 +1938,9 @@ fn current_managed_semantic(
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         return Ok(provider_projection_semantic(existing_config, provider_id)?);
     }
+    if resource.resource_type == SESSION_CATALOG_RESOURCE {
+        return Ok(model_catalog_projection_semantic(existing_config)?);
+    }
     if matches!(
         resource.resource_type.as_str(),
         AGENT_RESOURCE | MODEL_CATALOG_RESOURCE
@@ -1743,6 +1959,10 @@ fn current_managed_semantic(
         }
     }
     Ok(None)
+}
+
+fn is_config_fragment(resource_type: &str) -> bool {
+    matches!(resource_type, PROVIDER_RESOURCE | SESSION_CATALOG_RESOURCE)
 }
 
 fn detect_conflict(
@@ -1767,7 +1987,10 @@ fn detect_conflict(
         }
         (Some(_), None) => warnings.push(DiagnosticIssue::warning(
             "MANAGED_RESOURCE_DRIFT",
-            format!("{} 已在磁盘上缺失，Apply 将重建它。", resource.logical_key),
+            format!(
+                "{} 已在磁盘上缺失，配置同步时将重建它。",
+                resource.logical_key
+            ),
         )),
         _ => {}
     }
@@ -1805,7 +2028,7 @@ fn commit_projection(
     let config_hash = hash_bytes(config_content.as_bytes());
     let transaction = connection.transaction()?;
     for resource in &preview.desired {
-        let content_hash = if resource.resource_type == PROVIDER_RESOURCE {
+        let content_hash = if is_config_fragment(&resource.resource_type) {
             config_hash.clone()
         } else {
             hash_bytes(resource.content.as_deref().unwrap_or_default().as_bytes())
@@ -1868,7 +2091,7 @@ fn upsert_managed_resource(
             resource.target_path.to_string_lossy(),
             semantic_hash,
             content_hash,
-            (resource.resource_type == PROVIDER_RESOURCE).then_some(semantic_hash),
+            is_config_fragment(&resource.resource_type).then_some(semantic_hash),
             resource.origin_entity_type,
             resource.origin_entity_id,
             timestamp
@@ -1948,6 +2171,36 @@ fn active_transaction(
         .optional()?)
 }
 
+fn ensure_no_active_transaction(connection: &Connection) -> Result<(), ConfigurationError> {
+    if let Some(transaction) = active_transaction(connection)? {
+        return Err(if transaction.status == "RECOVERY_REQUIRED" {
+            ConfigurationError::RecoveryRequired
+        } else {
+            ConfigurationError::OperationInProgress
+        });
+    }
+    Ok(())
+}
+
+fn load_active_agent_id(connection: &Connection) -> Result<Option<String>, ConfigurationError> {
+    Ok(connection.query_row(
+        "SELECT active_agent_id FROM configuration_state WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+fn set_active_agent_id(
+    connection: &Connection,
+    active_agent_id: Option<&str>,
+) -> Result<(), ConfigurationError> {
+    connection.execute(
+        "UPDATE configuration_state SET active_agent_id = ?1 WHERE id = 1",
+        [active_agent_id],
+    )?;
+    Ok(())
+}
+
 fn last_applied_at(connection: &Connection) -> Result<Option<String>, ConfigurationError> {
     Ok(connection.query_row(
         "SELECT last_applied_at FROM configuration_state WHERE id = 1",
@@ -2007,7 +2260,7 @@ fn diagnose_configuration(status: ConfigurationStatusResponse) -> DiagnosticSect
             }
             ConfigurationStatus::PendingChanges => DiagnosticIssue::warning(
                 "CONFIGURATION_PENDING_CHANGES",
-                "存在尚未 Apply 的 Desired State 变化。",
+                "存在尚未同步到 Codex 的 Desired State 变化。",
             ),
             ConfigurationStatus::Drift => {
                 DiagnosticIssue::warning("CONFIGURATION_DRIFT", "CAS 受管资源存在 Drift。")
@@ -2016,7 +2269,7 @@ fn diagnose_configuration(status: ConfigurationStatusResponse) -> DiagnosticSect
                 DiagnosticIssue::error("CONFIGURATION_CONFLICT", "CAS 受管资源存在冲突。")
             }
             ConfigurationStatus::RecoveryRequired => {
-                DiagnosticIssue::error("APPLY_RECOVERY_REQUIRED", "存在需要恢复的 Apply 事务。")
+                DiagnosticIssue::error("APPLY_RECOVERY_REQUIRED", "存在需要恢复的配置事务。")
             }
             ConfigurationStatus::Unavailable => {
                 DiagnosticIssue::error("CONFIGURATION_UNAVAILABLE", "配置状态不可用。")
@@ -2096,7 +2349,6 @@ fn diagnose_agents(connection: &Connection) -> Result<DiagnosticSection, Configu
          LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
          LEFT JOIN models m ON m.id = b.model_id
          LEFT JOIN providers p ON p.id = m.provider_id
-         WHERE a.enabled = 1
          ORDER BY a.agent_key",
     )?;
     let agents = statement
@@ -2134,7 +2386,7 @@ fn diagnose_agents(connection: &Connection) -> Result<DiagnosticSection, Configu
         ) {
             DiagnosticIssue::error(
                 "AGENT_MODEL_INCOMPATIBLE",
-                format!("Agent {agent_key} 的 Model 不可直接 Apply。"),
+                format!("Agent {agent_key} 的 Model 不可用于当前配置同步。"),
             )
         } else if compatibility.as_deref() == Some("UNKNOWN") {
             DiagnosticIssue::warning(
@@ -2243,7 +2495,7 @@ fn refresh_scope_management(
 
 fn managed_relative_path(resource: &ManagedResource) -> Option<String> {
     match resource.resource_type.as_str() {
-        PROVIDER_RESOURCE => Some(CONFIG_RELATIVE_PATH.to_owned()),
+        PROVIDER_RESOURCE | SESSION_CATALOG_RESOURCE => Some(CONFIG_RELATIVE_PATH.to_owned()),
         AGENT_RESOURCE => Some(format!("agents/cas-{}.toml", resource.logical_key)),
         MODEL_CATALOG_RESOURCE => Some(format!("cas/model-catalogs/{}.json", resource.logical_key)),
         _ => None,
@@ -2337,12 +2589,15 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
             })
             || !matches!(
                 resource.resource_type.as_str(),
-                PROVIDER_RESOURCE | AGENT_RESOURCE | MODEL_CATALOG_RESOURCE
+                PROVIDER_RESOURCE
+                    | AGENT_RESOURCE
+                    | MODEL_CATALOG_RESOURCE
+                    | SESSION_CATALOG_RESOURCE
             )
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }
-        if resource.resource_type == PROVIDER_RESOURCE
+        if is_config_fragment(&resource.resource_type)
             && resource.relative_path != CONFIG_RELATIVE_PATH
         {
             return Err(ConfigurationError::InvalidSnapshot);
@@ -2397,7 +2652,11 @@ fn restore_snapshot_projection(
                 .ok_or(ConfigurationError::InvalidSnapshot)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if !provider_ids.is_empty() {
+    let restore_session_catalog = manifest
+        .resources
+        .iter()
+        .any(|resource| resource.resource_type == SESSION_CATALOG_RESOURCE);
+    if !provider_ids.is_empty() || restore_session_catalog {
         let config_path = snapshot.codex_home.join(CONFIG_RELATIVE_PATH);
         reject_symlink(&config_path)?;
         let mut current = read_optional_utf8(&config_path)?;
@@ -2405,12 +2664,15 @@ fn restore_snapshot_projection(
         for provider_id in provider_ids {
             current = restore_provider_projection(&current, &backup, &provider_id)?;
         }
+        if restore_session_catalog {
+            current = restore_model_catalog_projection(&current, &backup)?;
+        }
         atomic_write(&config_path, current.as_bytes())?;
     }
     for resource in manifest
         .resources
         .iter()
-        .filter(|resource| resource.resource_type != PROVIDER_RESOURCE)
+        .filter(|resource| !is_config_fragment(&resource.resource_type))
     {
         let target = safe_join(&snapshot.codex_home, &resource.relative_path)?;
         reject_symlink(&target)?;
@@ -2448,6 +2710,23 @@ fn sync_managed_after_restore(
                     .strip_prefix("model_providers.")
                     .ok_or(ConfigurationError::InvalidSnapshot)?;
                 let Some(semantic) = provider_projection_semantic(&config, provider_id)? else {
+                    transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                    continue;
+                };
+                (
+                    semantic,
+                    hash_bytes(config.as_bytes()),
+                    snapshot
+                        .codex_home
+                        .join(CONFIG_RELATIVE_PATH)
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
+                let Some(semantic) = model_catalog_projection_semantic(&config)? else {
                     transaction.execute(
                     "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
                     params![resource.resource_type, resource.logical_key],
@@ -2504,7 +2783,7 @@ fn sync_managed_after_restore(
                 physical_location,
                 semantic_hash,
                 content_hash,
-                (resource.resource_type == PROVIDER_RESOURCE).then_some(&semantic_hash),
+                is_config_fragment(&resource.resource_type).then_some(&semantic_hash),
                 resource.origin_entity_type,
                 resource.origin_entity_id,
                 timestamp
@@ -2759,6 +3038,20 @@ mod tests {
             let data_home = root.join("data");
             let codex_home = root.join("codex");
             fs::create_dir_all(&codex_home).unwrap();
+            fs::write(
+                codex_home.join("models_cache.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "models": [{
+                        "slug": "gpt-5.6-sol",
+                        "display_name": "GPT-5.6 Sol",
+                        "shell_type": "shell_command",
+                        "tool_mode": "code_mode_only",
+                        "multi_agent_version": "v2"
+                    }]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
             let database = data_home.join("cas.db");
             let service =
                 ConfigurationService::for_test(database.clone(), data_home, codex_home.clone());
@@ -2788,7 +3081,7 @@ mod tests {
         .unwrap();
 
         let preview = context.service.preview_apply().unwrap();
-        assert_eq!(preview.changes.len(), 3);
+        assert_eq!(preview.changes.len(), 5);
         assert!(preview.blockers.is_empty());
         let result = context
             .service
@@ -2808,6 +3101,11 @@ mod tests {
             document["model_providers"]["cas_deepseek"]["wire_api"].as_str(),
             Some("responses")
         );
+        let mixed_catalog_path = context.codex_home.join("cas/model-catalogs/mixed-v1.json");
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            mixed_catalog_path.to_str()
+        );
         let agent =
             fs::read_to_string(context.codex_home.join("agents/cas-executor.toml")).unwrap();
         let agent = agent.parse::<DocumentMut>().unwrap();
@@ -2819,6 +3117,14 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&catalog_path).unwrap()).unwrap();
         assert_eq!(catalog["models"][0]["slug"], "deepseek-v4-flash");
         assert_eq!(catalog["models"][0]["multi_agent_version"], "v1");
+        let mixed_catalog: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&mixed_catalog_path).unwrap()).unwrap();
+        assert_eq!(mixed_catalog["models"].as_array().unwrap().len(), 2);
+        assert_eq!(mixed_catalog["models"][0]["slug"], "gpt-5.6-sol");
+        assert_eq!(mixed_catalog["models"][0]["multi_agent_version"], "v1");
+        assert_eq!(mixed_catalog["models"][0]["shell_type"], "shell_command");
+        assert!(mixed_catalog["models"][0].get("tool_mode").is_none());
+        assert_eq!(mixed_catalog["models"][1]["slug"], "deepseek-v4-flash");
 
         assert!(!context.service.preview_apply().unwrap().has_changes);
         let managed_count: i64 = open_database(&context.database)
@@ -2827,7 +3133,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(managed_count, 3);
+        assert_eq!(managed_count, 5);
     }
 
     #[test]
@@ -2852,6 +3158,37 @@ mod tests {
                 .blockers
                 .iter()
                 .any(|issue| issue.code == "MANAGED_RESOURCE_CONFLICT")
+        );
+    }
+
+    #[test]
+    fn existing_primary_catalog_is_not_overwritten() {
+        let context = TestContext::new();
+        fs::write(
+            context.codex_home.join(CONFIG_RELATIVE_PATH),
+            r#"model_catalog_json = "C:\\custom\\catalog.json"
+"#,
+        )
+        .unwrap();
+
+        let preview = context.service.preview_apply().unwrap();
+        assert!(preview.blockers.iter().any(|issue| {
+            issue.code == "RESOURCE_OWNERSHIP_CONFLICT"
+                && issue.message.contains("model_catalog_json")
+        }));
+    }
+
+    #[test]
+    fn missing_primary_catalog_blocks_cross_provider_apply() {
+        let context = TestContext::new();
+        fs::remove_file(context.codex_home.join("models_cache.json")).unwrap();
+
+        let preview = context.service.preview_apply().unwrap();
+        assert!(
+            preview
+                .blockers
+                .iter()
+                .any(|issue| issue.code == "PRIMARY_MODEL_CATALOG_UNAVAILABLE")
         );
     }
 
@@ -2894,11 +3231,18 @@ mod tests {
                 .as_table()
                 .is_some_and(|providers| !providers.contains_key("cas_deepseek"))
         );
+        assert!(restored.get("model_catalog_json").is_none());
         assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
         assert!(
             !context
                 .codex_home
                 .join("cas/model-catalogs/deepseek.json")
+                .exists()
+        );
+        assert!(
+            !context
+                .codex_home
+                .join("cas/model-catalogs/mixed-v1.json")
                 .exists()
         );
     }
@@ -2966,6 +3310,12 @@ mod tests {
                 .join("cas/model-catalogs/deepseek.json")
                 .exists()
         );
+        assert!(
+            !context
+                .codex_home
+                .join("cas/model-catalogs/mixed-v1.json")
+                .exists()
+        );
         let status: String = open_database(&context.database)
             .unwrap()
             .query_row(
@@ -2975,6 +3325,153 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "ROLLED_BACK");
+    }
+
+    #[test]
+    fn default_mode_removes_only_cas_owned_projection() {
+        let context = TestContext::new();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        fs::write(
+            &config_path,
+            "[agents]\nenabled = true\n[mcp_servers.example]\ncommand = \"keep-me\"\n",
+        )
+        .unwrap();
+        context
+            .service
+            .apply(ConfigurationApplyRequest::default())
+            .unwrap();
+
+        let switched = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_id: None,
+            })
+            .unwrap();
+
+        assert!(matches!(switched.status, ApplyStatus::Applied));
+        assert_eq!(
+            context.service.runtime_mode().unwrap().active_agent_id,
+            None
+        );
+        let config = fs::read_to_string(config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(config["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            config["mcp_servers"]["example"]["command"].as_str(),
+            Some("keep-me")
+        );
+        assert!(
+            config["model_providers"]
+                .as_table()
+                .is_some_and(|providers| !providers.contains_key("cas_deepseek"))
+        );
+        assert!(config.get("model_catalog_json").is_none());
+        assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
+    }
+
+    #[test]
+    fn switching_agent_projects_exactly_one_agent() {
+        let context = TestContext::new();
+        context
+            .service
+            .apply(ConfigurationApplyRequest::default())
+            .unwrap();
+        let connection = open_database(&context.database).unwrap();
+        let model_id: String = connection
+            .query_row("SELECT id FROM models LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        let reviewer_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (?1, 'reviewer', 'Reviewer', '审查实现', '只报告可验证问题。',
+                           'PRESET', 1, 'READ_ONLY', 'HIGH', 'CAS', 1, ?2, ?2)",
+                params![reviewer_id, "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_model_bindings (
+                    id, agent_id, model_id, enabled, priority, source, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 0, 'CAS', ?4, ?4)",
+                params![
+                    Uuid::new_v4().to_string(),
+                    reviewer_id,
+                    model_id,
+                    "2026-01-01T00:00:00Z"
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        let switched = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_id: Some(reviewer_id.clone()),
+            })
+            .unwrap();
+
+        assert!(matches!(switched.status, ApplyStatus::Applied));
+        assert_eq!(
+            context.service.runtime_mode().unwrap().active_agent_id,
+            Some(reviewer_id)
+        );
+        assert!(
+            context
+                .codex_home
+                .join("agents/cas-reviewer.toml")
+                .is_file()
+        );
+        assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
+        let managed_agents: i64 = open_database(&context.database)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM managed_resources WHERE resource_type = 'CODEX_AGENT'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(managed_agents, 1);
+    }
+
+    #[test]
+    fn failed_switch_restores_previous_runtime_selection() {
+        let context = TestContext::new();
+        let previous = context
+            .service
+            .runtime_mode()
+            .unwrap()
+            .active_agent_id
+            .unwrap();
+        let connection = open_database(&context.database).unwrap();
+        let incomplete_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (?1, 'incomplete', 'Incomplete', '尚未配置', '等待模型绑定。',
+                           'CUSTOM', 1, 'INHERIT', 'MODEL_DEFAULT', 'USER', 1, ?2, ?2)",
+                params![incomplete_id, "2026-01-01T00:00:00Z"],
+            )
+            .unwrap();
+        drop(connection);
+
+        let result = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_id: Some(incomplete_id),
+            });
+
+        assert!(matches!(result, Err(ConfigurationError::ApplyBlocked(_))));
+        assert_eq!(
+            context.service.runtime_mode().unwrap().active_agent_id,
+            Some(previous)
+        );
     }
 
     fn seed_desired_state(database_path: &Path) {
@@ -3054,6 +3551,12 @@ mod tests {
                     model_id,
                     "2026-01-01T00:00:00Z"
                 ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE configuration_state SET active_agent_id = ?1 WHERE id = 1",
+                [&agent_id],
             )
             .unwrap();
     }

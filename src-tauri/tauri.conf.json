@@ -13,10 +13,12 @@
     "windows": [
       {
         "title": "Codex Agent Switch",
-        "width": 1100,
-        "height": 720,
-        "minWidth": 760,
-        "minHeight": 560
+        "width": 1000,
+        "height": 650,
+        "minWidth": 900,
+        "minHeight": 600,
+        "center": true,
+        "resizable": true
       }
     ]
   },

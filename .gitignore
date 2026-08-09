@@ -12,3 +12,7 @@ src-tauri/gen/
 *.pem
 *.key
 *.pfx
+
+# Internal development documentation stays local.
+*.md
+!/README.md

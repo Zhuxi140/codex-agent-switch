@@ -137,6 +137,45 @@ pub(crate) fn provider_projection_semantic(
         .map(canonical_item))
 }
 
+pub(crate) fn upsert_model_catalog_projection(
+    existing: &str,
+    path: &Path,
+) -> Result<String, ConfigError> {
+    let mut document = existing.parse::<DocumentMut>()?;
+    document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+    Ok(render_document(document, existing))
+}
+
+pub(crate) fn remove_model_catalog_projection(existing: &str) -> Result<String, ConfigError> {
+    let mut document = existing.parse::<DocumentMut>()?;
+    document.remove("model_catalog_json");
+    Ok(render_document(document, existing))
+}
+
+pub(crate) fn restore_model_catalog_projection(
+    current: &str,
+    snapshot: &str,
+) -> Result<String, ConfigError> {
+    let snapshot = snapshot.parse::<DocumentMut>()?;
+    let mut document = current.parse::<DocumentMut>()?;
+    match snapshot.get("model_catalog_json").cloned() {
+        Some(item) => {
+            document.insert("model_catalog_json", item);
+        }
+        None => {
+            document.remove("model_catalog_json");
+        }
+    }
+    Ok(render_document(document, current))
+}
+
+pub(crate) fn model_catalog_projection_semantic(
+    document: &str,
+) -> Result<Option<String>, ConfigError> {
+    let document = document.parse::<DocumentMut>()?;
+    Ok(document.get("model_catalog_json").map(canonical_item))
+}
+
 pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<String, ConfigError> {
     let mut document = DocumentMut::new();
     document["name"] = value(agent.agent_key);

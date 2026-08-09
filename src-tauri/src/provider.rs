@@ -59,6 +59,30 @@ impl ProviderService {
             .map_err(ApiError::from)
     }
 
+    pub(crate) fn update(
+        &self,
+        request: ProviderUpdateRequest,
+    ) -> Result<ProviderDetailResponse, ApiError> {
+        let pending = PendingProviderUpdate::try_from(request)?;
+        let mut repository = self.repository()?;
+        let current = repository.find_by_id(&pending.id)?;
+        if !pending.confirm_origin_change
+            && Url::parse(&current.base_url).map(|url| url.origin())
+                != Url::parse(&pending.base_url).map(|url| url.origin())
+        {
+            return Err(ProviderServiceError::OriginConfirmationRequired.into());
+        }
+        repository
+            .update(&pending)
+            .map(ProviderDetailResponse::from)
+            .map_err(ApiError::from)
+    }
+
+    pub(crate) fn delete(&self, request: ProviderDeleteRequest) -> Result<DeleteResult, ApiError> {
+        self.delete_with_secret_store(request, delete_secret)
+            .map_err(ApiError::from)
+    }
+
     fn create_with_secret_store<Store, Delete>(
         &self,
         request: ProviderCreateRequest,
@@ -103,6 +127,25 @@ impl ProviderService {
                 Ok(false) | Err(_) => Err(ProviderServiceError::OrphanSecret(credential_id)),
             },
         }
+    }
+
+    fn delete_with_secret_store<Delete>(
+        &self,
+        request: ProviderDeleteRequest,
+        delete: Delete,
+    ) -> Result<DeleteResult, ProviderServiceError>
+    where
+        Delete: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
+    {
+        let id = parse_uuid(&request.provider_id, "providerId")?;
+        let credential_id = self.repository()?.prepare_delete(&id)?;
+        if let Some(credential_id) = credential_id {
+            let credential_id = CredentialId::from_str(&credential_id)
+                .map_err(|_| ProviderServiceError::Unexpected)?;
+            delete(credential_id).map_err(ProviderServiceError::SecretStore)?;
+        }
+        self.repository()?.delete(&id)?;
+        Ok(DeleteResult { deleted: true })
     }
 
     fn repository(
@@ -236,6 +279,69 @@ impl SqliteProviderRepository {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(RepositoryError::from)
     }
+
+    fn update(
+        &mut self,
+        provider: &PendingProviderUpdate,
+    ) -> Result<ProviderRecord, RepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE providers
+             SET name = ?2, base_url = ?3, enabled = ?4,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![
+                provider.id,
+                provider.name,
+                provider.base_url,
+                provider.enabled
+            ],
+        )?;
+        if changed == 0 {
+            return Err(RepositoryError::NotFound);
+        }
+        self.find_by_id(&provider.id)
+    }
+
+    fn prepare_delete(&self, id: &str) -> Result<Option<String>, RepositoryError> {
+        let (credential_id, model_count) = self
+            .connection
+            .query_row(
+                "SELECT c.id, (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id)
+                 FROM providers p
+                 LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
+                 WHERE p.id = ?1",
+                [id],
+                |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, u32>(1)?)),
+            )
+            .optional()?
+            .ok_or(RepositoryError::NotFound)?;
+        if model_count > 0 {
+            return Err(RepositoryError::InUse);
+        }
+        Ok(credential_id)
+    }
+
+    fn delete(&mut self, id: &str) -> Result<(), RepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let model_count = transaction
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM models WHERE provider_id = p.id)
+                 FROM providers p WHERE p.id = ?1",
+                [id],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()?
+            .ok_or(RepositoryError::NotFound)?;
+        if model_count > 0 {
+            return Err(RepositoryError::InUse);
+        }
+        transaction.execute("DELETE FROM credentials WHERE provider_id = ?1", [id])?;
+        transaction.execute("DELETE FROM providers WHERE id = ?1", [id])?;
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 fn map_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
@@ -308,6 +414,30 @@ impl TryFrom<ProviderCreateRequest> for PendingProvider {
             preset_id: request.preset_id,
             secret,
             initial_models,
+        })
+    }
+}
+
+struct PendingProviderUpdate {
+    id: String,
+    name: String,
+    base_url: String,
+    enabled: bool,
+    confirm_origin_change: bool,
+}
+
+impl TryFrom<ProviderUpdateRequest> for PendingProviderUpdate {
+    type Error = ProviderServiceError;
+
+    fn try_from(request: ProviderUpdateRequest) -> Result<Self, Self::Error> {
+        validate_text(&request.name, "name", 120)?;
+        validate_base_url(&request.base_url)?;
+        Ok(Self {
+            id: parse_uuid(&request.provider_id, "providerId")?,
+            name: request.name.trim().to_owned(),
+            base_url: request.base_url,
+            enabled: request.enabled,
+            confirm_origin_change: request.confirm_origin_change,
         })
     }
 }
@@ -404,6 +534,29 @@ pub(crate) struct ProviderCreateRequest {
     enabled: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderUpdateRequest {
+    provider_id: String,
+    name: String,
+    base_url: String,
+    enabled: bool,
+    #[serde(default)]
+    confirm_origin_change: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderDeleteRequest {
+    provider_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DeleteResult {
+    deleted: bool,
+}
+
 #[derive(Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum ProviderProtocol {
@@ -442,6 +595,7 @@ pub(crate) struct ProviderSummary {
     provider_key: String,
     name: String,
     provider_type: String,
+    preset_id: Option<String>,
     protocol: String,
     enabled: bool,
     status: ProviderStatus,
@@ -461,6 +615,7 @@ impl From<ProviderRecord> for ProviderSummary {
             provider_key: provider.provider_key,
             name: provider.name,
             provider_type: provider.provider_type,
+            preset_id: provider.preset_id,
             protocol: provider.protocol,
             enabled: provider.enabled,
             status,
@@ -591,11 +746,26 @@ impl From<ProviderServiceError> for ApiError {
                 "当前阶段仅支持 OS_SECRET_HELPER。",
                 false,
             ),
+            ProviderServiceError::OriginConfirmationRequired => (
+                "PROVIDER_ORIGIN_CONFIRMATION_REQUIRED",
+                "Provider Endpoint Origin 已变化，需要明确确认。",
+                false,
+            ),
             ProviderServiceError::Repository(RepositoryError::NotFound) => {
                 ("PROVIDER_NOT_FOUND", "Provider 不存在。", false)
             }
+            ProviderServiceError::Repository(RepositoryError::InUse) => (
+                "PROVIDER_IN_USE",
+                "Provider 仍被 Model 引用，请先删除相关 Model。",
+                false,
+            ),
             ProviderServiceError::Repository(RepositoryError::Conflict) => {
-                ("PROVIDER_KEY_CONFLICT", "Provider Key 已存在。", false)
+                details = Some(BTreeMap::from([("field", "providerKey".to_owned())]));
+                (
+                    "PROVIDER_KEY_CONFLICT",
+                    "您已有一个使用相同 Provider Key 的 Provider 配置。",
+                    false,
+                )
             }
             ProviderServiceError::Repository(RepositoryError::Persistence(
                 PersistenceError::SchemaTooNew,
@@ -610,9 +780,11 @@ impl From<ProviderServiceError> for ApiError {
             ProviderServiceError::SecretStore(SecretStoreError::Unavailable) => {
                 ("SECRET_STORE_UNAVAILABLE", "系统凭据库当前不可用。", true)
             }
-            ProviderServiceError::SecretStore(_) => {
-                ("SECRET_STORE_WRITE_FAILED", "Credential 保存失败。", true)
-            }
+            ProviderServiceError::SecretStore(_) => (
+                "SECRET_STORE_OPERATION_FAILED",
+                "Credential 操作失败。",
+                true,
+            ),
             ProviderServiceError::OrphanSecret(id) => {
                 details = Some(BTreeMap::from([("credentialId", id.to_string())]));
                 (
@@ -643,6 +815,7 @@ impl From<RepositoryError> for ApiError {
 pub(crate) enum ProviderServiceError {
     InvalidField(&'static str),
     UnsupportedAuthStrategy,
+    OriginConfirmationRequired,
     SecretStore(SecretStoreError),
     OrphanSecret(CredentialId),
     Repository(RepositoryError),
@@ -655,6 +828,9 @@ impl fmt::Display for ProviderServiceError {
         match self {
             Self::InvalidField(field) => write!(formatter, "invalid provider field: {field}"),
             Self::UnsupportedAuthStrategy => formatter.write_str("unsupported auth strategy"),
+            Self::OriginConfirmationRequired => {
+                formatter.write_str("provider origin confirmation required")
+            }
             Self::SecretStore(_) => formatter.write_str("secret store operation failed"),
             Self::OrphanSecret(_) => formatter.write_str("orphan secret cleanup required"),
             Self::Repository(error) => write!(formatter, "provider repository failed: {error}"),
@@ -683,6 +859,7 @@ impl From<RepositoryError> for ProviderServiceError {
 #[derive(Debug)]
 pub(crate) enum RepositoryError {
     NotFound,
+    InUse,
     Conflict,
     Persistence(PersistenceError),
     Sqlite(rusqlite::Error),
@@ -692,6 +869,7 @@ impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound => formatter.write_str("not found"),
+            Self::InUse => formatter.write_str("provider in use"),
             Self::Conflict => formatter.write_str("constraint conflict"),
             Self::Persistence(error) => write!(formatter, "persistence failed: {error}"),
             Self::Sqlite(_) => formatter.write_str("sqlite operation failed"),
@@ -767,9 +945,19 @@ mod tests {
             },
         );
         assert!(matches!(
-            result,
+            &result,
             Err(ProviderServiceError::Repository(RepositoryError::Conflict))
         ));
+        let api_error = ApiError::from(result.err().unwrap());
+        assert_eq!(api_error.code(), "PROVIDER_KEY_CONFLICT");
+        assert_eq!(
+            api_error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("field"))
+                .map(String::as_str),
+            Some("providerKey")
+        );
         assert!(deleted.get());
         assert_eq!(
             service
@@ -833,6 +1021,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(provider.model_count, 1);
+        let providers = service.list(ProviderListRequest::default()).unwrap();
+        assert_eq!(providers[0].preset_id.as_deref(), Some("deepseek"));
         let count = service
             .repository()
             .unwrap()
@@ -844,5 +1034,71 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn provider_update_requires_confirmation_for_origin_change() {
+        let service = ProviderService::in_memory();
+        let provider = service
+            .create_with_secret_store(request("provider-one"), |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+        let update = |confirm_origin_change| ProviderUpdateRequest {
+            provider_id: provider.id.clone(),
+            name: "Updated Provider".to_owned(),
+            base_url: "https://other.example.com/v1".to_owned(),
+            enabled: false,
+            confirm_origin_change,
+        };
+
+        let error = match service.update(update(false)) {
+            Ok(_) => panic!("origin change without confirmation must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), "PROVIDER_ORIGIN_CONFIRMATION_REQUIRED");
+
+        let updated = service.update(update(true)).unwrap();
+        assert_eq!(updated.name, "Updated Provider");
+        assert_eq!(updated.base_url, "https://other.example.com/v1");
+        assert!(!updated.enabled);
+    }
+
+    #[test]
+    fn provider_delete_cleans_secret_and_refuses_models() {
+        let service = ProviderService::in_memory();
+        let provider = service
+            .create_with_secret_store(request("provider-one"), |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+        let deleted = Cell::new(false);
+        let result = service.delete_with_secret_store(
+            ProviderDeleteRequest {
+                provider_id: provider.id.clone(),
+            },
+            |_| {
+                deleted.set(true);
+                Ok(true)
+            },
+        );
+        assert!(result.is_ok());
+        assert!(deleted.get());
+        assert!(matches!(
+            service.repository().unwrap().find_by_id(&provider.id),
+            Err(RepositoryError::NotFound)
+        ));
+
+        let mut preset = request("deepseek");
+        preset.preset_id = Some("deepseek".to_owned());
+        let provider = service
+            .create_with_secret_store(preset, |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+        let result = service.delete_with_secret_store(
+            ProviderDeleteRequest {
+                provider_id: provider.id,
+            },
+            |_| panic!("in-use provider must not delete its secret"),
+        );
+        assert!(matches!(
+            result,
+            Err(ProviderServiceError::Repository(RepositoryError::InUse))
+        ));
     }
 }

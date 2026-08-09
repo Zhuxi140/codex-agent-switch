@@ -42,6 +42,7 @@ export interface SettingsResponse {
   autoBackupEnabled: boolean;
   updateChannel: string;
   customCodexHome: string | null;
+  customFontFamily: string | null;
 }
 
 export interface SettingsUpdateRequest {
@@ -49,6 +50,7 @@ export interface SettingsUpdateRequest {
   autoBackupEnabled?: boolean;
   updateChannel?: string;
   customCodexHome?: string | null;
+  customFontFamily?: string | null;
 }
 
 export type ConfigurationStatus =
@@ -104,21 +106,6 @@ export interface ConfigurationStatusResponse {
   issues: DiagnosticIssue[];
 }
 
-export interface ConfigurationChange {
-  operation: "CREATE" | "UPDATE" | "DELETE";
-  resourceType: "CODEX_PROVIDER" | "CODEX_AGENT" | "MODEL_CATALOG";
-  logicalKey: string;
-  summary: string;
-}
-
-export interface ConfigurationApplyPreview {
-  desiredStateHash: string;
-  changes: ConfigurationChange[];
-  blockers: DiagnosticIssue[];
-  warnings: DiagnosticIssue[];
-  hasChanges: boolean;
-}
-
 export interface ConfigurationApplyResponse {
   transactionId: string;
   status: "APPLIED" | "NO_CHANGES" | "FAILED_ROLLED_BACK" | "RECOVERY_REQUIRED";
@@ -127,6 +114,10 @@ export interface ConfigurationApplyResponse {
   changedResourceCount: number;
   restartRecommended: boolean;
   warnings: DiagnosticIssue[];
+}
+
+export interface RuntimeModeResponse {
+  activeAgentId: string | null;
 }
 
 export interface SnapshotSummary {
@@ -155,15 +146,15 @@ export function getConfigurationStatus(): Promise<ConfigurationStatusResponse> {
   return invoke<ConfigurationStatusResponse>("configuration_get_status");
 }
 
-export function previewConfigurationApply(): Promise<ConfigurationApplyPreview> {
-  return invoke<ConfigurationApplyPreview>("configuration_preview_apply");
+export function getRuntimeMode(): Promise<RuntimeModeResponse> {
+  return invoke<RuntimeModeResponse>("runtime_mode_get");
 }
 
-export function applyConfiguration(
-  expectedDesiredStateHash: string | null,
+export function switchRuntimeMode(
+  activeAgentId: string | null,
 ): Promise<ConfigurationApplyResponse> {
-  return invoke<ConfigurationApplyResponse>("configuration_apply", {
-    request: { expectedDesiredStateHash },
+  return invoke<ConfigurationApplyResponse>("runtime_mode_switch", {
+    request: { activeAgentId },
   });
 }
 
@@ -184,6 +175,7 @@ export interface ProviderSummary {
   providerKey: string;
   name: string;
   providerType: "PRESET" | "CUSTOM";
+  presetId: string | null;
   protocol: ProviderProtocol;
   enabled: boolean;
   status: ProviderStatus;
@@ -222,6 +214,18 @@ export interface ProviderCreateRequest {
   enabled: boolean;
 }
 
+export interface ProviderUpdateRequest {
+  providerId: string;
+  name: string;
+  baseUrl: string;
+  enabled: boolean;
+  confirmOriginChange?: boolean;
+}
+
+export interface DeleteResult {
+  deleted: boolean;
+}
+
 export interface ProviderListRequest {
   search?: string | null;
   enabled?: boolean | null;
@@ -239,6 +243,16 @@ export function listProviders(request: ProviderListRequest = {}): Promise<Provid
 
 export function getProvider(providerId: string): Promise<ProviderDetailResponse> {
   return invoke<ProviderDetailResponse>("provider_get", { request: { providerId } });
+}
+
+export function updateProvider(
+  request: ProviderUpdateRequest,
+): Promise<ProviderDetailResponse> {
+  return invoke<ProviderDetailResponse>("provider_update", { request });
+}
+
+export function deleteProvider(providerId: string): Promise<DeleteResult> {
+  return invoke<DeleteResult>("provider_delete", { request: { providerId } });
 }
 
 export type CompatibilityLevel =
@@ -260,6 +274,9 @@ export interface ModelSummary {
   lifecycle: ModelLifecycle;
   compatibility: CompatibilityLevel;
   contextWindow: number | null;
+  lastTestStatus: ModelConnectionTestStatus | null;
+  lastTestedAt: string | null;
+  lastTestLatencyMs: number | null;
 }
 
 export interface ModelListRequest {
@@ -273,6 +290,7 @@ export interface ModelAddRequest {
   providerId: string;
   modelId: string;
   displayName?: string | null;
+  contextWindow?: number | null;
 }
 
 export interface ModelDetailResponse {
@@ -306,6 +324,23 @@ export interface ModelDetailResponse {
   updatedAt: string;
 }
 
+export type ModelConnectionTestStatus =
+  | "SUCCESS"
+  | "CREDENTIAL_MISSING"
+  | "AUTH_FAILED"
+  | "MODEL_NOT_FOUND"
+  | "RATE_LIMITED"
+  | "PROTOCOL_ERROR"
+  | "UNREACHABLE"
+  | "SERVER_ERROR";
+
+export interface ModelConnectionTestResponse {
+  status: ModelConnectionTestStatus;
+  latencyMs: number | null;
+  providerRequestId: string | null;
+  message: string;
+}
+
 export function listModels(request: ModelListRequest = {}): Promise<ModelSummary[]> {
   return invoke<ModelSummary[]>("model_list", { request });
 }
@@ -318,6 +353,22 @@ export function addModel(request: ModelAddRequest): Promise<ModelDetailResponse>
   return invoke<ModelDetailResponse>("model_add", { request });
 }
 
+export function updateModel(modelId: string, displayName: string): Promise<ModelDetailResponse> {
+  return invoke<ModelDetailResponse>("model_update", { request: { modelId, displayName } });
+}
+
+export function setModelEnabled(modelId: string, enabled: boolean): Promise<ModelDetailResponse> {
+  return invoke<ModelDetailResponse>("model_set_enabled", { request: { modelId, enabled } });
+}
+
+export function deleteModel(modelId: string): Promise<void> {
+  return invoke<void>("model_delete", { request: { modelId } });
+}
+
+export function testModelConnection(modelId: string): Promise<ModelConnectionTestResponse> {
+  return invoke<ModelConnectionTestResponse>("model_test_connection", { request: { modelId } });
+}
+
 export type SandboxPolicy =
   | "READ_ONLY"
   | "WORKSPACE_WRITE"
@@ -328,7 +379,6 @@ export type ReasoningPolicy = "INHERIT" | "LOW" | "MEDIUM" | "HIGH" | "MODEL_DEF
 
 export type AgentAvailability =
   | "READY"
-  | "DISABLED"
   | "MODEL_MISSING"
   | "PROVIDER_UNAVAILABLE"
   | "INCOMPATIBLE_MODEL"
@@ -431,10 +481,6 @@ export function createAgent(request: AgentCreateRequest): Promise<AgentDetailRes
 
 export function updateAgent(request: AgentUpdateRequest): Promise<AgentDetailResponse> {
   return invoke<AgentDetailResponse>("agent_update", { request });
-}
-
-export function setAgentEnabled(agentId: string, enabled: boolean): Promise<AgentDetailResponse> {
-  return invoke<AgentDetailResponse>("agent_set_enabled", { request: { agentId, enabled } });
 }
 
 export function setAgentModelBinding(agentId: string, modelId: string): Promise<void> {

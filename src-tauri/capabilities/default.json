@@ -2,6 +2,22 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "主窗口基础权限",
-  "windows": ["main"],
-  "permissions": ["core:default"]
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [
+        { "url": "https://api-docs.deepseek.com/zh-cn/guides/responses_api" },
+        { "url": "https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api?mode=pure" },
+        { "url": "https://cloud.tencent.com.cn/document/product/1823/133813" },
+        { "url": "https://mimo.mi.com/docs/zh-CN/api/chat/responses" },
+        { "url": "https://docs.volcengine.com/docs/6492/2241837?lang=zh" },
+        { "url": "https://docs.infercom.ai/en/features/responses-api" },
+        { "url": "https://platform.minimax.io/docs/api-reference/responses-create" }
+      ]
+    }
+  ]
 }

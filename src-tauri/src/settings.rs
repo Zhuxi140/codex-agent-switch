@@ -25,6 +25,7 @@ pub(crate) struct SettingsResponse {
     pub(crate) auto_backup_enabled: bool,
     pub(crate) update_channel: String,
     pub(crate) custom_codex_home: Option<String>,
+    pub(crate) custom_font_family: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,6 +36,8 @@ pub(crate) struct SettingsUpdateRequest {
     update_channel: Option<String>,
     #[serde(default)]
     custom_codex_home: NullableStringUpdate,
+    #[serde(default)]
+    custom_font_family: NullableStringUpdate,
 }
 
 #[derive(Debug, Default)]
@@ -79,6 +82,11 @@ pub(crate) fn update_settings(
         NullableStringUpdate::Null => Some(None),
         NullableStringUpdate::Value(value) => Some(Some(validate_codex_home(&value)?)),
     };
+    let custom_font_family = match request.custom_font_family {
+        NullableStringUpdate::Missing => None,
+        NullableStringUpdate::Null => Some(None),
+        NullableStringUpdate::Value(value) => Some(Some(validate_font_family(&value)?)),
+    };
 
     let mut connection = open_database(database_path)?;
     let transaction = connection.transaction()?;
@@ -102,6 +110,19 @@ pub(crate) fn update_settings(
             None => {
                 transaction.execute(
                     "DELETE FROM application_settings WHERE setting_key = 'custom_codex_home'",
+                    [],
+                )?;
+            }
+        }
+    }
+    if let Some(value) = custom_font_family {
+        match value {
+            Some(font_family) => {
+                upsert_setting(&transaction, "custom_font_family", &font_family, "STRING")?
+            }
+            None => {
+                transaction.execute(
+                    "DELETE FROM application_settings WHERE setting_key = 'custom_font_family'",
                     [],
                 )?;
             }
@@ -132,6 +153,7 @@ fn read_settings(connection: &Connection) -> Result<SettingsResponse, SettingsEr
         auto_backup_enabled: true,
         update_channel: DEFAULT_UPDATE_CHANNEL.to_owned(),
         custom_codex_home: None,
+        custom_font_family: None,
     };
     let mut statement = connection.prepare(
         "SELECT setting_key, setting_value FROM application_settings ORDER BY setting_key",
@@ -156,6 +178,7 @@ fn read_settings(connection: &Connection) -> Result<SettingsResponse, SettingsEr
                 response.update_channel = value.ok_or(SettingsError::InvalidStoredValue)?;
             }
             "custom_codex_home" => response.custom_codex_home = value,
+            "custom_font_family" => response.custom_font_family = value,
             _ => {}
         }
     }
@@ -189,6 +212,19 @@ fn validate_codex_home(value: &str) -> Result<String, SettingsError> {
         return Err(SettingsError::InvalidField("customCodexHome"));
     }
     Ok(path.to_string_lossy().into_owned())
+}
+
+fn validate_font_family(value: &str) -> Result<String, SettingsError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || value.chars().any(|character| {
+            character.is_control() || matches!(character, '"' | '\\' | ';' | '{' | '}')
+        })
+    {
+        return Err(SettingsError::InvalidField("customFontFamily"));
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_update_channel(value: &str) -> Result<&str, SettingsError> {
@@ -318,11 +354,13 @@ mod tests {
                 custom_codex_home: NullableStringUpdate::Value(
                     codex_home.to_string_lossy().into_owned(),
                 ),
+                custom_font_family: NullableStringUpdate::Value("Segoe UI".to_owned()),
             },
         )
         .unwrap();
         assert_eq!(updated.appearance, Appearance::Dark);
         assert_eq!(updated.custom_codex_home.as_deref(), codex_home.to_str());
+        assert_eq!(updated.custom_font_family.as_deref(), Some("Segoe UI"));
 
         let cleared = update_settings(
             &database,
@@ -331,10 +369,12 @@ mod tests {
                 auto_backup_enabled: None,
                 update_channel: None,
                 custom_codex_home: NullableStringUpdate::Null,
+                custom_font_family: NullableStringUpdate::Null,
             },
         )
         .unwrap();
         assert_eq!(cleared.custom_codex_home, None);
+        assert_eq!(cleared.custom_font_family, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -350,6 +390,7 @@ mod tests {
                 auto_backup_enabled: Some(false),
                 update_channel: None,
                 custom_codex_home: NullableStringUpdate::Missing,
+                custom_font_family: NullableStringUpdate::Missing,
             },
         )
         .unwrap_err();

@@ -289,6 +289,14 @@ impl SqliteAgentRepository {
     }
 
     fn delete(&mut self, id: &str) -> Result<(), AgentRepositoryError> {
+        let active = self.connection.query_row(
+            "SELECT active_agent_id = ?1 FROM configuration_state WHERE id = 1",
+            [id],
+            |row| row.get::<_, Option<bool>>(0),
+        )?;
+        if active == Some(true) {
+            return Err(AgentRepositoryError::Active);
+        }
         ensure_changed(
             self.connection
                 .execute("DELETE FROM agents WHERE id = ?1", [id])?,
@@ -657,9 +665,6 @@ fn missing_model_compatibility() -> AgentBindingCompatibility {
 }
 
 fn availability(agent: &AgentRecord) -> AgentAvailability {
-    if !agent.enabled {
-        return AgentAvailability::Disabled;
-    }
     let Some(model) = &agent.model else {
         return AgentAvailability::ModelMissing;
     };
@@ -1149,7 +1154,6 @@ impl From<AgentRecord> for AgentBindingResponse {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum AgentAvailability {
     Ready,
-    Disabled,
     ModelMissing,
     ProviderUnavailable,
     IncompatibleModel,
@@ -1227,6 +1231,7 @@ pub(crate) enum AgentRepositoryError {
     NotFound,
     ModelNotFound,
     IncompatibleModel,
+    Active,
     Conflict,
     Persistence(PersistenceError),
     Sqlite(rusqlite::Error),
@@ -1238,6 +1243,7 @@ impl fmt::Display for AgentRepositoryError {
             Self::NotFound => formatter.write_str("agent not found"),
             Self::ModelNotFound => formatter.write_str("model not found"),
             Self::IncompatibleModel => formatter.write_str("model incompatible"),
+            Self::Active => formatter.write_str("agent is active"),
             Self::Conflict => formatter.write_str("agent key conflict"),
             Self::Persistence(error) => write!(formatter, "persistence failed: {error}"),
             Self::Sqlite(_) => formatter.write_str("sqlite operation failed"),
@@ -1294,7 +1300,13 @@ impl From<AgentServiceError> for ApiError {
             AgentServiceError::Repository(AgentRepositoryError::IncompatibleModel) => {
                 ("MODEL_INCOMPATIBLE", "Model 与 Agent 明确不兼容。", false)
             }
+            AgentServiceError::Repository(AgentRepositoryError::Active) => (
+                "AGENT_ACTIVE",
+                "当前正在使用该 Agent，请先在概览切换运行模式。",
+                false,
+            ),
             AgentServiceError::Repository(AgentRepositoryError::Conflict) => {
+                details = Some(BTreeMap::from([("field", "agentKey".to_owned())]));
                 ("AGENT_NAME_CONFLICT", "Agent Key 已存在。", false)
             }
             AgentServiceError::Repository(AgentRepositoryError::Persistence(
@@ -1444,5 +1456,24 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn active_agent_cannot_be_deleted() {
+        let service = AgentService::in_memory();
+        let agent = service.create(request(Some("executor"), None)).unwrap();
+        let mut repository = service.repository().unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE configuration_state SET active_agent_id = ?1 WHERE id = 1",
+                [&agent.id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            repository.delete(&agent.id),
+            Err(AgentRepositoryError::Active)
+        ));
     }
 }
