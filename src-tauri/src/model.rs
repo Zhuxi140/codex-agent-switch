@@ -232,12 +232,17 @@ impl SqliteModelRepository {
              ORDER BY p.name COLLATE NOCASE, m.display_name COLLATE NOCASE, m.id",
             model_select()
         ))?;
-        let rows = statement.query_map(
-            params![search, provider_id, enabled, compatibility],
-            map_model,
-        )?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(ModelRepositoryError::from)
+        let mut models = statement
+            .query_map(
+                params![search, provider_id, enabled, compatibility],
+                map_model,
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for model in &mut models {
+            model.reasoning_efforts = self.reasoning_efforts(&model.id)?;
+        }
+        Ok(models)
     }
 
     fn update(&mut self, model: &PendingModelUpdate) -> Result<ModelRecord, ModelRepositoryError> {
@@ -367,7 +372,7 @@ fn model_select() -> &'static str {
             m.lifecycle, m.compatibility_level, m.context_window, m.max_output_tokens,
             m.reasoning_supported, m.default_reasoning, m.compatibility_source,
             m.minimum_codex_version, m.compatibility_verified_at, m.created_at, m.updated_at,
-            m.last_test_status, m.last_tested_at, m.last_test_latency_ms
+            m.last_test_status, m.last_tested_at, m.last_test_latency_ms, m.source
      FROM models m
      JOIN providers p ON p.id = m.provider_id"
 }
@@ -394,6 +399,7 @@ fn map_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         last_test_status: row.get(17)?,
         last_tested_at: row.get(18)?,
         last_test_latency_ms: row.get(19)?,
+        source: row.get(20)?,
         reasoning_efforts: Vec::new(),
         capabilities: Vec::new(),
     })
@@ -738,6 +744,7 @@ struct ModelRecord {
     last_test_status: Option<String>,
     last_tested_at: Option<String>,
     last_test_latency_ms: Option<i64>,
+    source: String,
     capabilities: Vec<CapabilityRecord>,
     created_at: String,
     updated_at: String,
@@ -960,6 +967,10 @@ pub(crate) struct ModelSummary {
     lifecycle: String,
     compatibility: String,
     context_window: Option<i64>,
+    source: String,
+    reasoning_status: &'static str,
+    supported_reasoning_efforts: Vec<String>,
+    default_reasoning_effort: Option<String>,
     last_test_status: Option<String>,
     last_tested_at: Option<String>,
     last_test_latency_ms: Option<i64>,
@@ -967,6 +978,11 @@ pub(crate) struct ModelSummary {
 
 impl From<ModelRecord> for ModelSummary {
     fn from(model: ModelRecord) -> Self {
+        let reasoning_status = match model.reasoning_supported {
+            Some(true) => "SUPPORTED",
+            Some(false) => "UNSUPPORTED",
+            None => "UNKNOWN",
+        };
         Self {
             id: model.id,
             provider_id: model.provider_id,
@@ -977,6 +993,10 @@ impl From<ModelRecord> for ModelSummary {
             lifecycle: model.lifecycle,
             compatibility: model.compatibility_level,
             context_window: model.context_window,
+            source: model.source,
+            reasoning_status,
+            supported_reasoning_efforts: model.reasoning_efforts,
+            default_reasoning_effort: model.default_reasoning,
             last_test_status: model.last_test_status,
             last_tested_at: model.last_tested_at,
             last_test_latency_ms: model.last_test_latency_ms,
@@ -1356,6 +1376,31 @@ mod tests {
             initial_models_for_preset("unknown"),
             Err(CatalogError::UnknownPreset)
         ));
+    }
+
+    #[test]
+    fn model_list_exposes_preset_reasoning_limits() {
+        let service = ModelService::in_memory();
+        let provider_id = insert_provider(&service);
+        let model = initial_models_for_preset("deepseek").unwrap().remove(0);
+        {
+            let mut repository = service.repository().unwrap();
+            let transaction = repository.connection.transaction().unwrap();
+            insert_preset_model(&transaction, &provider_id, &model, "2026-01-01T00:00:00Z")
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        let listed = service.list(ModelListRequest::default()).unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "PRESET");
+        assert_eq!(listed[0].reasoning_status, "SUPPORTED");
+        assert_eq!(
+            listed[0].supported_reasoning_efforts,
+            ["low", "medium", "high"]
+        );
+        assert_eq!(listed[0].default_reasoning_effort.as_deref(), Some("high"));
     }
 
     #[test]

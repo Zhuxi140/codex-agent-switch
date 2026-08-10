@@ -3,12 +3,14 @@ import { createPortal } from "react-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
+  addProjectExclusion,
   addModel,
   createAgent,
   createProvider,
   deleteAgent,
   deleteModel,
   deleteProvider,
+  deleteProjectExclusion,
   getAgent,
   getAppBootstrap,
   getCodexEnvironment,
@@ -20,12 +22,11 @@ import {
   listAgents,
   listModels,
   listProviders,
+  listProjectExclusions,
   listSnapshots,
   redetectCodex,
-  removeAgentModelBinding,
   restoreSnapshot,
   runDiagnostics,
-  setAgentModelBinding,
   setModelEnabled,
   testModelConnection,
   switchRuntimeMode,
@@ -42,9 +43,11 @@ import {
   type ConfigurationStatusResponse,
   type DiagnosticsResponse,
   type ModelSummary,
+  type OrchestrationPhase,
   type ProviderCreateRequest,
   type ProviderDetailResponse,
   type ProviderSummary,
+  type ProjectExclusion,
   type ReasoningPolicy,
   type RuntimeModeResponse,
   type SandboxPolicy,
@@ -74,6 +77,9 @@ export function App() {
 
   useEffect(() => {
     getAppBootstrap().then(setBootstrap).catch((reason: unknown) => {
+      setError(errorMessage(reason));
+    });
+    getCodexEnvironment().then(setEnvironment).catch((reason: unknown) => {
       setError(errorMessage(reason));
     });
     getSettings()
@@ -177,6 +183,7 @@ export function App() {
         ) : page === "settings" ? (
           <SettingsPage
             onAppearanceChange={setAppearance}
+            onEnvironmentChange={setEnvironment}
             onFontFamilyChange={setCustomFontFamily}
           />
         ) : (
@@ -204,30 +211,52 @@ function OverviewPage({
   const [runtimeMode, setRuntimeMode] = useState<RuntimeModeResponse | null>(null);
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [selectedMode, setSelectedMode] = useState<"DEFAULT" | "SUBAGENT">("DEFAULT");
-  const [selectedAgentId, setSelectedAgentId] = useState("");
+  const [selectedAgentsByRole, setSelectedAgentsByRole] = useState<Record<string, string>>({});
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [operation, setOperation] = useState<"switch" | "restore" | null>(null);
+  const [refreshingMode, setRefreshingMode] = useState(false);
   const [configurationError, setConfigurationError] = useState<string | null>(null);
   const [configurationSuccess, setConfigurationSuccess] = useState<string | null>(null);
 
   const reloadConfiguration = useCallback(async () => {
-    const [status, mode, agentList, history] = await Promise.all([
-      getConfigurationStatus(),
-      getRuntimeMode(),
-      listAgents(),
-      listSnapshots(6),
+    const [statusResult, modeResult, agentsResult, historyResult] = await Promise.allSettled([
+      withTimeout(getConfigurationStatus(), "读取配置状态"),
+      withTimeout(getRuntimeMode(), "读取运行模式"),
+      withTimeout(listAgents(), "读取 Agent"),
+      withTimeout(listSnapshots(6), "读取 Snapshot"),
     ]);
-    setConfiguration(status);
-    setRuntimeMode(mode);
-    setAgents(agentList);
-    setSnapshots(history.items);
-    setSelectedMode(mode.activeAgentId ? "SUBAGENT" : "DEFAULT");
-    setSelectedAgentId(
-      mode.activeAgentId
-      ?? agentList.find((agent) => agent.availability === "READY")?.id
-      ?? agentList[0]?.id
-      ?? "",
-    );
+
+    if (statusResult.status === "fulfilled") setConfiguration(statusResult.value);
+    if (agentsResult.status === "fulfilled") setAgents(agentsResult.value);
+    if (historyResult.status === "fulfilled") setSnapshots(historyResult.value.items);
+
+    if (modeResult.status === "fulfilled") {
+      const mode = modeResult.value;
+      setRuntimeMode(mode);
+      const currentBindings = Object.fromEntries(
+        mode.activeBindings.map((binding) => [binding.roleKey, binding.agentId]),
+      );
+      if (mode.legacyActiveAgentId && agentsResult.status === "fulfilled") {
+        const legacy = agentsResult.value.find((agent) => agent.id === mode.legacyActiveAgentId);
+        if (legacy?.roleKey) currentBindings[legacy.roleKey] = legacy.id;
+      }
+      setSelectedMode(
+        mode.activeBindings.length > 0 || mode.legacyActiveAgentId ? "SUBAGENT" : "DEFAULT",
+      );
+      setSelectedAgentsByRole((current) => {
+        if (Object.keys(currentBindings).length > 0) return currentBindings;
+        if (agentsResult.status !== "fulfilled") return current;
+        return Object.fromEntries(
+          Object.entries(current).filter(([roleKey, agentId]) =>
+            agentsResult.value.some((agent) => agent.id === agentId && agent.roleKey === roleKey),
+          ),
+        );
+      });
+    }
+
+    const failure = [statusResult, modeResult, agentsResult, historyResult]
+      .find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }, []);
 
   useEffect(() => {
@@ -237,12 +266,14 @@ function OverviewPage({
   }, [reloadConfiguration]);
 
   async function handleModeSwitch() {
-    const activeAgentId = selectedMode === "SUBAGENT" ? selectedAgentId : null;
+    const activeAgentIds = selectedMode === "SUBAGENT"
+      ? Object.values(selectedAgentsByRole).filter(Boolean)
+      : [];
     setOperation("switch");
     setConfigurationError(null);
     setConfigurationSuccess(null);
     try {
-      const result = await switchRuntimeMode(activeAgentId);
+      const result = await withTimeout(switchRuntimeMode(activeAgentIds), "切换运行模式", 15_000);
       if (result.status === "FAILED_ROLLED_BACK" || result.status === "RECOVERY_REQUIRED") {
         throw new Error(
           result.status === "FAILED_ROLLED_BACK"
@@ -250,11 +281,10 @@ function OverviewPage({
             : "模式切换未完成，需要先恢复配置事务。",
         );
       }
-      const activeAgent = agents.find((agent) => agent.id === activeAgentId);
       setConfigurationSuccess(
-        activeAgent
-          ? `已切换到子 Agent：${activeAgent.name}。`
-          : "已切换到 Default；Codex 将全权负责当前任务。",
+        activeAgentIds.length > 0
+          ? `已启用 ${activeAgentIds.length} 个子 Agent。请在 Codex 中新建任务使 Strict Stop 生效。`
+          : "已切换到 Default。请在 Codex 中新建任务使模式变更生效。",
       );
       await reloadConfiguration();
     } catch (reason: unknown) {
@@ -262,6 +292,20 @@ function OverviewPage({
       await reloadConfiguration();
     } finally {
       setOperation(null);
+    }
+  }
+
+  async function handleModeRefresh() {
+    setRefreshingMode(true);
+    setConfigurationError(null);
+    setConfigurationSuccess(null);
+    try {
+      await reloadConfiguration();
+    } catch (reason: unknown) {
+      setConfigurationError(errorMessage(reason));
+    } finally {
+      setRefreshingMode(false);
+      setOperation((current) => current === "switch" ? null : current);
     }
   }
 
@@ -284,23 +328,50 @@ function OverviewPage({
     }
   }
 
-  const selectedAgent = agents.find((agent) => agent.id === selectedAgentId);
-  const targetAgentId = selectedMode === "SUBAGENT" ? selectedAgentId || null : null;
-  const sameMode = targetAgentId === runtimeMode?.activeAgentId;
-  const modeReady = selectedMode === "DEFAULT" || selectedAgent?.availability === "READY";
+  const orchestratableAgents = agents.filter((agent) => agent.roleKey && agent.orchestrationPhase);
+  const roleGroups = Object.entries(
+    orchestratableAgents.reduce<Record<string, AgentSummary[]>>((groups, agent) => {
+      const roleKey = agent.roleKey as string;
+      (groups[roleKey] ??= []).push(agent);
+      return groups;
+    }, {}),
+  ).sort(([leftRole, leftAgents], [rightRole, rightAgents]) => {
+    const phaseOrder: Record<OrchestrationPhase, number> = {
+      DISCOVERY: 1,
+      EXECUTION: 2,
+      VERIFICATION: 3,
+      REVIEW: 4,
+    };
+    const leftPhase = leftAgents[0]?.orchestrationPhase ?? "REVIEW";
+    const rightPhase = rightAgents[0]?.orchestrationPhase ?? "REVIEW";
+    return phaseOrder[leftPhase] - phaseOrder[rightPhase] || leftRole.localeCompare(rightRole);
+  });
+  const targetAgentIds = selectedMode === "SUBAGENT"
+    ? Object.values(selectedAgentsByRole).filter(Boolean).sort()
+    : [];
+  const currentAgentIds = runtimeMode?.activeBindings.map((binding) => binding.agentId).sort() ?? [];
+  const defaultIsCurrent = runtimeMode?.activeBindings.length === 0 && !runtimeMode.legacyActiveAgentId;
+  const sameMode = selectedMode === "DEFAULT"
+    ? defaultIsCurrent
+    : targetAgentIds.length > 0
+      && !runtimeMode?.legacyActiveAgentId
+      && targetAgentIds.length === currentAgentIds.length
+      && targetAgentIds.every((id, index) => id === currentAgentIds[index]);
+  const selectedAgents = targetAgentIds
+    .map((id) => agents.find((agent) => agent.id === id))
+    .filter((agent): agent is AgentSummary => Boolean(agent));
+  const modeReady = selectedMode === "DEFAULT"
+    || (selectedAgents.length > 0 && selectedAgents.every((agent) => agent.availability === "READY"));
   const alreadySynchronized = sameMode && configuration?.status === "APPLIED";
-  const activeAgent = agents.find((agent) => agent.id === runtimeMode?.activeAgentId);
+  const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
   return (
     <>
       <header>
         <div>
           <span className="eyebrow">Runtime Mode</span>
           <h1>选择 Codex 的工作方式</h1>
-          <p>使用 Default 让 Codex 全权负责，或只启用一个由 CAS 管理的子 Agent。</p>
+          <p>使用 Default 让 Codex 全权负责，或按 Role 启用多个由 CAS 管理的子 Agent。</p>
         </div>
-        <button className="secondary-button" disabled={detecting} onClick={onRedetect}>
-          {detecting ? "检测中…" : "重新检测 Codex"}
-        </button>
       </header>
 
       {error && (
@@ -324,6 +395,11 @@ function OverviewPage({
 
         {configurationSuccess && <div className="success-banner">{configurationSuccess}</div>}
         {configurationError && <div className="inline-error">{configurationError}</div>}
+        {(selectedMode === "SUBAGENT" || (runtimeMode?.activeBindings.length ?? 0) > 0) && (
+          <div className="orchestration-warning" role="note">
+            Strict Stop 依赖磁盘只读权限。切换后请新建 Codex 任务；若启动命令显式覆盖 Sandbox，Primary 只读约束可能失效。
+          </div>
+        )}
 
         <div className="runtime-mode-options" role="radiogroup" aria-label="Codex 运行模式">
           <label className={`runtime-mode-option ${selectedMode === "DEFAULT" ? "selected" : ""}`}>
@@ -337,40 +413,59 @@ function OverviewPage({
               <strong>Default</strong>
               <small>不启用 CAS 子 Agent，不改动 Codex 的主模型、MCP 或其他外部配置。</small>
             </span>
-            {runtimeMode?.activeAgentId === null && <span className="current-mode-tag">当前</span>}
+            {defaultIsCurrent && <span className="current-mode-tag">当前</span>}
           </label>
 
           <label className={`runtime-mode-option ${selectedMode === "SUBAGENT" ? "selected" : ""}`}>
             <input
               checked={selectedMode === "SUBAGENT"}
-              disabled={agents.length === 0}
               name="runtime-mode"
               onChange={() => setSelectedMode("SUBAGENT")}
               type="radio"
             />
             <span className="runtime-mode-copy">
               <strong>使用子 Agent</strong>
-              <small>从 Agents 中单选一个；Codex 只会看到该 Agent 的 CAS 投影。</small>
-              <select
-                aria-label="选择要启用的 Agent"
-                disabled={selectedMode !== "SUBAGENT" || agents.length === 0}
-                onChange={(event) => setSelectedAgentId(event.target.value)}
-                onClick={(event) => event.stopPropagation()}
-                value={selectedAgentId}
-              >
-                {agents.length === 0 && <option value="">请先创建 Agent</option>}
-                {agents.map((agent) => (
-                  <option key={agent.id} value={agent.id}>
-                    {agent.name} · {availabilityLabel(agent.availability)}
-                  </option>
-                ))}
-              </select>
-              {selectedMode === "SUBAGENT" && selectedAgent && selectedAgent.availability !== "READY" && (
-                <em>该 Agent 尚未就绪，请先在 Agents 页面完善 Model 与 Provider。</em>
+              <small>不同 Role 可以同时运行；同一 Role 只能选择一个 Agent。Primary 只负责规划、审查与收束。</small>
+              <div className="role-agent-selectors">
+                {roleGroups.length === 0 && <em>请先在 Agents 页面创建带 Role 与 Phase 的 Agent。</em>}
+                {roleGroups.map(([roleKey, candidates]) => {
+                  const selected = candidates.find((agent) => agent.id === selectedAgentsByRole[roleKey]);
+                  return (
+                    <label className="role-agent-selector" key={roleKey}>
+                      <span>
+                        <strong>{roleKey}</strong>
+                        <small>{selected?.orchestrationPhase ?? candidates[0]?.orchestrationPhase}</small>
+                      </span>
+                      <select
+                        aria-label={`选择 ${roleKey} Agent`}
+                        disabled={selectedMode !== "SUBAGENT"}
+                        onChange={(event) => setSelectedAgentsByRole((current) => ({
+                          ...current,
+                          [roleKey]: event.target.value,
+                        }))}
+                        onClick={(event) => event.stopPropagation()}
+                        value={selectedAgentsByRole[roleKey] ?? ""}
+                      >
+                        <option value="">不启用</option>
+                        {candidates.map((agent) => (
+                          <option key={agent.id} value={agent.id}>
+                            {agent.name} · {availabilityLabel(agent.availability)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  );
+                })}
+              </div>
+              {selectedMode === "SUBAGENT" && selectedAgents.some((agent) => agent.availability !== "READY") && (
+                <em>存在尚未就绪的 Agent，请先在 Agents 页面完善 Model 与 Provider。</em>
+              )}
+              {selectedMode === "SUBAGENT" && selectedAgents.length > 0 && !hasExecutionAgent && (
+                <em>未启用 EXECUTION Agent：Strict Stop 会阻止所有写入任务。</em>
               )}
             </span>
-            {runtimeMode?.activeAgentId && (
-              <span className="current-mode-tag">当前：{activeAgent?.name ?? "子 Agent"}</span>
+            {runtimeMode && (runtimeMode.activeBindings.length > 0 || runtimeMode.legacyActiveAgentId) && (
+              <span className="current-mode-tag">当前：{runtimeMode.activeBindings.length || 1} 个</span>
             )}
           </label>
         </div>
@@ -394,24 +489,41 @@ function OverviewPage({
                 ? "当前定义或磁盘配置有变化，可重新同步。"
                 : "确认后将立即切换，并只处理 CAS 拥有的配置。"}
           </span>
-          <button
-            className="primary-button"
-            disabled={operation !== null || !runtimeMode || !modeReady || alreadySynchronized}
-            onClick={handleModeSwitch}
-            type="button"
-          >
-            {operation === "switch"
-              ? "切换中…"
-              : alreadySynchronized
-                ? "当前已启用"
-                : sameMode
-                  ? "同步当前模式"
-                  : "切换模式"}
-          </button>
+          <div className="mode-action-buttons">
+            <button
+              className="secondary-button"
+              disabled={refreshingMode || operation === "restore"}
+              onClick={handleModeRefresh}
+              type="button"
+            >
+              {refreshingMode ? "刷新中…" : "刷新状态"}
+            </button>
+            <button
+              aria-busy={operation === "switch"}
+              className="primary-button"
+              disabled={operation !== null || refreshingMode || !runtimeMode || !modeReady || alreadySynchronized}
+              onClick={handleModeSwitch}
+              type="button"
+            >
+              {operation === "switch"
+                ? "切换中…"
+                : alreadySynchronized
+                  ? "当前已启用"
+                  : sameMode
+                    ? "同步当前模式"
+                    : "切换模式"}
+            </button>
+          </div>
         </div>
       </section>
 
-      {environment && <EnvironmentDetails environment={environment} />}
+      {environment && (
+        <EnvironmentDetails
+          detecting={detecting}
+          environment={environment}
+          onRedetect={onRedetect}
+        />
+      )}
 
       <section className="configuration-card snapshot-card">
         <div className="configuration-heading">
@@ -512,27 +624,36 @@ function DiagnosticsPage() {
 
 function SettingsPage({
   onAppearanceChange,
+  onEnvironmentChange,
   onFontFamilyChange,
 }: {
   onAppearanceChange: (appearance: Appearance) => void;
+  onEnvironmentChange: (environment: CodexEnvironmentResponse) => void;
   onFontFamilyChange: (fontFamily: string | null) => void;
 }) {
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
   const [environment, setEnvironment] = useState<CodexEnvironmentResponse | null>(null);
   const [customCodexHome, setCustomCodexHome] = useState("");
   const [customFontFamily, setCustomFontFamily] = useState("");
+  const [projectExclusions, setProjectExclusions] = useState<ProjectExclusion[]>([]);
+  const [projectPath, setProjectPath] = useState("");
+  const [projectPathError, setProjectPathError] = useState<string | null>(null);
+  const [exclusionError, setExclusionError] = useState<string | null>(null);
+  const [exclusionBusy, setExclusionBusy] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([getSettings(), getCodexEnvironment()])
-      .then(([loadedSettings, loadedEnvironment]) => {
+    Promise.all([getSettings(), getCodexEnvironment(), listProjectExclusions()])
+      .then(([loadedSettings, loadedEnvironment, loadedExclusions]) => {
         setSettings(loadedSettings);
         setCustomCodexHome(loadedSettings.customCodexHome ?? "");
         setCustomFontFamily(loadedSettings.customFontFamily ?? "");
         setEnvironment(loadedEnvironment);
+        setProjectExclusions(loadedExclusions);
       })
       .catch((reason: unknown) => setError(errorMessage(reason)));
   }, []);
@@ -554,7 +675,9 @@ function SettingsPage({
       setSettings(updated);
       setCustomCodexHome(updated.customCodexHome ?? "");
       setCustomFontFamily(updated.customFontFamily ?? "");
-      setEnvironment(await getCodexEnvironment());
+      const updatedEnvironment = await getCodexEnvironment();
+      setEnvironment(updatedEnvironment);
+      onEnvironmentChange(updatedEnvironment);
       onAppearanceChange(updated.appearance);
       onFontFamilyChange(updated.customFontFamily);
       setSuccess("设置已保存。");
@@ -569,11 +692,67 @@ function SettingsPage({
     setDetecting(true);
     setError(null);
     try {
-      setEnvironment(await redetectCodex());
+      const updatedEnvironment = await redetectCodex();
+      setEnvironment(updatedEnvironment);
+      onEnvironmentChange(updatedEnvironment);
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
       setDetecting(false);
+    }
+  }
+
+  async function addExclusion() {
+    const value = projectPath.trim();
+    setProjectPathError(null);
+    setExclusionError(null);
+    if (!value) {
+      setProjectPathError("请输入需要排除的项目绝对路径。");
+      return;
+    }
+    setExclusionBusy("add");
+    try {
+      const added = await addProjectExclusion(value);
+      setProjectExclusions((current) =>
+        [...current, added].sort((left, right) =>
+          left.projectPath.localeCompare(right.projectPath),
+        ),
+      );
+      setProjectPath("");
+      setSuccess("项目排除已添加；请在该项目中新建 Codex 会话。");
+    } catch (reason: unknown) {
+      if (errorField(reason) === "projectPath") {
+        setProjectPathError(errorMessage(reason));
+      } else {
+        setExclusionError(errorMessage(reason));
+      }
+    } finally {
+      setExclusionBusy(null);
+    }
+  }
+
+  async function removeExclusion(exclusion: ProjectExclusion) {
+    setExclusionBusy(exclusion.id);
+    setExclusionError(null);
+    try {
+      await deleteProjectExclusion(exclusion.id);
+      setProjectExclusions((current) =>
+        current.filter((item) => item.id !== exclusion.id),
+      );
+      setSuccess("项目排除已移除，CAS 接管的权限字段已安全恢复。");
+    } catch (reason: unknown) {
+      setExclusionError(errorMessage(reason));
+    } finally {
+      setExclusionBusy(null);
+    }
+  }
+
+  async function copyConversationMarker(marker: "CAS:OFF" | "CAS:ON") {
+    try {
+      await navigator.clipboard.writeText(marker);
+      setCopyStatus(`已复制 ${marker}`);
+    } catch {
+      setCopyStatus("复制失败，请手动选择文本。");
     }
   }
 
@@ -667,6 +846,111 @@ function SettingsPage({
             </label>
           </section>
 
+          <section className="settings-card">
+            <div className="panel-heading">
+              <div>
+                <span className="eyebrow">Orchestration</span>
+                <h2>编排排除</h2>
+                <p>让指定项目或当前对话暂时不使用 CAS 子 Agent。</p>
+              </div>
+            </div>
+
+            <div className="project-exclusion-add">
+              <label className="field">
+                <span>项目绝对路径</span>
+                <input
+                  aria-invalid={Boolean(projectPathError)}
+                  onChange={(event) => {
+                    setProjectPath(event.target.value);
+                    setProjectPathError(null);
+                  }}
+                  placeholder="例如 C:\Projects\standalone-app"
+                  value={projectPath}
+                />
+                {projectPathError ? (
+                  <small className="field-error">{projectPathError}</small>
+                ) : (
+                  <small>
+                    CAS 会保留式修改该项目的 .codex/config.toml，并在移除时恢复接管字段。
+                  </small>
+                )}
+              </label>
+              <button
+                className="secondary-button"
+                disabled={exclusionBusy !== null}
+                onClick={addExclusion}
+                type="button"
+              >
+                {exclusionBusy === "add" ? "添加中…" : "添加项目"}
+              </button>
+            </div>
+
+            <div className="orchestration-warning">
+              项目排除仅对新 Codex 会话生效，且项目必须已被 Codex 标记为 trusted。
+              若没有生效，请先检查项目信任状态。排除期间 Primary 使用
+              Workspace 可写权限，并关闭 multi-agent。
+            </div>
+
+            <div className="project-exclusion-list" aria-label="已排除项目">
+              {projectExclusions.length === 0 ? (
+                <p className="empty-copy">当前没有项目排除项。</p>
+              ) : (
+                projectExclusions.map((exclusion) => (
+                  <div className="project-exclusion-entry" key={exclusion.id}>
+                    <span>
+                      <strong>{exclusion.projectPath}</strong>
+                      <small>仅匹配该目录及其子目录</small>
+                    </span>
+                    <button
+                      className="danger-button"
+                      disabled={exclusionBusy !== null}
+                      onClick={() => removeExclusion(exclusion)}
+                      type="button"
+                    >
+                      {exclusionBusy === exclusion.id ? "移除中…" : "移除"}
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+            {exclusionError && <div className="inline-error">{exclusionError}</div>}
+
+            <div className="conversation-control">
+              <div>
+                <strong>当前对话临时排除</strong>
+                <p>
+                  关闭编排不会自动解除当前会话的只读权限；请同时使用
+                  <code>/permissions</code>。
+                </p>
+              </div>
+              <div className="conversation-command-grid">
+                <article>
+                  <code>CAS:OFF</code>
+                  <span>发送后运行 /permissions，选择 Auto 或 Workspace。</span>
+                  <button
+                    className="ghost-button"
+                    onClick={() => copyConversationMarker("CAS:OFF")}
+                    type="button"
+                  >
+                    复制
+                  </button>
+                </article>
+                <article>
+                  <code>CAS:ON</code>
+                  <span>恢复编排后运行 /permissions，切回 Read Only。</span>
+                  <button
+                    className="ghost-button"
+                    onClick={() => copyConversationMarker("CAS:ON")}
+                    type="button"
+                  >
+                    复制
+                  </button>
+                </article>
+              </div>
+              {copyStatus && <small role="status">{copyStatus}</small>}
+            </div>
+          </section>
+
           <div className="form-actions">
             <button className="primary-button" disabled={saving} type="submit">
               {saving ? "保存中…" : "保存设置"}
@@ -680,7 +964,7 @@ function SettingsPage({
 
 function AgentsPage() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
-  const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
+  const [activeAgentIds, setActiveAgentIds] = useState<string[]>([]);
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [presets, setPresets] = useState<AgentPresetResponse[]>([]);
   const [loading, setLoading] = useState(true);
@@ -702,7 +986,10 @@ function AgentsPage() {
       setAgents(agentList);
       setModels(modelList);
       setPresets(presetList);
-      setActiveAgentId(mode.activeAgentId);
+      setActiveAgentIds([
+        ...mode.activeBindings.map((binding) => binding.agentId),
+        ...(mode.legacyActiveAgentId ? [mode.legacyActiveAgentId] : []),
+      ]);
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
@@ -760,7 +1047,7 @@ function AgentsPage() {
       {selectedId && (
         <AgentDetailPanel
           agentId={selectedId}
-          isActive={selectedId === activeAgentId}
+          isActive={activeAgentIds.includes(selectedId)}
           models={models}
           onBack={() => setSelectedId(null)}
           onChanged={changed}
@@ -795,7 +1082,7 @@ function AgentsPage() {
           {agents.map((agent) => (
             <AgentRow
               agent={agent}
-              isActive={agent.id === activeAgentId}
+              isActive={activeAgentIds.includes(agent.id)}
               key={agent.id}
               onOpen={setSelectedId}
             />
@@ -826,7 +1113,12 @@ function AgentRow({
           {isActive && <span className="agent-state current">当前使用</span>}
         </div>
         <p>{agent.description}</p>
-        <code>{agent.agentKey}</code>
+        <code>
+          {agent.agentKey}
+          {agent.roleKey && agent.orchestrationPhase
+            ? ` · ${agent.roleKey} / ${agent.orchestrationPhase}`
+            : " · 未分类"}
+        </code>
       </div>
       <div className="agent-binding">
         <strong>{agent.model?.displayName ?? "No model assigned"}</strong>
@@ -851,6 +1143,10 @@ function CreateAgentPanel({
   const initial = presets[0];
   const [templateKey, setTemplateKey] = useState(initial?.key ?? "");
   const [agentKey, setAgentKey] = useState(initial?.key ?? "");
+  const [roleKey, setRoleKey] = useState(initial?.roleKey ?? "");
+  const [orchestrationPhase, setOrchestrationPhase] = useState<OrchestrationPhase>(
+    initial?.orchestrationPhase ?? "EXECUTION",
+  );
   const [name, setName] = useState(initial?.name ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [instruction, setInstruction] = useState("");
@@ -869,6 +1165,8 @@ function CreateAgentPanel({
     setTemplateKey(key);
     const preset = presets.find((value) => value.key === key);
     setAgentKey(preset?.key ?? "");
+    setRoleKey(preset?.roleKey ?? "");
+    setOrchestrationPhase(preset?.orchestrationPhase ?? "EXECUTION");
     setName(preset?.name ?? "");
     setDescription(preset?.description ?? "");
     setInstruction("");
@@ -888,6 +1186,7 @@ function CreateAgentPanel({
       description,
       instruction,
       instructionRequired: !templateKey,
+      roleKey,
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -906,6 +1205,8 @@ function CreateAgentPanel({
         sandboxPolicy,
         reasoningPolicy,
         modelId: modelId || null,
+        roleKey,
+        orchestrationPhase,
       });
       onCreated();
     } catch (reason: unknown) {
@@ -973,6 +1274,40 @@ function CreateAgentPanel({
           </small>
         </label>
 
+        <label className="field">
+          <span>Role</span>
+          <input
+            aria-invalid={invalidField === "roleKey"}
+            maxLength={64}
+            onChange={(event) => {
+              setRoleKey(event.target.value);
+              if (invalidField === "roleKey") setInvalidField(null);
+            }}
+            pattern="[a-z][a-z0-9_-]*"
+            required
+            value={roleKey}
+          />
+          <small className={invalidField === "roleKey" ? "field-error" : undefined}>
+            {invalidField === "roleKey"
+              ? "Role 必须以小写字母开头，只能包含小写字母、数字、-、_。"
+              : "同一 Role 在运行时最多启用一个 Agent。"}
+          </small>
+        </label>
+
+        <label className="field">
+          <span>Phase</span>
+          <select
+            onChange={(event) => setOrchestrationPhase(event.target.value as OrchestrationPhase)}
+            value={orchestrationPhase}
+          >
+            <option value="DISCOVERY">Discovery</option>
+            <option value="EXECUTION">Execution</option>
+            <option value="VERIFICATION">Verification</option>
+            <option value="REVIEW">Review</option>
+          </select>
+          <small>决定 Primary 在什么阶段委派该 Agent。</small>
+        </label>
+
         <label className="field full-width">
           <span>Description</span>
           <textarea
@@ -1007,6 +1342,8 @@ function CreateAgentPanel({
         </label>
 
         <PolicyFields
+          model={selectedModel}
+          reasoningInvalid={invalidField === "reasoningPolicy"}
           reasoningPolicy={reasoningPolicy}
           sandboxPolicy={sandboxPolicy}
           setReasoningPolicy={setReasoningPolicy}
@@ -1018,8 +1355,12 @@ function CreateAgentPanel({
           <select
             aria-invalid={invalidField === "modelId"}
             onChange={(event) => {
-              setModelId(event.target.value);
+              const nextModelId = event.target.value;
+              const nextModel = models.find((model) => model.id === nextModelId);
+              setModelId(nextModelId);
+              setReasoningPolicy(normalizeReasoningPolicy(reasoningPolicy, nextModel));
               if (invalidField === "modelId") setInvalidField(null);
+              if (invalidField === "reasoningPolicy") setInvalidField(null);
             }}
             value={modelId}
           >
@@ -1078,11 +1419,16 @@ function AgentDetailPanel({
     setInvalidField(null);
     getAgent(agentId)
       .then((value) => {
-        setAgent(value);
-        setModelId(value.modelBinding?.id ?? "");
+        const nextModelId = value.modelBinding?.id ?? "";
+        const selectedModel = models.find((model) => model.id === nextModelId);
+        setAgent({
+          ...value,
+          reasoningPolicy: normalizeReasoningPolicy(value.reasoningPolicy, selectedModel),
+        });
+        setModelId(nextModelId);
       })
       .catch((reason: unknown) => setError(errorMessage(reason)));
-  }, [agentId]);
+  }, [agentId, models]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1094,6 +1440,7 @@ function AgentDetailPanel({
       description: agent.description,
       instruction: agent.instruction,
       instructionRequired: true,
+      roleKey: agent.roleKey ?? "",
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -1102,19 +1449,17 @@ function AgentDetailPanel({
     }
     setSaving(true);
     try {
-      await updateAgent({
+      const refreshed = await updateAgent({
         agentId: agent.id,
         name: agent.name,
         description: agent.description,
         instruction: agent.instruction,
         sandboxPolicy: agent.sandboxPolicy,
         reasoningPolicy: agent.reasoningPolicy,
+        modelId: modelId || null,
+        roleKey: agent.roleKey ?? "",
+        orchestrationPhase: agent.orchestrationPhase ?? "EXECUTION",
       });
-      if (modelId !== (agent.modelBinding?.id ?? "")) {
-        if (modelId) await setAgentModelBinding(agent.id, modelId);
-        else await removeAgentModelBinding(agent.id);
-      }
-      const refreshed = await getAgent(agent.id);
       setAgent(refreshed);
       setModelId(refreshed.modelBinding?.id ?? "");
       onChanged("Agent 配置已保存。");
@@ -1143,6 +1488,7 @@ function AgentDetailPanel({
     return <section className="notice error"><strong>无法读取 Agent</strong><p>{error}</p><button className="secondary-button" onClick={onBack}>返回</button></section>;
   }
   if (!agent) return <section className="notice">正在读取 Agent…</section>;
+  const selectedModel = models.find((model) => model.id === modelId);
 
   return (
     <section className="provider-panel">
@@ -1175,6 +1521,44 @@ function AgentDetailPanel({
           <span>Key</span>
           <div className="static-value">{agent.agentKey}</div>
           <small>身份字段不可在普通编辑中修改。</small>
+        </label>
+
+        <label className="field">
+          <span>Role</span>
+          <input
+            aria-invalid={invalidField === "roleKey"}
+            disabled={isActive}
+            maxLength={64}
+            onChange={(event) => {
+              setAgent({ ...agent, roleKey: event.target.value });
+              if (invalidField === "roleKey") setInvalidField(null);
+            }}
+            required
+            value={agent.roleKey ?? ""}
+          />
+          <small className={invalidField === "roleKey" ? "field-error" : undefined}>
+            {invalidField === "roleKey"
+              ? "Role 格式无效。"
+              : isActive ? "当前启用时不可修改 Role。" : "同一 Role 在运行时最多启用一个 Agent。"}
+          </small>
+        </label>
+
+        <label className="field">
+          <span>Phase</span>
+          <select
+            disabled={isActive}
+            onChange={(event) => setAgent({
+              ...agent,
+              orchestrationPhase: event.target.value as OrchestrationPhase,
+            })}
+            value={agent.orchestrationPhase ?? "EXECUTION"}
+          >
+            <option value="DISCOVERY">Discovery</option>
+            <option value="EXECUTION">Execution</option>
+            <option value="VERIFICATION">Verification</option>
+            <option value="REVIEW">Review</option>
+          </select>
+          <small>{isActive ? "当前启用时不可修改 Phase。" : "Primary 据此决定委派阶段。"}</small>
         </label>
 
         <label className="field full-width">
@@ -1210,6 +1594,8 @@ function AgentDetailPanel({
         </label>
 
         <PolicyFields
+          model={selectedModel}
+          reasoningInvalid={invalidField === "reasoningPolicy"}
           reasoningPolicy={agent.reasoningPolicy}
           sandboxPolicy={agent.sandboxPolicy}
           setReasoningPolicy={(value) => setAgent({ ...agent, reasoningPolicy: value })}
@@ -1221,8 +1607,15 @@ function AgentDetailPanel({
           <select
             aria-invalid={invalidField === "modelId"}
             onChange={(event) => {
-              setModelId(event.target.value);
+              const nextModelId = event.target.value;
+              const nextModel = models.find((model) => model.id === nextModelId);
+              setModelId(nextModelId);
+              setAgent({
+                ...agent,
+                reasoningPolicy: normalizeReasoningPolicy(agent.reasoningPolicy, nextModel),
+              });
               if (invalidField === "modelId") setInvalidField(null);
+              if (invalidField === "reasoningPolicy") setInvalidField(null);
             }}
             value={modelId}
           >
@@ -1262,16 +1655,21 @@ function AgentDetailPanel({
 }
 
 function PolicyFields({
+  model,
+  reasoningInvalid,
   reasoningPolicy,
   sandboxPolicy,
   setReasoningPolicy,
   setSandboxPolicy,
 }: {
+  model: ModelSummary | undefined;
+  reasoningInvalid: boolean;
   reasoningPolicy: ReasoningPolicy;
   sandboxPolicy: SandboxPolicy;
   setReasoningPolicy: (value: ReasoningPolicy) => void;
   setSandboxPolicy: (value: SandboxPolicy) => void;
 }) {
+  const reasoningOptions = availableReasoningPolicies(model);
   return (
     <>
       <label className="field">
@@ -1285,16 +1683,63 @@ function PolicyFields({
       </label>
       <label className="field">
         <span>Reasoning</span>
-        <select onChange={(event) => setReasoningPolicy(event.target.value as ReasoningPolicy)} value={reasoningPolicy}>
-          <option value="MODEL_DEFAULT">Model default</option>
-          <option value="LOW">Low</option>
-          <option value="MEDIUM">Medium</option>
-          <option value="HIGH">High</option>
-          <option value="INHERIT">Inherit</option>
+        <select
+          aria-invalid={reasoningInvalid}
+          onChange={(event) => setReasoningPolicy(event.target.value as ReasoningPolicy)}
+          value={reasoningPolicy}
+        >
+          {reasoningOptions.map((option) => (
+            <option key={option} value={option}>
+              {reasoningPolicyLabel(option, model)}
+            </option>
+          ))}
         </select>
+        <small className={reasoningInvalid ? "field-error" : undefined}>
+          {reasoningInvalid
+            ? "所选 Model 不支持该 Reasoning。"
+            : model?.source === "PRESET"
+              ? "已按 CAS 内置 Model 的官方能力限制可选级别。"
+              : "自定义 Model 能力未知时，可选择 Inherit。"}
+        </small>
       </label>
     </>
   );
+}
+
+const ALL_REASONING_POLICIES: ReasoningPolicy[] = [
+  "MODEL_DEFAULT",
+  "LOW",
+  "MEDIUM",
+  "HIGH",
+  "INHERIT",
+];
+
+function availableReasoningPolicies(model: ModelSummary | undefined): ReasoningPolicy[] {
+  if (!model || model.source !== "PRESET") return ALL_REASONING_POLICIES;
+  const efforts = new Set(model.supportedReasoningEfforts.map((effort) => effort.toUpperCase()));
+  return ALL_REASONING_POLICIES.filter((policy) => (
+    policy === "MODEL_DEFAULT" || (policy !== "INHERIT" && efforts.has(policy))
+  ));
+}
+
+function normalizeReasoningPolicy(
+  policy: ReasoningPolicy,
+  model: ModelSummary | undefined,
+): ReasoningPolicy {
+  return availableReasoningPolicies(model).includes(policy) ? policy : "MODEL_DEFAULT";
+}
+
+function reasoningPolicyLabel(
+  policy: ReasoningPolicy,
+  model: ModelSummary | undefined,
+): string {
+  if (policy === "MODEL_DEFAULT") {
+    const defaultEffort = model?.defaultReasoningEffort;
+    return defaultEffort ? `Model default (${defaultEffort})` : "Model default";
+  }
+  return policy === "INHERIT"
+    ? "Inherit"
+    : `${policy[0]}${policy.slice(1).toLowerCase()}`;
 }
 
 function CompatibilityPanel({ compatibility }: { compatibility: AgentDetailResponse["compatibility"] }) {
@@ -2617,17 +3062,33 @@ function ProviderResponsesReferenceDialog({ onClose }: { onClose: () => void }) 
   );
 }
 
-function EnvironmentDetails({ environment }: { environment: CodexEnvironmentResponse }) {
+function EnvironmentDetails({
+  detecting,
+  environment,
+  onRedetect,
+}: {
+  detecting: boolean;
+  environment: CodexEnvironmentResponse;
+  onRedetect: () => void;
+}) {
   return (
     <section className="environment-card">
       <div className="environment-heading">
         <div>
           <span className="eyebrow">Codex Environment</span>
           <h2>{environment.supported ? "客户端满足当前基线" : "客户端需要处理"}</h2>
+          <p className="environment-tip">
+            如果当前目录或者显示不正确，请手动进行一次重新检测 Codex。
+          </p>
         </div>
-        <span className={environment.supported ? "result ready" : "result blocked"}>
-          {environment.supported ? "READY" : "BLOCKED"}
-        </span>
+        <div className="environment-actions">
+          <span className={environment.supported ? "result ready" : "result blocked"}>
+            {environment.supported ? "READY" : "BLOCKED"}
+          </span>
+          <button className="secondary-button" disabled={detecting} onClick={onRedetect} type="button">
+            {detecting ? "检测中…" : "重新检测 Codex"}
+          </button>
+        </div>
       </div>
       <dl>
         <EnvironmentField label="Executable" value={environment.executablePath} />
@@ -2660,7 +3121,14 @@ function EnvironmentField({ label, value }: { label: string; value: string | nul
   );
 }
 
-type AgentFormField = "agentKey" | "name" | "description" | "instruction" | "modelId";
+type AgentFormField =
+  | "agentKey"
+  | "roleKey"
+  | "name"
+  | "description"
+  | "instruction"
+  | "modelId"
+  | "reasoningPolicy";
 
 function invalidAgentField(values: {
   agentKey?: string;
@@ -2668,10 +3136,12 @@ function invalidAgentField(values: {
   description: string;
   instruction: string;
   instructionRequired: boolean;
+  roleKey: string;
 }): AgentFormField | null {
   if (values.agentKey !== undefined && !/^[a-z][a-z0-9_-]{0,63}$/.test(values.agentKey)) {
     return "agentKey";
   }
+  if (!/^[a-z][a-z0-9_-]{0,63}$/.test(values.roleKey)) return "roleKey";
   if (!values.name.trim() || values.name.length > 160) return "name";
   if (!values.description.trim() || values.description.length > 2000) return "description";
   if (values.instructionRequired && !values.instruction.trim()) return "instruction";
@@ -2681,7 +3151,17 @@ function invalidAgentField(values: {
 
 function agentErrorField(reason: unknown): AgentFormField | null {
   const field = errorField(reason);
-  if (["agentKey", "name", "description", "instruction", "modelId"].includes(field ?? "")) {
+  if (
+    [
+      "agentKey",
+      "roleKey",
+      "name",
+      "description",
+      "instruction",
+      "modelId",
+      "reasoningPolicy",
+    ].includes(field ?? "")
+  ) {
     return field as AgentFormField;
   }
   const code = errorCode(reason);
@@ -2691,16 +3171,47 @@ function agentErrorField(reason: unknown): AgentFormField | null {
 }
 
 function errorMessage(reason: unknown): string {
-  if (reason instanceof Error) return reason.message;
-  if (
+  let message = "操作失败，请重试。";
+  if (reason instanceof Error) {
+    message = reason.message;
+  } else if (
     typeof reason === "object" &&
     reason !== null &&
     "message" in reason &&
     typeof reason.message === "string"
   ) {
-    return reason.message;
+    message = reason.message;
   }
-  return "操作失败，请重试。";
+  const blockerCode =
+    typeof reason === "object" &&
+    reason !== null &&
+    "details" in reason &&
+    typeof reason.details === "object" &&
+    reason.details !== null &&
+    "blockerCode" in reason.details &&
+    typeof reason.details.blockerCode === "string"
+      ? reason.details.blockerCode
+      : null;
+  return blockerCode ? `${message}（${blockerCode}）` : message;
+}
+
+function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 10_000): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(
+      () => reject(new Error(`${label}超时。请确认 Codex 未占用配置后刷新状态。`)),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeout);
+        resolve(value);
+      },
+      (reason: unknown) => {
+        window.clearTimeout(timeout);
+        reject(reason);
+      },
+    );
+  });
 }
 
 function errorField(reason: unknown): string | null {

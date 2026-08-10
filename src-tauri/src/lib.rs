@@ -21,9 +21,10 @@ use codex_environment::CodexEnvironment;
 use configuration::{
     ConfigurationApplyPreview, ConfigurationApplyRequest, ConfigurationApplyResponse,
     ConfigurationService, ConfigurationStatus, ConfigurationStatusResponse, DiagnosticsResponse,
-    DiagnosticsRunRequest, RuntimeModeResponse, RuntimeModeSwitchRequest, SnapshotDetailResponse,
-    SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse, SnapshotRestoreRequest,
-    SnapshotRestoreResponse,
+    DiagnosticsRunRequest, ProjectExclusionAddRequest, ProjectExclusionDeleteRequest,
+    ProjectExclusionResponse, RuntimeModeResponse, RuntimeModeSwitchRequest,
+    SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse,
+    SnapshotRestoreRequest, SnapshotRestoreResponse,
 };
 use model::{
     ModelAddRequest, ModelConnectionTestResponse, ModelDeleteRequest, ModelDetailResponse,
@@ -310,6 +311,31 @@ fn runtime_mode_switch(
 }
 
 #[tauri::command]
+fn project_exclusion_list(
+    state: tauri::State<'_, ConfigurationService>,
+) -> Result<Vec<ProjectExclusionResponse>, ApiError> {
+    state.list_project_exclusions().map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn project_exclusion_add(
+    state: tauri::State<'_, ConfigurationService>,
+    request: ProjectExclusionAddRequest,
+) -> Result<ProjectExclusionResponse, ApiError> {
+    state.add_project_exclusion(request).map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn project_exclusion_delete(
+    state: tauri::State<'_, ConfigurationService>,
+    request: ProjectExclusionDeleteRequest,
+) -> Result<(), ApiError> {
+    state
+        .delete_project_exclusion(request)
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
 fn snapshot_list(
     state: tauri::State<'_, ConfigurationService>,
     request: SnapshotListRequest,
@@ -386,6 +412,9 @@ pub fn run() {
             configuration_apply,
             runtime_mode_get,
             runtime_mode_switch,
+            project_exclusion_list,
+            project_exclusion_add,
+            project_exclusion_delete,
             snapshot_list,
             snapshot_get,
             snapshot_restore,

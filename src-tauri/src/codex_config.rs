@@ -1,12 +1,48 @@
 use std::fmt;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue, value};
 
 use crate::domain::{Agent, BaseBinding, Model, ResponsesProvider};
 
 const AUTH_TIMEOUT_MS: i64 = 5_000;
 const AUTH_REFRESH_INTERVAL_MS: i64 = 300_000;
+const ORCHESTRATION_BEGIN: &str = "<<< CAS ORCHESTRATION v1 >>>";
+const ORCHESTRATION_END: &str = "<<< END CAS ORCHESTRATION v1 >>>";
+const GLOBAL_ORCHESTRATION_BEGIN: &str = "<!-- CAS ORCHESTRATION v1 BEGIN -->";
+const GLOBAL_ORCHESTRATION_END: &str = "<!-- CAS ORCHESTRATION v1 END -->";
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PermissionStyle {
+    DefaultPermissions,
+    SandboxMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrchestrationBaseline {
+    pub(crate) permission_style: PermissionStyle,
+    pub(crate) default_permissions: Option<String>,
+    pub(crate) sandbox_mode: Option<String>,
+    pub(crate) agents_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) global_instructions_path: Option<String>,
+    #[serde(default)]
+    pub(crate) global_instructions_existed: bool,
+    #[serde(default)]
+    pub(crate) global_instructions_content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProjectExclusionBaseline {
+    projection_style: PermissionStyle,
+    default_permissions: Option<String>,
+    sandbox_mode: Option<String>,
+    agents_enabled: Option<bool>,
+}
 
 pub(crate) struct ProviderProjection<'a> {
     pub(crate) provider_id: &'a str,
@@ -174,6 +210,449 @@ pub(crate) fn model_catalog_projection_semantic(
 ) -> Result<Option<String>, ConfigError> {
     let document = document.parse::<DocumentMut>()?;
     Ok(document.get("model_catalog_json").map(canonical_item))
+}
+
+pub(crate) fn capture_orchestration_baseline(
+    existing: &str,
+) -> Result<OrchestrationBaseline, ConfigError> {
+    let document = existing.parse::<DocumentMut>()?;
+    let default_permissions = optional_string(&document, "default_permissions")?;
+    let sandbox_mode = optional_string(&document, "sandbox_mode")?;
+    if default_permissions.is_some() && sandbox_mode.is_some() {
+        return Err(ConfigError::InvalidStructure(
+            "default_permissions + sandbox_mode",
+        ));
+    }
+    let permission_style =
+        if sandbox_mode.is_some() || document.contains_key("sandbox_workspace_write") {
+            PermissionStyle::SandboxMode
+        } else {
+            PermissionStyle::DefaultPermissions
+        };
+    let agents_enabled = document
+        .get("agents")
+        .map(|item| {
+            item.as_table()
+                .ok_or(ConfigError::InvalidStructure("agents"))?
+                .get("enabled")
+                .map(|enabled| {
+                    enabled
+                        .as_value()
+                        .and_then(TomlValue::as_bool)
+                        .ok_or(ConfigError::InvalidStructure("agents.enabled"))
+                })
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    Ok(OrchestrationBaseline {
+        permission_style,
+        default_permissions,
+        sandbox_mode,
+        agents_enabled,
+        global_instructions_path: None,
+        global_instructions_existed: false,
+        global_instructions_content: None,
+    })
+}
+
+pub(crate) fn capture_project_exclusion_baseline(
+    existing: &str,
+    projection_style: PermissionStyle,
+) -> Result<ProjectExclusionBaseline, ConfigError> {
+    let document = existing.parse::<DocumentMut>()?;
+    let default_permissions = optional_string(&document, "default_permissions")?;
+    let sandbox_mode = optional_string(&document, "sandbox_mode")?;
+    if default_permissions.is_some() && sandbox_mode.is_some() {
+        return Err(ConfigError::InvalidStructure(
+            "default_permissions + sandbox_mode",
+        ));
+    }
+    let agents_enabled = document
+        .get("agents")
+        .map(|item| {
+            item.as_table()
+                .ok_or(ConfigError::InvalidStructure("agents"))?
+                .get("enabled")
+                .map(|enabled| {
+                    enabled
+                        .as_value()
+                        .and_then(TomlValue::as_bool)
+                        .ok_or(ConfigError::InvalidStructure("agents.enabled"))
+                })
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    Ok(ProjectExclusionBaseline {
+        projection_style,
+        default_permissions,
+        sandbox_mode,
+        agents_enabled,
+    })
+}
+
+pub(crate) fn upsert_project_exclusion_projection(
+    existing: &str,
+    permission_style: PermissionStyle,
+) -> Result<String, ConfigError> {
+    let mut document = existing.parse::<DocumentMut>()?;
+    match permission_style {
+        PermissionStyle::DefaultPermissions => {
+            document.remove("sandbox_mode");
+            document["default_permissions"] = value(":workspace");
+        }
+        PermissionStyle::SandboxMode => {
+            document.remove("default_permissions");
+            document["sandbox_mode"] = value("workspace-write");
+        }
+    }
+    ensure_agents_table(&mut document)?;
+    document["agents"]["enabled"] = value(false);
+    Ok(render_document(document, existing))
+}
+
+pub(crate) fn project_exclusion_projection_matches(
+    existing: &str,
+    baseline: &ProjectExclusionBaseline,
+) -> Result<bool, ConfigError> {
+    let document = existing.parse::<DocumentMut>()?;
+    let permissions_match = match baseline.projection_style {
+        PermissionStyle::DefaultPermissions => {
+            optional_string(&document, "default_permissions")?.as_deref() == Some(":workspace")
+                && !document.contains_key("sandbox_mode")
+        }
+        PermissionStyle::SandboxMode => {
+            optional_string(&document, "sandbox_mode")?.as_deref() == Some("workspace-write")
+                && !document.contains_key("default_permissions")
+        }
+    };
+    Ok(permissions_match
+        && document
+            .get("agents")
+            .and_then(Item::as_table)
+            .and_then(|agents| agents.get("enabled"))
+            .and_then(Item::as_value)
+            .and_then(TomlValue::as_bool)
+            == Some(false))
+}
+
+pub(crate) fn restore_project_exclusion_projection(
+    current: &str,
+    baseline: &ProjectExclusionBaseline,
+) -> Result<String, ConfigError> {
+    let mut document = current.parse::<DocumentMut>()?;
+    restore_optional_string(
+        &mut document,
+        "default_permissions",
+        baseline.default_permissions.as_deref(),
+    );
+    restore_optional_string(
+        &mut document,
+        "sandbox_mode",
+        baseline.sandbox_mode.as_deref(),
+    );
+    restore_agents_enabled(&mut document, baseline.agents_enabled)?;
+    Ok(render_document(document, current))
+}
+
+pub(crate) fn upsert_orchestration_projection(
+    existing: &str,
+    instructions: &str,
+    baseline: &OrchestrationBaseline,
+) -> Result<String, ConfigError> {
+    let mut document = existing.parse::<DocumentMut>()?;
+    let current_instructions =
+        optional_string(&document, "developer_instructions")?.unwrap_or_default();
+    let unmanaged = remove_orchestration_block(&current_instructions)?;
+    let block = format!("{ORCHESTRATION_BEGIN}\n{instructions}\n{ORCHESTRATION_END}");
+    let combined = if unmanaged.trim().is_empty() {
+        block
+    } else {
+        format!("{}\n\n{block}", unmanaged.trim_end())
+    };
+    document["developer_instructions"] = value(combined);
+    match baseline.permission_style {
+        PermissionStyle::DefaultPermissions => {
+            document.remove("sandbox_mode");
+            document["default_permissions"] = value(":read-only");
+        }
+        PermissionStyle::SandboxMode => {
+            document.remove("default_permissions");
+            document["sandbox_mode"] = value("read-only");
+        }
+    }
+    ensure_agents_table(&mut document)?;
+    document["agents"]["enabled"] = value(true);
+    Ok(render_document(document, existing))
+}
+
+pub(crate) fn remove_orchestration_projection(
+    existing: &str,
+    baseline: &OrchestrationBaseline,
+) -> Result<String, ConfigError> {
+    let mut document = existing.parse::<DocumentMut>()?;
+    let current_instructions =
+        optional_string(&document, "developer_instructions")?.unwrap_or_default();
+    let restored_instructions = remove_orchestration_block(&current_instructions)?;
+    if restored_instructions.trim().is_empty() {
+        document.remove("developer_instructions");
+    } else {
+        document["developer_instructions"] = value(restored_instructions.trim_end());
+    }
+    match baseline.permission_style {
+        PermissionStyle::DefaultPermissions => {
+            document.remove("sandbox_mode");
+            restore_optional_string(
+                &mut document,
+                "default_permissions",
+                baseline.default_permissions.as_deref(),
+            );
+        }
+        PermissionStyle::SandboxMode => {
+            document.remove("default_permissions");
+            restore_optional_string(
+                &mut document,
+                "sandbox_mode",
+                baseline.sandbox_mode.as_deref(),
+            );
+        }
+    }
+    restore_agents_enabled(&mut document, baseline.agents_enabled)?;
+    Ok(render_document(document, existing))
+}
+
+pub(crate) fn restore_orchestration_projection(
+    current: &str,
+    snapshot: &str,
+) -> Result<String, ConfigError> {
+    let snapshot_document = snapshot.parse::<DocumentMut>()?;
+    let mut document = current.parse::<DocumentMut>()?;
+    let current_instructions =
+        optional_string(&document, "developer_instructions")?.unwrap_or_default();
+    let unmanaged = remove_orchestration_block(&current_instructions)?;
+    let snapshot_instructions =
+        optional_string(&snapshot_document, "developer_instructions")?.unwrap_or_default();
+    let restored = match orchestration_block(&snapshot_instructions)? {
+        Some(block) if unmanaged.trim().is_empty() => block,
+        Some(block) => format!("{}\n\n{block}", unmanaged.trim_end()),
+        None => unmanaged,
+    };
+    if restored.trim().is_empty() {
+        document.remove("developer_instructions");
+    } else {
+        document["developer_instructions"] = value(restored.trim_end());
+    }
+    for key in ["default_permissions", "sandbox_mode"] {
+        match snapshot_document.get(key).cloned() {
+            Some(item) => {
+                document.insert(key, item);
+            }
+            None => {
+                document.remove(key);
+            }
+        }
+    }
+    let snapshot_agents_enabled = snapshot_document
+        .get("agents")
+        .and_then(Item::as_table)
+        .and_then(|agents| agents.get("enabled"))
+        .and_then(Item::as_value)
+        .and_then(TomlValue::as_bool);
+    restore_agents_enabled(&mut document, snapshot_agents_enabled)?;
+    Ok(render_document(document, current))
+}
+
+pub(crate) fn orchestration_projection_semantic(
+    document: &str,
+) -> Result<Option<String>, ConfigError> {
+    let document = document.parse::<DocumentMut>()?;
+    let instructions = optional_string(&document, "developer_instructions")?.unwrap_or_default();
+    let Some(block) = orchestration_block(&instructions)? else {
+        return Ok(None);
+    };
+    let semantic = serde_json::json!({
+        "block": block,
+        "defaultPermissions": optional_string(&document, "default_permissions")?,
+        "sandboxMode": optional_string(&document, "sandbox_mode")?,
+        "agentsEnabled": document
+            .get("agents")
+            .and_then(Item::as_table)
+            .and_then(|agents| agents.get("enabled"))
+            .and_then(Item::as_value)
+            .and_then(TomlValue::as_bool),
+    });
+    Ok(Some(
+        serde_json::to_string(&semantic).expect("JSON value must serialize"),
+    ))
+}
+
+pub(crate) fn upsert_global_orchestration_projection(
+    existing: &str,
+    instructions: &str,
+) -> Result<String, ConfigError> {
+    let unmanaged = remove_global_orchestration_projection(existing, None)?;
+    let separator = if unmanaged.is_empty() || unmanaged.ends_with("\n\n") {
+        ""
+    } else if unmanaged.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    Ok(format!(
+        "{unmanaged}{separator}{GLOBAL_ORCHESTRATION_BEGIN}\n{instructions}\n{GLOBAL_ORCHESTRATION_END}\n"
+    ))
+}
+
+pub(crate) fn remove_global_orchestration_projection(
+    existing: &str,
+    original: Option<&str>,
+) -> Result<String, ConfigError> {
+    let Some((start, end)) = marked_block_range(
+        existing,
+        GLOBAL_ORCHESTRATION_BEGIN,
+        GLOBAL_ORCHESTRATION_END,
+        "AGENTS.md",
+    )?
+    else {
+        return Ok(existing.to_owned());
+    };
+    if end == existing.len()
+        && let Some(original) = original
+    {
+        let separator = if original.is_empty() || original.ends_with("\n\n") {
+            ""
+        } else if original.ends_with('\n') {
+            "\n"
+        } else {
+            "\n\n"
+        };
+        if existing[..start] == format!("{original}{separator}") {
+            return Ok(original.to_owned());
+        }
+    }
+    Ok(format!("{}{}", &existing[..start], &existing[end..]))
+}
+
+pub(crate) fn global_orchestration_projection_semantic(
+    document: &str,
+) -> Result<Option<String>, ConfigError> {
+    Ok(marked_block_range(
+        document,
+        GLOBAL_ORCHESTRATION_BEGIN,
+        GLOBAL_ORCHESTRATION_END,
+        "AGENTS.md",
+    )?
+    .map(|(start, end)| {
+        document[start..end]
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+    }))
+}
+
+fn optional_string(
+    document: &DocumentMut,
+    key: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    document
+        .get(key)
+        .map(|item| {
+            item.as_value()
+                .and_then(TomlValue::as_str)
+                .map(str::to_owned)
+                .ok_or(ConfigError::InvalidStructure(key))
+        })
+        .transpose()
+}
+
+fn restore_optional_string(document: &mut DocumentMut, key: &str, original: Option<&str>) {
+    match original {
+        Some(original) => document[key] = value(original),
+        None => {
+            document.remove(key);
+        }
+    }
+}
+
+fn ensure_agents_table(document: &mut DocumentMut) -> Result<(), ConfigError> {
+    if !document.contains_key("agents") {
+        document["agents"] = Item::Table(Table::new());
+    }
+    document["agents"]
+        .as_table()
+        .ok_or(ConfigError::InvalidStructure("agents"))?;
+    Ok(())
+}
+
+fn restore_agents_enabled(
+    document: &mut DocumentMut,
+    original: Option<bool>,
+) -> Result<(), ConfigError> {
+    match original {
+        Some(original) => {
+            ensure_agents_table(document)?;
+            document["agents"]["enabled"] = value(original);
+        }
+        None => {
+            if let Some(agents) = document.get_mut("agents") {
+                let agents = agents
+                    .as_table_mut()
+                    .ok_or(ConfigError::InvalidStructure("agents"))?;
+                agents.remove("enabled");
+                if agents.is_empty() {
+                    document.remove("agents");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn orchestration_block(instructions: &str) -> Result<Option<String>, ConfigError> {
+    Ok(marked_block_range(
+        instructions,
+        ORCHESTRATION_BEGIN,
+        ORCHESTRATION_END,
+        "developer_instructions",
+    )?
+    .map(|(start, end)| instructions[start..end].to_owned()))
+}
+
+fn remove_orchestration_block(instructions: &str) -> Result<String, ConfigError> {
+    let Some(block) = orchestration_block(instructions)? else {
+        return Ok(instructions.to_owned());
+    };
+    Ok(instructions.replacen(&block, "", 1).trim_end().to_owned())
+}
+
+fn marked_block_range(
+    content: &str,
+    begin: &str,
+    end: &str,
+    field: &'static str,
+) -> Result<Option<(usize, usize)>, ConfigError> {
+    let Some(start) = content.find(begin) else {
+        if content.contains(end) {
+            return Err(ConfigError::InvalidStructure(field));
+        }
+        return Ok(None);
+    };
+    let tail = &content[start..];
+    let Some(end_offset) = tail.find(end) else {
+        return Err(ConfigError::InvalidStructure(field));
+    };
+    let block_end = start + end_offset + end.len();
+    let block_end = if content[block_end..].starts_with("\r\n") {
+        block_end + 2
+    } else if content[block_end..].starts_with('\n') {
+        block_end + 1
+    } else {
+        block_end
+    };
+    if content[block_end..].contains(begin) {
+        return Err(ConfigError::InvalidStructure(field));
+    }
+    Ok(Some((start, block_end)))
 }
 
 pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<String, ConfigError> {
@@ -466,6 +945,119 @@ name = "executor"
             document_semantic(first).unwrap(),
             document_semantic(second).unwrap()
         );
+    }
+
+    #[test]
+    fn orchestration_restores_legacy_permission_style_and_user_instructions() {
+        let existing = r#"sandbox_mode = "workspace-write"
+developer_instructions = "用户规则"
+
+[agents]
+enabled = false
+max_threads = 6
+"#;
+        let baseline = capture_orchestration_baseline(existing).unwrap();
+        let active = upsert_orchestration_projection(existing, "必须委派写入。", &baseline)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(active["sandbox_mode"].as_str(), Some("read-only"));
+        assert!(active.get("default_permissions").is_none());
+        assert_eq!(active["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(active["agents"]["max_threads"].as_integer(), Some(6));
+
+        let restored = remove_orchestration_projection(&active.to_string(), &baseline)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(restored["sandbox_mode"].as_str(), Some("workspace-write"));
+        assert_eq!(
+            restored["developer_instructions"].as_str(),
+            Some("用户规则")
+        );
+        assert_eq!(restored["agents"]["enabled"].as_bool(), Some(false));
+        assert_eq!(restored["agents"]["max_threads"].as_integer(), Some(6));
+    }
+
+    #[test]
+    fn global_orchestration_preserves_and_restores_user_instructions() {
+        let existing = "# 用户规则\n\n保留这段内容。\n";
+        let active = upsert_global_orchestration_projection(existing, "必须委派写入。").unwrap();
+
+        assert!(
+            global_orchestration_projection_semantic(&active)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            remove_global_orchestration_projection(&active, Some(existing)).unwrap(),
+            existing
+        );
+        assert_eq!(
+            global_orchestration_projection_semantic(&active).unwrap(),
+            global_orchestration_projection_semantic(&active.replace('\n', "\r\n")).unwrap()
+        );
+    }
+
+    #[test]
+    fn project_exclusion_preserves_user_config_and_restores_owned_fields() {
+        let existing = r#"# 用户注释
+default_permissions = ":read-only"
+
+[mcp_servers.example]
+command = "keep-me"
+
+[agents]
+enabled = true
+max_threads = 6
+"#;
+        let baseline =
+            capture_project_exclusion_baseline(existing, PermissionStyle::DefaultPermissions)
+                .unwrap();
+        let active =
+            upsert_project_exclusion_projection(existing, PermissionStyle::DefaultPermissions)
+                .unwrap();
+        let active_document = active.parse::<DocumentMut>().unwrap();
+        assert!(active.contains("# 用户注释"));
+        assert_eq!(
+            active_document["default_permissions"].as_str(),
+            Some(":workspace")
+        );
+        assert_eq!(active_document["agents"]["enabled"].as_bool(), Some(false));
+        assert!(project_exclusion_projection_matches(&active, &baseline).unwrap());
+
+        let later = active.replace("keep-me", "changed-later");
+        let restored = restore_project_exclusion_projection(&later, &baseline).unwrap();
+        let restored_document = restored.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            restored_document["default_permissions"].as_str(),
+            Some(":read-only")
+        );
+        assert_eq!(restored_document["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            restored_document["agents"]["max_threads"].as_integer(),
+            Some(6)
+        );
+        assert_eq!(
+            restored_document["mcp_servers"]["example"]["command"].as_str(),
+            Some("changed-later")
+        );
+    }
+
+    #[test]
+    fn project_exclusion_uses_legacy_sandbox_permission_style_when_required() {
+        let existing = "sandbox_mode = 'read-only'\n";
+        let baseline =
+            capture_project_exclusion_baseline(existing, PermissionStyle::SandboxMode).unwrap();
+        let active =
+            upsert_project_exclusion_projection(existing, PermissionStyle::SandboxMode).unwrap();
+        let active_document = active.parse::<DocumentMut>().unwrap();
+        assert!(active_document.get("default_permissions").is_none());
+        assert_eq!(
+            active_document["sandbox_mode"].as_str(),
+            Some("workspace-write")
+        );
+        assert!(project_exclusion_projection_matches(&active, &baseline).unwrap());
     }
 
     fn provider(

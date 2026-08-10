@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "codex-agent-switch"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cas-secret-store",
  "reqwest",

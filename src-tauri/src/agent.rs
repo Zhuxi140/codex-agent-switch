@@ -148,8 +148,8 @@ impl SqliteAgentRepository {
             "INSERT INTO agents (
                 id, agent_key, name, description, instruction, agent_type, enabled,
                 sandbox_policy, reasoning_policy, source, managed, minimum_context_window,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?12)",
+                created_at, updated_at, role_key, orchestration_phase
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?12, ?13, ?14)",
             params![
                 agent.id,
                 agent.agent_key,
@@ -163,6 +163,8 @@ impl SqliteAgentRepository {
                 agent.source,
                 agent.minimum_context_window,
                 timestamp,
+                agent.role_key,
+                agent.orchestration_phase,
             ],
         )?;
         insert_capabilities(
@@ -181,6 +183,7 @@ impl SqliteAgentRepository {
         if let Some(model_id) = &agent.model_id {
             let model =
                 load_model(&transaction, model_id)?.ok_or(AgentRepositoryError::ModelNotFound)?;
+            validate_reasoning_policy(agent.reasoning_policy, &model)?;
             let compatibility = evaluate_compatibility(
                 &agent.required_capabilities,
                 &agent.preferred_capabilities,
@@ -197,10 +200,56 @@ impl SqliteAgentRepository {
     }
 
     fn update(&mut self, changes: &AgentChanges) -> Result<AgentRecord, AgentRepositoryError> {
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let active = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM active_agent_bindings WHERE agent_id = ?1
+                UNION ALL
+                SELECT 1 FROM configuration_state WHERE id = 1 AND active_agent_id = ?1
+             )",
+            [&changes.id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if active {
+            let current = transaction.query_row(
+                "SELECT role_key, orchestration_phase FROM agents WHERE id = ?1",
+                [&changes.id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )?;
+            if current.0.as_deref() != Some(changes.role_key.as_str())
+                || current.1.as_deref() != Some(changes.orchestration_phase)
+            {
+                return Err(AgentRepositoryError::Active);
+            }
+        }
+        let current =
+            load_agent(&transaction, &changes.id)?.ok_or(AgentRepositoryError::NotFound)?;
+        if let Some(model_id) = &changes.model_id {
+            let model =
+                load_model(&transaction, model_id)?.ok_or(AgentRepositoryError::ModelNotFound)?;
+            validate_reasoning_policy(changes.reasoning_policy, &model)?;
+            let compatibility = evaluate_compatibility(
+                &current.required_capabilities,
+                &current.preferred_capabilities,
+                current.minimum_context_window,
+                &model,
+            );
+            if compatibility.status == BindingCompatibilityStatus::Incompatible {
+                return Err(AgentRepositoryError::IncompatibleModel);
+            }
+        }
+        let changed = transaction.execute(
             "UPDATE agents
              SET name = ?2, description = ?3, instruction = ?4, sandbox_policy = ?5,
-                 reasoning_policy = ?6, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 reasoning_policy = ?6, role_key = ?7, orchestration_phase = ?8,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
                 changes.id,
@@ -209,9 +258,31 @@ impl SqliteAgentRepository {
                 changes.instruction,
                 changes.sandbox_policy,
                 changes.reasoning_policy,
+                changes.role_key,
+                changes.orchestration_phase,
             ],
         )?;
         ensure_changed(changed)?;
+        let timestamp = now(&transaction)?;
+        if let Some(model_id) = &changes.model_id {
+            transaction.execute(
+                "INSERT INTO agent_model_bindings (
+                    id, agent_id, model_id, enabled, priority, source, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, 1, 0, 'USER', ?4, ?4)
+                 ON CONFLICT(agent_id) DO UPDATE SET
+                    model_id = excluded.model_id,
+                    enabled = 1,
+                    source = 'USER',
+                    updated_at = excluded.updated_at",
+                params![Uuid::new_v4().to_string(), changes.id, model_id, timestamp],
+            )?;
+        } else {
+            transaction.execute(
+                "DELETE FROM agent_model_bindings WHERE agent_id = ?1",
+                [&changes.id],
+            )?;
+        }
+        transaction.commit()?;
         self.find_by_id(&changes.id)
     }
 
@@ -241,6 +312,7 @@ impl SqliteAgentRepository {
         let agent = load_agent(&transaction, agent_id)?.ok_or(AgentRepositoryError::NotFound)?;
         let model =
             load_model(&transaction, model_id)?.ok_or(AgentRepositoryError::ModelNotFound)?;
+        validate_reasoning_policy(&agent.reasoning_policy, &model)?;
         let compatibility = evaluate_compatibility(
             &agent.required_capabilities,
             &agent.preferred_capabilities,
@@ -290,11 +362,15 @@ impl SqliteAgentRepository {
 
     fn delete(&mut self, id: &str) -> Result<(), AgentRepositoryError> {
         let active = self.connection.query_row(
-            "SELECT active_agent_id = ?1 FROM configuration_state WHERE id = 1",
+            "SELECT EXISTS(
+                SELECT 1 FROM active_agent_bindings WHERE agent_id = ?1
+                UNION ALL
+                SELECT 1 FROM configuration_state WHERE id = 1 AND active_agent_id = ?1
+             )",
             [id],
-            |row| row.get::<_, Option<bool>>(0),
+            |row| row.get::<_, bool>(0),
         )?;
-        if active == Some(true) {
+        if active {
             return Err(AgentRepositoryError::Active);
         }
         ensure_changed(
@@ -341,7 +417,8 @@ fn load_agent(
                     a.enabled, a.sandbox_policy, a.reasoning_policy, a.source, a.managed,
                     a.minimum_context_window, a.created_at, a.updated_at, m.id, m.provider_id,
                     p.name, m.model_id, m.display_name, m.enabled, p.enabled, m.lifecycle,
-                    m.compatibility_level, m.context_window
+                    m.compatibility_level, m.context_window, a.role_key, a.orchestration_phase,
+                    m.source, m.reasoning_supported, m.default_reasoning
              FROM agents a
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
              LEFT JOIN models m ON m.id = b.model_id
@@ -358,6 +435,8 @@ fn load_agent(
             load_capabilities(connection, "agent_preferred_capabilities", &record.id)?;
         if let Some(model) = record.model.as_mut() {
             model.capabilities = load_model_capabilities(connection, &model.reference.id)?;
+            model.reasoning_efforts =
+                load_model_reasoning_efforts(connection, &model.reference.id)?;
             record.compatibility = evaluate_compatibility(
                 &record.required_capabilities,
                 &record.preferred_capabilities,
@@ -377,7 +456,8 @@ fn load_model(
     let mut model = connection
         .query_row(
             "SELECT m.id, m.provider_id, p.name, m.model_id, m.display_name, m.enabled,
-                    p.enabled, m.lifecycle, m.compatibility_level, m.context_window
+                    p.enabled, m.lifecycle, m.compatibility_level, m.context_window,
+                    m.source, m.reasoning_supported, m.default_reasoning
              FROM models m
              JOIN providers p ON p.id = m.provider_id
              WHERE m.id = ?1",
@@ -387,6 +467,7 @@ fn load_model(
         .optional()?;
     if let Some(record) = model.as_mut() {
         record.capabilities = load_model_capabilities(connection, &record.reference.id)?;
+        record.reasoning_efforts = load_model_reasoning_efforts(connection, &record.reference.id)?;
     }
     Ok(model)
 }
@@ -412,6 +493,12 @@ fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
                 .unwrap_or_else(|| "UNKNOWN".into()),
             context_window: row.get(23)?,
             capabilities: HashMap::new(),
+            source: row
+                .get::<_, Option<String>>(26)?
+                .unwrap_or_else(|| "USER".into()),
+            reasoning_supported: row.get::<_, Option<i64>>(27)?.map(|value| value != 0),
+            default_reasoning: row.get(28)?,
+            reasoning_efforts: Vec::new(),
         })
     } else {
         None
@@ -431,6 +518,8 @@ fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         minimum_context_window: row.get(11)?,
         created_at: row.get(12)?,
         updated_at: row.get(13)?,
+        role_key: row.get(24)?,
+        orchestration_phase: row.get(25)?,
         required_capabilities: Vec::new(),
         preferred_capabilities: Vec::new(),
         model,
@@ -454,6 +543,10 @@ fn map_binding_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingModelRe
         compatibility_level: row.get(8)?,
         context_window: row.get(9)?,
         capabilities: HashMap::new(),
+        source: row.get(10)?,
+        reasoning_supported: row.get::<_, Option<i64>>(11)?.map(|value| value != 0),
+        default_reasoning: row.get(12)?,
+        reasoning_efforts: Vec::new(),
     })
 }
 
@@ -483,6 +576,46 @@ fn load_model_capabilities(
         })?
         .collect::<Result<HashMap<_, _>, _>>()
         .map_err(AgentRepositoryError::from)
+}
+
+fn load_model_reasoning_efforts(
+    connection: &Connection,
+    model_id: &str,
+) -> Result<Vec<String>, AgentRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT effort FROM model_reasoning_efforts
+         WHERE model_id = ?1 ORDER BY ordinal, effort",
+    )?;
+    statement
+        .query_map([model_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AgentRepositoryError::from)
+}
+
+fn validate_reasoning_policy(
+    reasoning_policy: &str,
+    model: &BindingModelRecord,
+) -> Result<(), AgentRepositoryError> {
+    if model.source != "PRESET" {
+        return Ok(());
+    }
+    if reasoning_policy == "MODEL_DEFAULT" {
+        return (model.reasoning_supported != Some(true) || model.default_reasoning.is_some())
+            .then_some(())
+            .ok_or(AgentRepositoryError::InvalidReasoningPolicy);
+    }
+    let effort = match reasoning_policy {
+        "LOW" => "low",
+        "MEDIUM" => "medium",
+        "HIGH" => "high",
+        _ => return Err(AgentRepositoryError::InvalidReasoningPolicy),
+    };
+    model
+        .reasoning_supported
+        .is_some_and(|supported| supported)
+        .then_some(())
+        .filter(|_| model.reasoning_efforts.iter().any(|value| value == effort))
+        .ok_or(AgentRepositoryError::InvalidReasoningPolicy)
 }
 
 fn insert_capabilities(
@@ -705,6 +838,8 @@ pub(crate) struct AgentCreateRequest {
     sandbox_policy: SandboxPolicy,
     reasoning_policy: ReasoningPolicy,
     model_id: Option<String>,
+    role_key: String,
+    orchestration_phase: Option<OrchestrationPhase>,
 }
 
 #[derive(Deserialize)]
@@ -716,6 +851,29 @@ pub(crate) struct AgentUpdateRequest {
     instruction: String,
     sandbox_policy: SandboxPolicy,
     reasoning_policy: ReasoningPolicy,
+    model_id: Option<String>,
+    role_key: String,
+    orchestration_phase: OrchestrationPhase,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum OrchestrationPhase {
+    Discovery,
+    Execution,
+    Verification,
+    Review,
+}
+
+impl OrchestrationPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Discovery => "DISCOVERY",
+            Self::Execution => "EXECUTION",
+            Self::Verification => "VERIFICATION",
+            Self::Review => "REVIEW",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -801,6 +959,8 @@ struct NewAgent {
     required_capabilities: Vec<String>,
     preferred_capabilities: Vec<String>,
     model_id: Option<String>,
+    role_key: String,
+    orchestration_phase: &'static str,
 }
 
 impl TryFrom<AgentCreateRequest> for NewAgent {
@@ -828,6 +988,12 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
             .filter(|value| !value.trim().is_empty())
             .map(|value| parse_uuid(&value, "modelId"))
             .transpose()?;
+        let role_key = value_or_default(request.role_key, preset.map(|value| value.key));
+        validate_role_key(&role_key)?;
+        let orchestration_phase = request
+            .orchestration_phase
+            .or_else(|| preset.map(|value| value.orchestration_phase))
+            .ok_or(AgentServiceError::InvalidField("orchestrationPhase"))?;
         Ok(Self {
             id: Uuid::new_v4().to_string(),
             agent_key,
@@ -847,6 +1013,8 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
                 .map(|value| strings(value.preferred_capabilities))
                 .unwrap_or_default(),
             model_id,
+            role_key,
+            orchestration_phase: orchestration_phase.as_str(),
         })
     }
 }
@@ -858,6 +1026,9 @@ struct AgentChanges {
     instruction: String,
     sandbox_policy: &'static str,
     reasoning_policy: &'static str,
+    model_id: Option<String>,
+    role_key: String,
+    orchestration_phase: &'static str,
 }
 
 impl TryFrom<AgentUpdateRequest> for AgentChanges {
@@ -868,6 +1039,12 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
         validate_text(&request.name, "name", 160)?;
         validate_text(&request.description, "description", 2_000)?;
         validate_text(&request.instruction, "instruction", 100_000)?;
+        validate_role_key(&request.role_key)?;
+        let model_id = request
+            .model_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| parse_uuid(&value, "modelId"))
+            .transpose()?;
         Ok(Self {
             id,
             name: request.name.trim().to_owned(),
@@ -875,6 +1052,9 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
             instruction: request.instruction.trim().to_owned(),
             sandbox_policy: request.sandbox_policy.as_str(),
             reasoning_policy: request.reasoning_policy.as_str(),
+            model_id,
+            role_key: request.role_key.trim().to_owned(),
+            orchestration_phase: request.orchestration_phase.as_str(),
         })
     }
 }
@@ -910,6 +1090,19 @@ fn validate_agent_key(value: &str) -> Result<(), AgentServiceError> {
         .ok_or(AgentServiceError::InvalidField("agentKey"))
 }
 
+fn validate_role_key(value: &str) -> Result<(), AgentServiceError> {
+    let mut bytes = value.bytes();
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    valid
+        .then_some(())
+        .ok_or(AgentServiceError::InvalidField("roleKey"))
+}
+
 fn validate_text(
     value: &str,
     field: &'static str,
@@ -930,6 +1123,7 @@ struct AgentPresetDefinition {
     required_capabilities: &'static [&'static str],
     preferred_capabilities: &'static [&'static str],
     minimum_context_window: Option<i64>,
+    orchestration_phase: OrchestrationPhase,
 }
 
 const COMMON_REQUIRED: &[&str] = &["TOOL_CALLING", "CODEX_MULTI_AGENT"];
@@ -945,6 +1139,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
+        orchestration_phase: OrchestrationPhase::Execution,
     },
     AgentPresetDefinition {
         key: "explorer",
@@ -956,6 +1151,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
+        orchestration_phase: OrchestrationPhase::Discovery,
     },
     AgentPresetDefinition {
         key: "reviewer",
@@ -967,6 +1163,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
+        orchestration_phase: OrchestrationPhase::Review,
     },
     AgentPresetDefinition {
         key: "tester",
@@ -978,6 +1175,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
+        orchestration_phase: OrchestrationPhase::Verification,
     },
 ];
 
@@ -998,6 +1196,8 @@ pub(crate) struct AgentPresetResponse {
     default_sandbox_policy: &'static str,
     default_reasoning_policy: &'static str,
     required_capabilities: &'static [&'static str],
+    role_key: &'static str,
+    orchestration_phase: &'static str,
 }
 
 impl From<&'static AgentPresetDefinition> for AgentPresetResponse {
@@ -1009,6 +1209,8 @@ impl From<&'static AgentPresetDefinition> for AgentPresetResponse {
             default_sandbox_policy: preset.sandbox_policy,
             default_reasoning_policy: preset.reasoning_policy,
             required_capabilities: preset.required_capabilities,
+            role_key: preset.key,
+            orchestration_phase: preset.orchestration_phase.as_str(),
         }
     }
 }
@@ -1033,6 +1235,8 @@ struct AgentRecord {
     model: Option<BindingModelRecord>,
     compatibility: AgentBindingCompatibility,
     availability: AgentAvailability,
+    role_key: Option<String>,
+    orchestration_phase: Option<String>,
 }
 
 struct BindingModelRecord {
@@ -1043,6 +1247,10 @@ struct BindingModelRecord {
     compatibility_level: String,
     context_window: Option<i64>,
     capabilities: HashMap<String, String>,
+    source: String,
+    reasoning_supported: Option<bool>,
+    default_reasoning: Option<String>,
+    reasoning_efforts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1066,6 +1274,8 @@ pub(crate) struct AgentSummary {
     model: Option<AgentModelReference>,
     availability: AgentAvailability,
     reasoning_policy: String,
+    role_key: Option<String>,
+    orchestration_phase: Option<String>,
 }
 
 impl From<AgentRecord> for AgentSummary {
@@ -1079,6 +1289,8 @@ impl From<AgentRecord> for AgentSummary {
             model: agent.model.map(|model| model.reference),
             availability: agent.availability,
             reasoning_policy: agent.reasoning_policy,
+            role_key: agent.role_key,
+            orchestration_phase: agent.orchestration_phase,
         }
     }
 }
@@ -1103,6 +1315,8 @@ pub(crate) struct AgentDetailResponse {
     managed: bool,
     created_at: String,
     updated_at: String,
+    role_key: Option<String>,
+    orchestration_phase: Option<String>,
 }
 
 impl From<AgentRecord> for AgentDetailResponse {
@@ -1125,6 +1339,8 @@ impl From<AgentRecord> for AgentDetailResponse {
             managed: agent.managed,
             created_at: agent.created_at,
             updated_at: agent.updated_at,
+            role_key: agent.role_key,
+            orchestration_phase: agent.orchestration_phase,
         }
     }
 }
@@ -1231,6 +1447,7 @@ pub(crate) enum AgentRepositoryError {
     NotFound,
     ModelNotFound,
     IncompatibleModel,
+    InvalidReasoningPolicy,
     Active,
     Conflict,
     Persistence(PersistenceError),
@@ -1243,6 +1460,9 @@ impl fmt::Display for AgentRepositoryError {
             Self::NotFound => formatter.write_str("agent not found"),
             Self::ModelNotFound => formatter.write_str("model not found"),
             Self::IncompatibleModel => formatter.write_str("model incompatible"),
+            Self::InvalidReasoningPolicy => {
+                formatter.write_str("reasoning policy is unsupported by model")
+            }
             Self::Active => formatter.write_str("agent is active"),
             Self::Conflict => formatter.write_str("agent key conflict"),
             Self::Persistence(error) => write!(formatter, "persistence failed: {error}"),
@@ -1300,6 +1520,14 @@ impl From<AgentServiceError> for ApiError {
             AgentServiceError::Repository(AgentRepositoryError::IncompatibleModel) => {
                 ("MODEL_INCOMPATIBLE", "Model 与 Agent 明确不兼容。", false)
             }
+            AgentServiceError::Repository(AgentRepositoryError::InvalidReasoningPolicy) => {
+                details = Some(BTreeMap::from([("field", "reasoningPolicy".to_owned())]));
+                (
+                    "REASONING_POLICY_UNSUPPORTED",
+                    "所选 Model 不支持该 Reasoning。",
+                    false,
+                )
+            }
             AgentServiceError::Repository(AgentRepositoryError::Active) => (
                 "AGENT_ACTIVE",
                 "当前正在使用该 Agent，请先在概览切换运行模式。",
@@ -1349,6 +1577,8 @@ mod tests {
             sandbox_policy: SandboxPolicy::WorkspaceWrite,
             reasoning_policy: ReasoningPolicy::High,
             model_id,
+            role_key: String::new(),
+            orchestration_phase: None,
         }
     }
 
@@ -1404,6 +1634,34 @@ mod tests {
         model_id
     }
 
+    fn set_preset_reasoning(
+        service: &AgentService,
+        model_id: &str,
+        default_effort: &str,
+        efforts: &[&str],
+    ) {
+        let repository = service.repository().unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE models
+                 SET source = 'PRESET', reasoning_supported = 1, default_reasoning = ?2
+                 WHERE id = ?1",
+                params![model_id, default_effort],
+            )
+            .unwrap();
+        for (ordinal, effort) in efforts.iter().enumerate() {
+            repository
+                .connection
+                .execute(
+                    "INSERT INTO model_reasoning_efforts (model_id, effort, ordinal)
+                     VALUES (?1, ?2, ?3)",
+                    params![model_id, effort, ordinal as i64],
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
     fn exposes_four_agent_presets() {
         let service = AgentService::in_memory();
@@ -1418,6 +1676,8 @@ mod tests {
             .create(request(Some("executor"), Some(model_id)))
             .unwrap();
         assert_eq!(agent.agent_key, "executor");
+        assert_eq!(agent.role_key.as_deref(), Some("executor"));
+        assert_eq!(agent.orchestration_phase.as_deref(), Some("EXECUTION"));
         assert_eq!(
             agent.required_capabilities,
             vec!["CODEX_MULTI_AGENT".to_owned(), "TOOL_CALLING".to_owned()]
@@ -1456,6 +1716,40 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn preset_model_rejects_inherited_or_unsupported_reasoning() {
+        let service = AgentService::in_memory();
+        let model_id = insert_model(&service, "NATIVE", true);
+        set_preset_reasoning(&service, &model_id, "medium", &["low", "medium"]);
+
+        let mut inherited = request(Some("executor"), Some(model_id.clone()));
+        inherited.reasoning_policy = ReasoningPolicy::Inherit;
+        assert_eq!(
+            service.create(inherited).unwrap_err().code(),
+            "REASONING_POLICY_UNSUPPORTED"
+        );
+
+        let mut unsupported = request(Some("executor"), Some(model_id));
+        unsupported.reasoning_policy = ReasoningPolicy::High;
+        assert_eq!(
+            service.create(unsupported).unwrap_err().code(),
+            "REASONING_POLICY_UNSUPPORTED"
+        );
+    }
+
+    #[test]
+    fn preset_model_accepts_supported_reasoning() {
+        let service = AgentService::in_memory();
+        let model_id = insert_model(&service, "NATIVE", true);
+        set_preset_reasoning(&service, &model_id, "high", &["low", "medium", "high"]);
+
+        let agent = service
+            .create(request(Some("executor"), Some(model_id)))
+            .unwrap();
+
+        assert_eq!(agent.reasoning_policy, "HIGH");
     }
 
     #[test]

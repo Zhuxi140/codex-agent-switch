@@ -117,7 +117,20 @@ export interface ConfigurationApplyResponse {
 }
 
 export interface RuntimeModeResponse {
-  activeAgentId: string | null;
+  activeBindings: ActiveAgentBinding[];
+  legacyActiveAgentId: string | null;
+}
+
+export interface ProjectExclusion {
+  id: string;
+  projectPath: string;
+  createdAt: string;
+}
+
+export interface ActiveAgentBinding {
+  roleKey: string;
+  phase: OrchestrationPhase;
+  agentId: string;
 }
 
 export interface SnapshotSummary {
@@ -151,10 +164,26 @@ export function getRuntimeMode(): Promise<RuntimeModeResponse> {
 }
 
 export function switchRuntimeMode(
-  activeAgentId: string | null,
+  activeAgentIds: string[],
 ): Promise<ConfigurationApplyResponse> {
   return invoke<ConfigurationApplyResponse>("runtime_mode_switch", {
-    request: { activeAgentId },
+    request: { activeAgentIds },
+  });
+}
+
+export function listProjectExclusions(): Promise<ProjectExclusion[]> {
+  return invoke<ProjectExclusion[]>("project_exclusion_list");
+}
+
+export function addProjectExclusion(projectPath: string): Promise<ProjectExclusion> {
+  return invoke<ProjectExclusion>("project_exclusion_add", {
+    request: { projectPath },
+  });
+}
+
+export function deleteProjectExclusion(exclusionId: string): Promise<void> {
+  return invoke<void>("project_exclusion_delete", {
+    request: { exclusionId },
   });
 }
 
@@ -274,6 +303,10 @@ export interface ModelSummary {
   lifecycle: ModelLifecycle;
   compatibility: CompatibilityLevel;
   contextWindow: number | null;
+  source: "PRESET" | "USER" | "IMPORTED";
+  reasoningStatus: "SUPPORTED" | "UNSUPPORTED" | "UNKNOWN";
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string | null;
   lastTestStatus: ModelConnectionTestStatus | null;
   lastTestedAt: string | null;
   lastTestLatencyMs: number | null;
@@ -411,7 +444,11 @@ export interface AgentSummary {
   model: AgentModelReference | null;
   availability: AgentAvailability;
   reasoningPolicy: ReasoningPolicy;
+  roleKey: string | null;
+  orchestrationPhase: OrchestrationPhase | null;
 }
+
+export type OrchestrationPhase = "DISCOVERY" | "EXECUTION" | "VERIFICATION" | "REVIEW";
 
 export interface AgentDetailResponse {
   id: string;
@@ -423,6 +460,8 @@ export interface AgentDetailResponse {
   enabled: boolean;
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
+  roleKey: string | null;
+  orchestrationPhase: OrchestrationPhase | null;
   requiredCapabilities: string[];
   preferredCapabilities: string[];
   modelBinding: AgentModelReference | null;
@@ -440,6 +479,8 @@ export interface AgentPresetResponse {
   defaultSandboxPolicy: SandboxPolicy;
   defaultReasoningPolicy: ReasoningPolicy;
   requiredCapabilities: string[];
+  roleKey: string;
+  orchestrationPhase: OrchestrationPhase;
 }
 
 export interface AgentCreateRequest {
@@ -452,6 +493,8 @@ export interface AgentCreateRequest {
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
   modelId?: string | null;
+  roleKey: string;
+  orchestrationPhase?: OrchestrationPhase | null;
 }
 
 export interface AgentUpdateRequest {
@@ -461,6 +504,9 @@ export interface AgentUpdateRequest {
   instruction: string;
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
+  modelId?: string | null;
+  roleKey: string;
+  orchestrationPhase: OrchestrationPhase;
 }
 
 export function listAgentPresets(): Promise<AgentPresetResponse[]> {
