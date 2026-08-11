@@ -148,8 +148,11 @@ impl SqliteAgentRepository {
             "INSERT INTO agents (
                 id, agent_key, name, description, instruction, agent_type, enabled,
                 sandbox_policy, reasoning_policy, source, managed, minimum_context_window,
-                created_at, updated_at, role_key, orchestration_phase
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?12, ?13, ?14)",
+                created_at, updated_at, role_key, orchestration_phase, reuse_strategy,
+                cache_retention_override_seconds
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 1, ?11, ?12, ?12, ?13, ?14, ?15, ?16
+             )",
             params![
                 agent.id,
                 agent.agent_key,
@@ -165,6 +168,8 @@ impl SqliteAgentRepository {
                 timestamp,
                 agent.role_key,
                 agent.orchestration_phase,
+                agent.reuse_strategy,
+                agent.cache_retention_override_seconds,
             ],
         )?;
         insert_capabilities(
@@ -249,6 +254,8 @@ impl SqliteAgentRepository {
             "UPDATE agents
              SET name = ?2, description = ?3, instruction = ?4, sandbox_policy = ?5,
                  reasoning_policy = ?6, role_key = ?7, orchestration_phase = ?8,
+                 reuse_strategy = COALESCE(?9, reuse_strategy),
+                 cache_retention_override_seconds = ?10,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
@@ -260,6 +267,8 @@ impl SqliteAgentRepository {
                 changes.reasoning_policy,
                 changes.role_key,
                 changes.orchestration_phase,
+                changes.reuse_strategy,
+                changes.cache_retention_override_seconds,
             ],
         )?;
         ensure_changed(changed)?;
@@ -418,7 +427,8 @@ fn load_agent(
                     a.minimum_context_window, a.created_at, a.updated_at, m.id, m.provider_id,
                     p.name, m.model_id, m.display_name, m.enabled, p.enabled, m.lifecycle,
                     m.compatibility_level, m.context_window, a.role_key, a.orchestration_phase,
-                    m.source, m.reasoning_supported, m.default_reasoning
+                    m.source, m.reasoning_supported, m.default_reasoning, a.reuse_strategy,
+                    a.cache_retention_override_seconds
              FROM agents a
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
              LEFT JOIN models m ON m.id = b.model_id
@@ -520,6 +530,8 @@ fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         updated_at: row.get(13)?,
         role_key: row.get(24)?,
         orchestration_phase: row.get(25)?,
+        reuse_strategy: row.get(29)?,
+        cache_retention_override_seconds: row.get(30)?,
         required_capabilities: Vec::new(),
         preferred_capabilities: Vec::new(),
         model,
@@ -720,7 +732,6 @@ fn evaluate_compatibility(
             CompatibilityIssueSeverity::Warning,
             format!("Model lifecycle 为 {}。", model.lifecycle),
         ),
-        "UNKNOWN" => unknown = true,
         _ => {}
     }
 
@@ -807,8 +818,14 @@ fn availability(agent: &AgentRecord) -> AgentAvailability {
     if !model.model_enabled {
         return AgentAvailability::InvalidConfiguration;
     }
-    if agent.compatibility.status == BindingCompatibilityStatus::Incompatible {
-        return AgentAvailability::IncompatibleModel;
+    match agent.compatibility.status {
+        BindingCompatibilityStatus::Incompatible => {
+            return AgentAvailability::IncompatibleModel;
+        }
+        BindingCompatibilityStatus::Unknown => {
+            return AgentAvailability::UnverifiedModel;
+        }
+        _ => {}
     }
     AgentAvailability::Ready
 }
@@ -840,6 +857,10 @@ pub(crate) struct AgentCreateRequest {
     model_id: Option<String>,
     role_key: String,
     orchestration_phase: Option<OrchestrationPhase>,
+    #[serde(default)]
+    reuse_strategy: Option<ReuseStrategy>,
+    #[serde(default)]
+    cache_retention_override_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -854,6 +875,9 @@ pub(crate) struct AgentUpdateRequest {
     model_id: Option<String>,
     role_key: String,
     orchestration_phase: OrchestrationPhase,
+    #[serde(default)]
+    reuse_strategy: Option<ReuseStrategy>,
+    cache_retention_override_seconds: Option<i64>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -872,6 +896,24 @@ impl OrchestrationPhase {
             Self::Execution => "EXECUTION",
             Self::Verification => "VERIFICATION",
             Self::Review => "REVIEW",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ReuseStrategy {
+    Auto,
+    Hot,
+    Cold,
+}
+
+impl ReuseStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "AUTO",
+            Self::Hot => "HOT",
+            Self::Cold => "COLD",
         }
     }
 }
@@ -961,6 +1003,8 @@ struct NewAgent {
     model_id: Option<String>,
     role_key: String,
     orchestration_phase: &'static str,
+    reuse_strategy: &'static str,
+    cache_retention_override_seconds: Option<i64>,
 }
 
 impl TryFrom<AgentCreateRequest> for NewAgent {
@@ -994,6 +1038,7 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
             .orchestration_phase
             .or_else(|| preset.map(|value| value.orchestration_phase))
             .ok_or(AgentServiceError::InvalidField("orchestrationPhase"))?;
+        validate_cache_retention_override(request.cache_retention_override_seconds)?;
         Ok(Self {
             id: Uuid::new_v4().to_string(),
             agent_key,
@@ -1015,6 +1060,11 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
             model_id,
             role_key,
             orchestration_phase: orchestration_phase.as_str(),
+            reuse_strategy: request
+                .reuse_strategy
+                .unwrap_or(ReuseStrategy::Auto)
+                .as_str(),
+            cache_retention_override_seconds: request.cache_retention_override_seconds,
         })
     }
 }
@@ -1029,6 +1079,8 @@ struct AgentChanges {
     model_id: Option<String>,
     role_key: String,
     orchestration_phase: &'static str,
+    reuse_strategy: Option<&'static str>,
+    cache_retention_override_seconds: Option<i64>,
 }
 
 impl TryFrom<AgentUpdateRequest> for AgentChanges {
@@ -1045,6 +1097,7 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
             .filter(|value| !value.trim().is_empty())
             .map(|value| parse_uuid(&value, "modelId"))
             .transpose()?;
+        validate_cache_retention_override(request.cache_retention_override_seconds)?;
         Ok(Self {
             id,
             name: request.name.trim().to_owned(),
@@ -1055,8 +1108,19 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
             model_id,
             role_key: request.role_key.trim().to_owned(),
             orchestration_phase: request.orchestration_phase.as_str(),
+            reuse_strategy: request.reuse_strategy.map(ReuseStrategy::as_str),
+            cache_retention_override_seconds: request.cache_retention_override_seconds,
         })
     }
+}
+
+fn validate_cache_retention_override(value: Option<i64>) -> Result<(), AgentServiceError> {
+    if value.is_some_and(|seconds| !(1..=31_536_000).contains(&seconds)) {
+        return Err(AgentServiceError::InvalidField(
+            "cacheRetentionOverrideSeconds",
+        ));
+    }
+    Ok(())
 }
 
 fn value_or_default(value: String, default: Option<&str>) -> String {
@@ -1237,6 +1301,8 @@ struct AgentRecord {
     availability: AgentAvailability,
     role_key: Option<String>,
     orchestration_phase: Option<String>,
+    reuse_strategy: String,
+    cache_retention_override_seconds: Option<i64>,
 }
 
 struct BindingModelRecord {
@@ -1274,6 +1340,8 @@ pub(crate) struct AgentSummary {
     model: Option<AgentModelReference>,
     availability: AgentAvailability,
     reasoning_policy: String,
+    reuse_strategy: String,
+    cache_retention_override_seconds: Option<i64>,
     role_key: Option<String>,
     orchestration_phase: Option<String>,
 }
@@ -1289,6 +1357,8 @@ impl From<AgentRecord> for AgentSummary {
             model: agent.model.map(|model| model.reference),
             availability: agent.availability,
             reasoning_policy: agent.reasoning_policy,
+            reuse_strategy: agent.reuse_strategy,
+            cache_retention_override_seconds: agent.cache_retention_override_seconds,
             role_key: agent.role_key,
             orchestration_phase: agent.orchestration_phase,
         }
@@ -1307,6 +1377,8 @@ pub(crate) struct AgentDetailResponse {
     enabled: bool,
     sandbox_policy: String,
     reasoning_policy: String,
+    reuse_strategy: String,
+    cache_retention_override_seconds: Option<i64>,
     required_capabilities: Vec<String>,
     preferred_capabilities: Vec<String>,
     model_binding: Option<AgentModelReference>,
@@ -1331,6 +1403,8 @@ impl From<AgentRecord> for AgentDetailResponse {
             enabled: agent.enabled,
             sandbox_policy: agent.sandbox_policy,
             reasoning_policy: agent.reasoning_policy,
+            reuse_strategy: agent.reuse_strategy,
+            cache_retention_override_seconds: agent.cache_retention_override_seconds,
             required_capabilities: agent.required_capabilities,
             preferred_capabilities: agent.preferred_capabilities,
             model_binding: agent.model.map(|model| model.reference),
@@ -1373,6 +1447,7 @@ enum AgentAvailability {
     ModelMissing,
     ProviderUnavailable,
     IncompatibleModel,
+    UnverifiedModel,
     InvalidConfiguration,
 }
 
@@ -1579,6 +1654,8 @@ mod tests {
             model_id,
             role_key: String::new(),
             orchestration_phase: None,
+            reuse_strategy: None,
+            cache_retention_override_seconds: None,
         }
     }
 
@@ -1678,6 +1755,7 @@ mod tests {
         assert_eq!(agent.agent_key, "executor");
         assert_eq!(agent.role_key.as_deref(), Some("executor"));
         assert_eq!(agent.orchestration_phase.as_deref(), Some("EXECUTION"));
+        assert_eq!(agent.reuse_strategy, "AUTO");
         assert_eq!(
             agent.required_capabilities,
             vec!["CODEX_MULTI_AGENT".to_owned(), "TOOL_CALLING".to_owned()]
@@ -1686,6 +1764,38 @@ mod tests {
         assert_eq!(
             agent.compatibility.status,
             BindingCompatibilityStatus::Compatible
+        );
+    }
+
+    #[test]
+    fn agent_cache_retention_override_round_trips_and_validates() {
+        let service = AgentService::in_memory();
+        let mut valid = request(Some("executor"), None);
+        valid.cache_retention_override_seconds = Some(300);
+        let agent = service.create(valid).unwrap();
+        assert_eq!(agent.cache_retention_override_seconds, Some(300));
+        let updated = service
+            .update(AgentUpdateRequest {
+                agent_id: agent.id,
+                name: agent.name,
+                description: agent.description,
+                instruction: agent.instruction,
+                sandbox_policy: SandboxPolicy::WorkspaceWrite,
+                reasoning_policy: ReasoningPolicy::High,
+                model_id: None,
+                role_key: agent.role_key.unwrap(),
+                orchestration_phase: OrchestrationPhase::Execution,
+                reuse_strategy: Some(ReuseStrategy::Auto),
+                cache_retention_override_seconds: None,
+            })
+            .unwrap();
+        assert_eq!(updated.cache_retention_override_seconds, None);
+
+        let mut invalid = request(Some("reviewer"), None);
+        invalid.cache_retention_override_seconds = Some(0);
+        assert_eq!(
+            service.create(invalid).unwrap_err().code(),
+            "VALIDATION_ERROR"
         );
     }
 
@@ -1700,6 +1810,37 @@ mod tests {
             agent.compatibility.status,
             BindingCompatibilityStatus::Unknown
         );
+    }
+
+    #[test]
+    fn verified_model_with_unknown_lifecycle_remains_available() {
+        let service = AgentService::in_memory();
+        let model_id = insert_model(&service, "COMPATIBLE", true);
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE models SET lifecycle = 'UNKNOWN' WHERE id = ?1",
+                [&model_id],
+            )
+            .unwrap();
+
+        let agent = service
+            .create(request(Some("executor"), Some(model_id)))
+            .unwrap();
+
+        assert_eq!(
+            agent.compatibility.status,
+            BindingCompatibilityStatus::Compatible
+        );
+        let summary = service
+            .list(AgentListRequest::default())
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == agent.id)
+            .unwrap();
+        assert!(matches!(summary.availability, AgentAvailability::Ready));
     }
 
     #[test]

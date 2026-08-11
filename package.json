@@ -6,6 +6,11 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:bundle": "npm run build && npm run prepare:sidecar",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "bundle:windows": "tauri build --bundles nsis",
+    "poc:app-server": "node scripts/cas-app-server-poc.mjs",
+    "poc:app-server:self-test": "node scripts/cas-app-server-poc.mjs --self-test",
     "tauri": "tauri"
   },
   "dependencies": {

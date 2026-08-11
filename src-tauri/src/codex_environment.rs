@@ -7,10 +7,26 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use serde::Deserialize;
 use serde::Serialize;
 
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const RUNTIME_OVERRIDE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MINIMUM_MULTI_AGENT_VERSION: ClientVersion = ClientVersion(0, 144, 0);
+#[cfg(windows)]
+const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +40,12 @@ pub(crate) struct CodexEnvironment {
     pub(crate) configuration_writable: bool,
     pub(crate) multi_agent_available: bool,
     pub(crate) issues: Vec<DiagnosticIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RuntimePermissionOverride {
+    pub(crate) process_id: u32,
+    pub(crate) flags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +159,254 @@ pub(crate) fn detect_with_codex_home(custom_codex_home: Option<PathBuf>) -> Code
         multi_agent_available: supported,
         issues,
     }
+}
+
+pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
+    #[cfg(windows)]
+    {
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return false;
+            }
+
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut found = false;
+            let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+            while has_entry {
+                if is_codex_process_name(&entry.szExeFile) {
+                    let process =
+                        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
+                    if !process.is_null() {
+                        let mut created = FILETIME::default();
+                        let mut exited = FILETIME::default();
+                        let mut kernel = FILETIME::default();
+                        let mut user = FILETIME::default();
+                        if GetProcessTimes(
+                            process,
+                            &mut created,
+                            &mut exited,
+                            &mut kernel,
+                            &mut user,
+                        ) != 0
+                            && filetime_to_unix_ms(created) < last_applied_at_ms
+                        {
+                            found = true;
+                        }
+                        CloseHandle(process);
+                    }
+                }
+                if found {
+                    break;
+                }
+                has_entry = Process32NextW(snapshot, &mut entry) != 0;
+            }
+            CloseHandle(snapshot);
+            found
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = last_applied_at_ms;
+        false
+    }
+}
+
+pub(crate) fn detect_runtime_permission_overrides() -> Result<Vec<RuntimePermissionOverride>, String>
+{
+    #[cfg(windows)]
+    {
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r#"ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -Filter "Name='codex.exe' OR Name='ChatGPT.exe'" -ErrorAction Stop | Select-Object ProcessId,Name,CommandLine) -Compress"#,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("无法启动运行时权限覆盖检测：{error}"))?;
+        let deadline = Instant::now() + RUNTIME_OVERRIDE_PROBE_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("运行时权限覆盖检测超过 3 秒。".to_owned());
+                }
+                Err(error) => return Err(format!("运行时权限覆盖检测失败：{error}")),
+            }
+        };
+        let stdout = read_pipe(child.stdout.take());
+        let stderr = read_pipe(child.stderr.take());
+        if !status.success() {
+            return Err(if stderr.trim().is_empty() {
+                format!("运行时权限覆盖检测退出码：{status}")
+            } else {
+                format!("运行时权限覆盖检测失败：{}", stderr.trim())
+            });
+        }
+        if stdout.trim().is_empty() {
+            return Err(if stderr.trim().is_empty() {
+                "运行时权限覆盖检测没有返回结果。".to_owned()
+            } else {
+                format!("运行时权限覆盖检测失败：{}", stderr.trim())
+            });
+        }
+        let processes = serde_json::from_str::<Vec<WindowsProcessCommand>>(stdout.trim())
+            .map_err(|error| format!("运行时权限覆盖检测结果无法解析：{error}"))?;
+        return Ok(collect_permission_overrides(
+            processes.into_iter().filter_map(|process| {
+                process
+                    .command_line
+                    .map(|command_line| (process.process_id, process.name, command_line))
+            }),
+        ));
+    }
+    #[cfg(not(windows))]
+    {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,comm=,args="])
+            .output()
+            .map_err(|error| format!("无法启动运行时权限覆盖检测：{error}"))?;
+        if !output.status.success() {
+            return Err(format!("运行时权限覆盖检测退出码：{}", output.status));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let processes = stdout.lines().filter_map(parse_ps_process);
+        Ok(collect_permission_overrides(processes))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WindowsProcessCommand {
+    process_id: u32,
+    name: String,
+    command_line: Option<String>,
+}
+
+fn collect_permission_overrides(
+    processes: impl IntoIterator<Item = (u32, String, String)>,
+) -> Vec<RuntimePermissionOverride> {
+    processes
+        .into_iter()
+        .filter(|(_, name, _)| is_codex_process_label(name))
+        .filter_map(|(process_id, _, command_line)| {
+            let flags = permission_override_flags(&command_line);
+            (!flags.is_empty()).then_some(RuntimePermissionOverride { process_id, flags })
+        })
+        .collect()
+}
+
+fn is_codex_process_label(name: &str) -> bool {
+    let name = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "codex" | "codex.exe" | "chatgpt" | "chatgpt.exe"
+    )
+}
+
+fn permission_override_flags(command_line: &str) -> Vec<String> {
+    let tokens = command_line
+        .split_whitespace()
+        .map(|token| token.trim_matches(['"', '\'']).to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let mut flags = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = &tokens[index];
+        if matches!(
+            token.as_str(),
+            "--approve-for-me"
+                | "--dangerously-bypass-approvals-and-sandbox"
+                | "--full-auto"
+                | "--yolo"
+        ) {
+            flags.push(token.clone());
+        } else if token == "--sandbox" || token == "-s" {
+            let value = tokens.get(index + 1).map(String::as_str).unwrap_or("?");
+            flags.push(format!("{token}={value}"));
+            index += 1;
+        } else if let Some(value) = token.strip_prefix("--sandbox=") {
+            flags.push(format!("--sandbox={value}"));
+        } else if matches!(
+            token.as_str(),
+            "--ask-for-approval" | "-a" | "--profile" | "-p" | "--add-dir"
+        ) {
+            let value = tokens.get(index + 1).map(String::as_str).unwrap_or("?");
+            flags.push(format!("{token}={value}"));
+            index += 1;
+        } else if ["--ask-for-approval=", "--profile=", "--add-dir="]
+            .iter()
+            .any(|prefix| token.starts_with(prefix))
+        {
+            flags.push(token.clone());
+        } else if token == "-c" || token == "--config" {
+            if let Some(value) = tokens.get(index + 1)
+                && is_permission_config_override(value)
+            {
+                flags.push(format!("{token}={value}"));
+            }
+            index += 1;
+        } else if let Some(value) = token.strip_prefix("--config=")
+            && is_permission_config_override(value)
+        {
+            flags.push(format!("--config={value}"));
+        }
+        index += 1;
+    }
+    flags.sort();
+    flags.dedup();
+    flags
+}
+
+fn is_permission_config_override(value: &str) -> bool {
+    ["approval_policy=", "default_permissions=", "sandbox_mode="]
+        .iter()
+        .any(|key| value.starts_with(key))
+}
+
+#[cfg(not(windows))]
+fn parse_ps_process(line: &str) -> Option<(u32, String, String)> {
+    let mut fields = line.split_whitespace();
+    let process_id_text = fields.next()?;
+    let process_id = process_id_text.parse().ok()?;
+    let name = fields.next()?.to_owned();
+    let command_line = fields.collect::<Vec<_>>().join(" ");
+    Some((process_id, name, command_line))
+}
+
+#[cfg(windows)]
+fn is_codex_process_name(buffer: &[u16]) -> bool {
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    matches!(
+        String::from_utf16_lossy(&buffer[..length])
+            .to_ascii_lowercase()
+            .as_str(),
+        "chatgpt.exe" | "codex.exe"
+    )
+}
+
+#[cfg(windows)]
+fn filetime_to_unix_ms(value: FILETIME) -> i64 {
+    let ticks = (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
+    (ticks.saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS) / 10_000) as i64
 }
 
 fn resolve_codex_home(
@@ -308,5 +578,54 @@ mod tests {
         );
 
         assert_eq!(resolved, Some(PathBuf::from(r"D:\Codex")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn identifies_codex_processes_and_converts_filetime() {
+        let mut name = [0u16; 260];
+        for (index, character) in "ChatGPT.exe".encode_utf16().enumerate() {
+            name[index] = character;
+        }
+        assert!(is_codex_process_name(&name));
+
+        let unix_epoch = FILETIME {
+            dwLowDateTime: WINDOWS_TO_UNIX_EPOCH_100NS as u32,
+            dwHighDateTime: (WINDOWS_TO_UNIX_EPOCH_100NS >> 32) as u32,
+        };
+        assert_eq!(filetime_to_unix_ms(unix_epoch), 0);
+    }
+
+    #[test]
+    fn detects_only_permission_related_runtime_overrides() {
+        let overrides = collect_permission_overrides([
+            (
+                42,
+                "codex.exe".to_owned(),
+                "codex exec --sandbox read-only -a never -c approval_policy=never prompt"
+                    .to_owned(),
+            ),
+            (
+                43,
+                "codex.exe".to_owned(),
+                "codex exec -m gpt-5.6-sol prompt".to_owned(),
+            ),
+            (
+                44,
+                "other.exe".to_owned(),
+                "other.exe --sandbox danger-full-access".to_owned(),
+            ),
+        ]);
+
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides[0].process_id, 42);
+        assert_eq!(
+            overrides[0].flags,
+            vec![
+                "--sandbox=read-only".to_owned(),
+                "-a=never".to_owned(),
+                "-c=approval_policy=never".to_owned()
+            ]
+        );
     }
 }

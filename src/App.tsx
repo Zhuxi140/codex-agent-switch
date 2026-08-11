@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import { createPortal } from "react-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -11,6 +11,7 @@ import {
   deleteModel,
   deleteProvider,
   deleteProjectExclusion,
+  executeAgentThread,
   getAgent,
   getAppBootstrap,
   getCodexEnvironment,
@@ -18,16 +19,24 @@ import {
   getRuntimeMode,
   getProvider,
   getSettings,
+  getUsageSummary,
+  getUsageMonitorStatus,
   listAgentPresets,
+  listAgentThreadInstances,
   listAgents,
   listModels,
   listProviders,
   listProjectExclusions,
   listSnapshots,
+  listUsageRecords,
+  recommendAgentThreadInstance,
   redetectCodex,
   restoreSnapshot,
   runDiagnostics,
   setModelEnabled,
+  startUsageMonitor,
+  stopUsageMonitor,
+  setAgentThreadInstanceScope,
   testModelConnection,
   switchRuntimeMode,
   updateSettings,
@@ -37,7 +46,12 @@ import {
   type Appearance,
   type AgentDetailResponse,
   type AgentPresetResponse,
+  type AgentReuseStrategy,
   type AgentSummary,
+  type AgentThreadInstanceResponse,
+  type AgentThreadInstanceRecommendation,
+  type AgentThreadExecutionResponse,
+  type AgentThreadInstanceStatus,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
   type ConfigurationStatusResponse,
@@ -45,20 +59,28 @@ import {
   type ModelSummary,
   type OrchestrationPhase,
   type ProviderCreateRequest,
+  type ProviderCacheRetentionType,
+  type ProviderCacheSupport,
   type ProviderDetailResponse,
   type ProviderSummary,
   type ProjectExclusion,
   type ReasoningPolicy,
   type RuntimeModeResponse,
+  type RuntimeBridgeStatusResponse,
   type SandboxPolicy,
   type SnapshotSummary,
   type SettingsResponse,
+  type UsageQueryRequest,
+  type UsageRecordResponse,
+  type UsageStatus,
+  type UsageSummaryResponse,
 } from "./api";
 
-type Page = "overview" | "agents" | "providers" | "models" | "diagnostics" | "settings";
+type Page = "overview" | "usage" | "agents" | "providers" | "models" | "diagnostics" | "settings";
 
 const navigation: Array<{ label: string; page?: Page }> = [
   { label: "概览", page: "overview" },
+  { label: "用量监控", page: "usage" },
   { label: "Agents", page: "agents" },
   { label: "Providers", page: "providers" },
   { label: "Models", page: "models" },
@@ -174,6 +196,8 @@ export function App() {
             error={error}
             onRedetect={handleRedetect}
           />
+        ) : page === "usage" ? (
+          <UsagePage />
         ) : page === "agents" ? (
           <AgentsPage />
         ) : page === "providers" ? (
@@ -215,20 +239,28 @@ function OverviewPage({
   const [snapshots, setSnapshots] = useState<SnapshotSummary[]>([]);
   const [operation, setOperation] = useState<"switch" | "restore" | null>(null);
   const [refreshingMode, setRefreshingMode] = useState(false);
+  const [agentConfigOpen, setAgentConfigOpen] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
   const [configurationError, setConfigurationError] = useState<string | null>(null);
   const [configurationSuccess, setConfigurationSuccess] = useState<string | null>(null);
+  const [failurePolicy, setFailurePolicy] =
+    useState<SettingsResponse["orchestrationFailurePolicy"]>("STRICT_STOP");
 
   const reloadConfiguration = useCallback(async () => {
-    const [statusResult, modeResult, agentsResult, historyResult] = await Promise.allSettled([
+    const [statusResult, modeResult, agentsResult, historyResult, settingsResult] = await Promise.allSettled([
       withTimeout(getConfigurationStatus(), "读取配置状态"),
       withTimeout(getRuntimeMode(), "读取运行模式"),
       withTimeout(listAgents(), "读取 Agent"),
       withTimeout(listSnapshots(6), "读取 Snapshot"),
+      withTimeout(getSettings(), "读取编排设置"),
     ]);
 
     if (statusResult.status === "fulfilled") setConfiguration(statusResult.value);
     if (agentsResult.status === "fulfilled") setAgents(agentsResult.value);
     if (historyResult.status === "fulfilled") setSnapshots(historyResult.value.items);
+    if (settingsResult.status === "fulfilled") {
+      setFailurePolicy(settingsResult.value.orchestrationFailurePolicy);
+    }
 
     if (modeResult.status === "fulfilled") {
       const mode = modeResult.value;
@@ -254,7 +286,7 @@ function OverviewPage({
       });
     }
 
-    const failure = [statusResult, modeResult, agentsResult, historyResult]
+    const failure = [statusResult, modeResult, agentsResult, historyResult, settingsResult]
       .find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
   }, []);
@@ -281,10 +313,16 @@ function OverviewPage({
             : "模式切换未完成，需要先恢复配置事务。",
         );
       }
+      const reasoningWarning = result.warnings.find((warning) =>
+        warning.code === "AGENT_REASONING_DOWNGRADED"
+        || warning.code === "AGENT_REASONING_INHERIT_RESOLVED"
+      );
       setConfigurationSuccess(
-        activeAgentIds.length > 0
-          ? `已启用 ${activeAgentIds.length} 个子 Agent。请在 Codex 中新建任务使 Strict Stop 生效。`
-          : "已切换到 Default。请在 Codex 中新建任务使模式变更生效。",
+        `${activeAgentIds.length > 0
+          ? `已启用 ${activeAgentIds.length} 个子 Agent。请完全退出并重启 Codex，再新建任务；父任务权限保持 Auto 或 Workspace。`
+          : "已切换到 Default。请在 Codex 中新建任务使模式变更生效。"}${
+          reasoningWarning ? ` ${reasoningWarning.message}` : ""
+        }`,
       );
       await reloadConfiguration();
     } catch (reason: unknown) {
@@ -306,6 +344,32 @@ function OverviewPage({
     } finally {
       setRefreshingMode(false);
       setOperation((current) => current === "switch" ? null : current);
+    }
+  }
+
+  async function handleFailurePolicyChange(
+    nextPolicy: SettingsResponse["orchestrationFailurePolicy"],
+  ) {
+    if (nextPolicy === failurePolicy || policySaving) return;
+    const previousPolicy = failurePolicy;
+    setFailurePolicy(nextPolicy);
+    setPolicySaving(true);
+    setConfigurationError(null);
+    setConfigurationSuccess(null);
+    try {
+      const updated = await updateSettings({ orchestrationFailurePolicy: nextPolicy });
+      setFailurePolicy(updated.orchestrationFailurePolicy);
+      setConfigurationSuccess("子 Agent 失败策略已保存；请同步当前模式并重启 Codex 后生效。");
+      try {
+        await reloadConfiguration();
+      } catch (reason: unknown) {
+        setConfigurationError(`策略已保存，但状态刷新失败：${errorMessage(reason)}`);
+      }
+    } catch (reason: unknown) {
+      setFailurePolicy(previousPolicy);
+      setConfigurationError(`失败策略保存失败：${errorMessage(reason)}`);
+    } finally {
+      setPolicySaving(false);
     }
   }
 
@@ -346,9 +410,8 @@ function OverviewPage({
     const rightPhase = rightAgents[0]?.orchestrationPhase ?? "REVIEW";
     return phaseOrder[leftPhase] - phaseOrder[rightPhase] || leftRole.localeCompare(rightRole);
   });
-  const targetAgentIds = selectedMode === "SUBAGENT"
-    ? Object.values(selectedAgentsByRole).filter(Boolean).sort()
-    : [];
+  const configuredAgentIds = Object.values(selectedAgentsByRole).filter(Boolean).sort();
+  const targetAgentIds = selectedMode === "SUBAGENT" ? configuredAgentIds : [];
   const currentAgentIds = runtimeMode?.activeBindings.map((binding) => binding.agentId).sort() ?? [];
   const defaultIsCurrent = runtimeMode?.activeBindings.length === 0 && !runtimeMode.legacyActiveAgentId;
   const sameMode = selectedMode === "DEFAULT"
@@ -357,7 +420,7 @@ function OverviewPage({
       && !runtimeMode?.legacyActiveAgentId
       && targetAgentIds.length === currentAgentIds.length
       && targetAgentIds.every((id, index) => id === currentAgentIds[index]);
-  const selectedAgents = targetAgentIds
+  const selectedAgents = configuredAgentIds
     .map((id) => agents.find((agent) => agent.id === id))
     .filter((agent): agent is AgentSummary => Boolean(agent));
   const modeReady = selectedMode === "DEFAULT"
@@ -366,6 +429,14 @@ function OverviewPage({
   const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
   return (
     <>
+      {environment && (
+        <EnvironmentDetails
+          detecting={detecting}
+          environment={environment}
+          onRedetect={onRedetect}
+        />
+      )}
+
       <header>
         <div>
           <span className="eyebrow">Runtime Mode</span>
@@ -388,86 +459,133 @@ function OverviewPage({
             <h2>运行模式</h2>
             <p>切换时自动创建 Snapshot，并在失败时回滚 CAS-owned 配置。</p>
           </div>
-          <span className={`mode-status ${configuration?.status.toLowerCase() ?? "unavailable"}`}>
-            {configuration?.status ?? "LOADING"}
+          <span className={`mode-status ${
+            configuration?.restartRecommended
+              ? "restart-required"
+              : configuration?.status.toLowerCase() ?? "unavailable"
+          }`}>
+            {configuration?.restartRecommended
+              ? "RESTART REQUIRED"
+              : configuration?.status ?? "LOADING"}
           </span>
         </div>
 
         {configurationSuccess && <div className="success-banner">{configurationSuccess}</div>}
         {configurationError && <div className="inline-error">{configurationError}</div>}
+        {configuration?.restartRecommended && (
+          <div className="inline-error" role="alert">
+            <strong>Codex 尚未加载最新配置</strong>
+            <span>
+              检测到运行中的 Codex 早于最近一次 CAS 配置同步。请完全退出 Codex，再重新启动并创建全新任务；继续使用当前任务仍会沿用旧的 Multi-Agent 运行时。
+            </span>
+          </div>
+        )}
         {(selectedMode === "SUBAGENT" || (runtimeMode?.activeBindings.length ?? 0) > 0) && (
           <div className="orchestration-warning" role="note">
-            Strict Stop 依赖磁盘只读权限。切换后请新建 Codex 任务；若启动命令显式覆盖 Sandbox，Primary 只读约束可能失效。
+            子 Agent 会继承 Primary 的实时权限。CAS 会配置 V1 明文委派与 Workspace
+            基线；切换后必须完全退出并重启 Codex，再新建任务，并保持 Auto 或
+            Workspace。
+            {failurePolicy === "STRICT_STOP"
+              ? " 当前为 Strict Stop：委派失败后 Primary 必须停止。"
+              : " 当前为 Primary Fallback：委派失败后 Primary 会先显式警告，再接管任务；这是指令约束，不是权限隔离。"}
           </div>
         )}
 
         <div className="runtime-mode-options" role="radiogroup" aria-label="Codex 运行模式">
-          <label className={`runtime-mode-option ${selectedMode === "DEFAULT" ? "selected" : ""}`}>
+          <div className={`runtime-mode-option ${selectedMode === "DEFAULT" ? "selected" : ""}`}>
             <input
               checked={selectedMode === "DEFAULT"}
+              id="runtime-mode-default"
               name="runtime-mode"
               onChange={() => setSelectedMode("DEFAULT")}
               type="radio"
             />
-            <span className="runtime-mode-copy">
+            <label className="runtime-mode-copy" htmlFor="runtime-mode-default">
               <strong>Default</strong>
               <small>不启用 CAS 子 Agent，不改动 Codex 的主模型、MCP 或其他外部配置。</small>
-            </span>
+            </label>
             {defaultIsCurrent && <span className="current-mode-tag">当前</span>}
-          </label>
+          </div>
 
-          <label className={`runtime-mode-option ${selectedMode === "SUBAGENT" ? "selected" : ""}`}>
+          <div className={`runtime-mode-option ${selectedMode === "SUBAGENT" ? "selected" : ""}`}>
             <input
               checked={selectedMode === "SUBAGENT"}
+              id="runtime-mode-subagent"
               name="runtime-mode"
               onChange={() => setSelectedMode("SUBAGENT")}
               type="radio"
             />
             <span className="runtime-mode-copy">
-              <strong>使用子 Agent</strong>
-              <small>不同 Role 可以同时运行；同一 Role 只能选择一个 Agent。Primary 只负责规划、审查与收束。</small>
-              <div className="role-agent-selectors">
-                {roleGroups.length === 0 && <em>请先在 Agents 页面创建带 Role 与 Phase 的 Agent。</em>}
-                {roleGroups.map(([roleKey, candidates]) => {
-                  const selected = candidates.find((agent) => agent.id === selectedAgentsByRole[roleKey]);
-                  return (
-                    <label className="role-agent-selector" key={roleKey}>
-                      <span>
-                        <strong>{roleKey}</strong>
-                        <small>{selected?.orchestrationPhase ?? candidates[0]?.orchestrationPhase}</small>
-                      </span>
-                      <select
-                        aria-label={`选择 ${roleKey} Agent`}
-                        disabled={selectedMode !== "SUBAGENT"}
-                        onChange={(event) => setSelectedAgentsByRole((current) => ({
-                          ...current,
-                          [roleKey]: event.target.value,
-                        }))}
-                        onClick={(event) => event.stopPropagation()}
-                        value={selectedAgentsByRole[roleKey] ?? ""}
-                      >
-                        <option value="">不启用</option>
-                        {candidates.map((agent) => (
-                          <option key={agent.id} value={agent.id}>
-                            {agent.name} · {availabilityLabel(agent.availability)}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                  );
-                })}
+              <label htmlFor="runtime-mode-subagent">
+                <strong>使用子 Agent</strong>
+                <small>不同 Role 可以同时运行；同一 Role 只能选择一个 Agent。Primary 只负责规划、审查与收束。</small>
+              </label>
+              <div className="selected-agent-summary" aria-label="已配置的子 Agent">
+                {selectedAgents.length === 0 ? (
+                  <small>尚未配置子 Agent。</small>
+                ) : (
+                  selectedAgents.map((agent) => (
+                    <span key={agent.id}>
+                      {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+                    </span>
+                  ))
+                )}
               </div>
+              <button
+                className="secondary-button configure-agent-button"
+                onClick={() => {
+                  setSelectedMode("SUBAGENT");
+                  setAgentConfigOpen(true);
+                }}
+                type="button"
+              >
+                配置子 Agent
+              </button>
               {selectedMode === "SUBAGENT" && selectedAgents.some((agent) => agent.availability !== "READY") && (
                 <em>存在尚未就绪的 Agent，请先在 Agents 页面完善 Model 与 Provider。</em>
               )}
               {selectedMode === "SUBAGENT" && selectedAgents.length > 0 && !hasExecutionAgent && (
-                <em>未启用 EXECUTION Agent：Strict Stop 会阻止所有写入任务。</em>
+                <em>
+                  未启用 EXECUTION Agent：
+                  {failurePolicy === "STRICT_STOP"
+                    ? "Strict Stop 会阻止所有写入任务。"
+                    : "Primary Fallback 会警告后由 Primary 接管。"}
+                </em>
               )}
             </span>
             {runtimeMode && (runtimeMode.activeBindings.length > 0 || runtimeMode.legacyActiveAgentId) && (
               <span className="current-mode-tag">当前：{runtimeMode.activeBindings.length || 1} 个</span>
             )}
+          </div>
+        </div>
+
+        <div className="failure-policy-panel">
+          <label htmlFor="overview-failure-policy">
+            <span>
+              <strong>子 Agent 失败策略</strong>
+              <small>
+                Strict Stop 在委派失败后停止；Primary Fallback 会先警告，再由 Primary 接管。
+              </small>
+            </span>
+            <select
+              disabled={policySaving}
+              id="overview-failure-policy"
+              onChange={(event) => void handleFailurePolicyChange(
+                event.target.value as SettingsResponse["orchestrationFailurePolicy"],
+              )}
+              value={failurePolicy}
+            >
+              <option value="STRICT_STOP">Strict Stop（推荐）</option>
+              <option value="PRIMARY_FALLBACK">Primary Fallback</option>
+            </select>
           </label>
+          {policySaving && <small role="status">正在保存失败策略…</small>}
+          {failurePolicy === "PRIMARY_FALLBACK" && (
+            <div className="orchestration-warning" role="alert">
+              Primary 与子 Agent 都需要 Auto 或 Workspace 权限。该回退依赖编排指令约束，
+              不是文件权限隔离。
+            </div>
+          )}
         </div>
 
         {configuration && configuration.issues.length > 0 && (
@@ -483,11 +601,13 @@ function OverviewPage({
 
         <div className="mode-switch-actions">
           <span>
-            {alreadySynchronized
-              ? "当前模式已同步到 Codex。"
-              : sameMode
-                ? "当前定义或磁盘配置有变化，可重新同步。"
-                : "确认后将立即切换，并只处理 CAS 拥有的配置。"}
+            {configuration?.restartRecommended
+              ? "磁盘配置已同步，但运行中的 Codex 仍在使用旧配置。"
+              : alreadySynchronized
+                ? "当前模式已同步到 Codex。"
+                : sameMode
+                  ? "当前定义或磁盘配置有变化，可重新同步。"
+                  : "确认后将立即切换，并只处理 CAS 拥有的配置。"}
           </span>
           <div className="mode-action-buttons">
             <button
@@ -507,21 +627,30 @@ function OverviewPage({
             >
               {operation === "switch"
                 ? "切换中…"
-                : alreadySynchronized
-                  ? "当前已启用"
-                  : sameMode
-                    ? "同步当前模式"
-                    : "切换模式"}
+                : configuration?.restartRecommended
+                  ? "等待重启 Codex"
+                  : alreadySynchronized
+                    ? "当前已启用"
+                    : sameMode
+                      ? "同步当前模式"
+                      : "切换模式"}
             </button>
           </div>
         </div>
       </section>
 
-      {environment && (
-        <EnvironmentDetails
-          detecting={detecting}
-          environment={environment}
-          onRedetect={onRedetect}
+      {agentConfigOpen && (
+        <AgentConfigurationDialog
+          failurePolicy={failurePolicy}
+          hasExecutionAgent={hasExecutionAgent}
+          onClose={() => setAgentConfigOpen(false)}
+          onSelect={(roleKey, agentId) => setSelectedAgentsByRole((current) => ({
+            ...current,
+            [roleKey]: agentId,
+          }))}
+          roleGroups={roleGroups}
+          selectedAgents={selectedAgents}
+          selectedAgentsByRole={selectedAgentsByRole}
         />
       )}
 
@@ -559,6 +688,106 @@ function OverviewPage({
   );
 }
 
+function AgentConfigurationDialog({
+  failurePolicy,
+  hasExecutionAgent,
+  onClose,
+  onSelect,
+  roleGroups,
+  selectedAgents,
+  selectedAgentsByRole,
+}: {
+  failurePolicy: SettingsResponse["orchestrationFailurePolicy"];
+  hasExecutionAgent: boolean;
+  onClose: () => void;
+  onSelect: (roleKey: string, agentId: string) => void;
+  roleGroups: Array<[string, AgentSummary[]]>;
+  selectedAgents: AgentSummary[];
+  selectedAgentsByRole: Record<string, string>;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  return (
+    <dialog
+      aria-labelledby="agent-config-title"
+      className="agent-config-dialog"
+      onCancel={onClose}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+      ref={dialogRef}
+    >
+      <section className="agent-config-card">
+        <header>
+          <div>
+            <span className="eyebrow">Subagents</span>
+            <h2 id="agent-config-title">配置子 Agent</h2>
+            <p>不同 Role 可以同时运行；同一 Role 只能启用一个 Agent。</p>
+          </div>
+          <button className="ghost-button" onClick={onClose} type="button" aria-label="关闭子 Agent 配置">
+            关闭
+          </button>
+        </header>
+
+        <div className="role-agent-selectors">
+          {roleGroups.length === 0 && (
+            <div className="empty-copy">请先在 Agents 页面创建带 Role 与 Phase 的 Agent。</div>
+          )}
+          {roleGroups.map(([roleKey, candidates]) => {
+            const selected = candidates.find((agent) => agent.id === selectedAgentsByRole[roleKey]);
+            return (
+              <label className="role-agent-selector" key={roleKey}>
+                <span>
+                  <strong>{roleKey}</strong>
+                  <small>{selected?.orchestrationPhase ?? candidates[0]?.orchestrationPhase}</small>
+                </span>
+                <select
+                  aria-label={`选择 ${roleKey} Agent`}
+                  onChange={(event) => onSelect(roleKey, event.target.value)}
+                  value={selectedAgentsByRole[roleKey] ?? ""}
+                >
+                  <option value="">不启用</option>
+                  {candidates.map((agent) => (
+                    <option key={agent.id} value={agent.id}>
+                      {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+                      {" · "}{availabilityLabel(agent.availability)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            );
+          })}
+        </div>
+
+        <div className="agent-config-feedback">
+          {selectedAgents.some((agent) => agent.availability !== "READY") && (
+            <em>存在尚未就绪的 Agent，请先在 Agents 页面完善 Model 与 Provider。</em>
+          )}
+          {selectedAgents.length > 0 && !hasExecutionAgent && (
+            <em>
+              未启用 EXECUTION Agent：
+              {failurePolicy === "STRICT_STOP"
+                ? "Strict Stop 会阻止所有写入任务。"
+                : "Primary Fallback 会警告后由 Primary 接管。"}
+            </em>
+          )}
+        </div>
+
+        <footer>
+          <small>关闭窗口后，点击“切换模式”或“同步当前模式”写入 Codex 配置。</small>
+          <button className="primary-button" onClick={onClose} type="button">完成</button>
+        </footer>
+      </section>
+    </dialog>
+  );
+}
+
 function DiagnosticsPage() {
   const [result, setResult] = useState<DiagnosticsResponse | null>(null);
   const [running, setRunning] = useState(false);
@@ -590,6 +819,7 @@ function DiagnosticsPage() {
       </header>
 
       {error && <div className="inline-error">{error}</div>}
+
       {!result && !error && <section className="notice">诊断不会修改数据库或 Codex 文件。</section>}
 
       {result && (
@@ -671,6 +901,7 @@ function SettingsPage({
         updateChannel: settings.updateChannel,
         customCodexHome: customCodexHome.trim() || null,
         customFontFamily: customFontFamily.trim() || null,
+        orchestrationFailurePolicy: settings.orchestrationFailurePolicy,
       });
       setSettings(updated);
       setCustomCodexHome(updated.customCodexHome ?? "");
@@ -919,8 +1150,8 @@ function SettingsPage({
               <div>
                 <strong>当前对话临时排除</strong>
                 <p>
-                  关闭编排不会自动解除当前会话的只读权限；请同时使用
-                  <code>/permissions</code>。
+                  CAS:OFF 与 CAS:ON 只切换编排规则，不改变当前权限。子 Agent 写入要求
+                  <code>/permissions</code>保持 Auto 或 Workspace。
                 </p>
               </div>
               <div className="conversation-command-grid">
@@ -937,7 +1168,7 @@ function SettingsPage({
                 </article>
                 <article>
                   <code>CAS:ON</code>
-                  <span>恢复编排后运行 /permissions，切回 Read Only。</span>
+                  <span>恢复编排后继续保持 Auto 或 Workspace。</span>
                   <button
                     className="ghost-button"
                     onClick={() => copyConversationMarker("CAS:ON")}
@@ -1114,19 +1345,696 @@ function AgentRow({
         </div>
         <p>{agent.description}</p>
         <code>
-          {agent.agentKey}
+          {agent.model
+            ? `${agent.model.providerName} / ${agent.model.displayName}`
+            : "未绑定供应商 / 模型"}
           {agent.roleKey && agent.orchestrationPhase
             ? ` · ${agent.roleKey} / ${agent.orchestrationPhase}`
             : " · 未分类"}
         </code>
       </div>
       <div className="agent-binding">
-        <strong>{agent.model?.displayName ?? "No model assigned"}</strong>
-        <span>{agent.model?.providerName ?? "Needs model"} · {agent.reasoningPolicy}</span>
+        <strong>Agent Key</strong>
+        <span>{agent.agentKey} · {agent.reasoningPolicy}</span>
       </div>
       <button className="secondary-button" onClick={() => onOpen(agent.id)}>管理</button>
     </article>
   );
+}
+
+type UsageRange = "TODAY" | "7_DAYS" | "ALL" | "CUSTOM";
+
+function UsagePage() {
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [agentError, setAgentError] = useState<string | null>(null);
+
+  useEffect(() => {
+    listAgents()
+      .then(setAgents)
+      .catch((reason: unknown) => setAgentError(errorMessage(reason)));
+  }, []);
+
+  return (
+    <>
+      <header className="page-header">
+        <div>
+          <span className="eyebrow">Usage</span>
+          <h1>用量监控</h1>
+          <p>查看 Primary 与子 Agent 的 Token 使用汇总和会话明细。</p>
+        </div>
+      </header>
+      {agentError && (
+        <section className="notice error">
+          Agent 筛选器读取失败：{agentError}
+        </section>
+      )}
+      <UsageMonitorCard />
+      <AgentThreadInstancesPanel agents={agents} />
+      <AgentUsagePanel agents={agents} />
+    </>
+  );
+}
+
+function UsageMonitorCard() {
+  const [monitor, setMonitor] = useState<RuntimeBridgeStatusResponse | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setMonitor(await getUsageMonitorStatus());
+      setError(null);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  async function setRunning(running: boolean) {
+    setBusy(true);
+    setError(null);
+    try {
+      setMonitor(running ? await startUsageMonitor() : await stopUsageMonitor());
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="runtime-monitor-card">
+      <header>
+        <div>
+          <span className="eyebrow">Runtime Bridge</span>
+          <h2>Token Usage 监控</h2>
+          <p>仅统计由当前 CAS Runtime Bridge 启动或恢复的 Codex 会话。</p>
+        </div>
+        <div className="runtime-monitor-actions">
+          <button className="secondary-button" disabled={busy} onClick={() => void refresh()} type="button">
+            刷新
+          </button>
+          <button
+            className="primary-button"
+            disabled={busy || monitor?.status === "RUNNING"}
+            onClick={() => void setRunning(true)}
+            type="button"
+          >
+            {busy ? "处理中…" : "启动监控"}
+          </button>
+          <button
+            className="secondary-button"
+            disabled={busy || !monitor || monitor.status === "STOPPED"}
+            onClick={() => void setRunning(false)}
+            type="button"
+          >
+            停止
+          </button>
+        </div>
+      </header>
+      {monitor && (
+        <dl className="runtime-monitor-grid">
+          <EnvironmentField label="Bridge" value={monitor.status} />
+          <EnvironmentField label="Usage Schema" value={monitor.schemaCapability} />
+          <EnvironmentField label="Session Schema" value={monitor.managedSessionCapability} />
+          <EnvironmentField label="Agent Execution" value={monitor.agentExecutionCapability} />
+          <EnvironmentField label="Protocol" value={monitor.protocolCompatibility} />
+          <EnvironmentField label="Bound Thread" value={monitor.managedSession?.threadId ?? null} />
+          <EnvironmentField label="Session State" value={monitor.managedSession?.status ?? null} />
+        </dl>
+      )}
+      {monitor?.lastError && <small className="runtime-monitor-warning">{monitor.lastError}</small>}
+      {error && <small className="runtime-monitor-warning">{error}</small>}
+      <small className="runtime-monitor-note">
+        独立启动的 Codex Desktop / CLI 不会被旁路监听；异常退出后需显式恢复原 Thread，
+        CAS 不会自动重放上一个 Turn。
+      </small>
+    </section>
+  );
+}
+
+function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
+  const [instances, setInstances] = useState<AgentThreadInstanceResponse[]>([]);
+  const [scopeDrafts, setScopeDrafts] = useState<Record<string, string>>({});
+  const [savingScope, setSavingScope] = useState<string | null>(null);
+  const [decisionAgentId, setDecisionAgentId] = useState("");
+  const [decisionScope, setDecisionScope] = useState("");
+  const [decisionCwd, setDecisionCwd] = useState("");
+  const [decisionInput, setDecisionInput] = useState("");
+  const [recommendation, setRecommendation] =
+    useState<AgentThreadInstanceRecommendation | null>(null);
+  const [execution, setExecution] = useState<AgentThreadExecutionResponse | null>(null);
+  const [decisionBusy, setDecisionBusy] = useState(false);
+  const [executionBusy, setExecutionBusy] = useState(false);
+  const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const loaded = await listAgentThreadInstances({ limit: 50 });
+      setInstances(loaded);
+      setScopeDrafts(Object.fromEntries(
+        loaded.map((instance) => [instance.id, instance.scopeKey ?? ""]),
+      ));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  useEffect(() => {
+    if (!decisionAgentId && agents.length > 0) setDecisionAgentId(agents[0].id);
+  }, [agents, decisionAgentId]);
+
+  async function saveScope(instance: AgentThreadInstanceResponse) {
+    setSavingScope(instance.id);
+    setError(null);
+    try {
+      const updated = await setAgentThreadInstanceScope(
+        instance.codexThreadId,
+        scopeDrafts[instance.id]?.trim() || null,
+      );
+      setInstances((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setScopeDrafts((current) => ({ ...current, [updated.id]: updated.scopeKey ?? "" }));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setSavingScope(null);
+    }
+  }
+
+  async function evaluateReuse(event: FormEvent) {
+    event.preventDefault();
+    setDecisionError(null);
+    setRecommendation(null);
+    setExecution(null);
+    if (!decisionAgentId || !decisionScope.trim()) {
+      setDecisionError("请选择 Agent，并填写 Scope。");
+      return;
+    }
+    setDecisionBusy(true);
+    try {
+      setRecommendation(await recommendAgentThreadInstance(decisionAgentId, decisionScope));
+    } catch (reason: unknown) {
+      setDecisionError(errorMessage(reason));
+    } finally {
+      setDecisionBusy(false);
+    }
+  }
+
+  async function executeRecommendation() {
+    if (!recommendation || !decisionCwd.trim() || !decisionInput.trim()) {
+      setDecisionError("执行前必须填写绝对工作目录和完整任务。");
+      return;
+    }
+    const action = recommendation.decision === "REUSE" ? "复用现有 Thread" : "创建新 Thread";
+    if (!window.confirm(`${action} 并立即发送任务？该操作会产生真实模型调用。`)) return;
+    setExecutionBusy(true);
+    setDecisionError(null);
+    setExecution(null);
+    try {
+      const result = await executeAgentThread({
+        agentId: decisionAgentId,
+        scopeKey: decisionScope,
+        cwd: decisionCwd,
+        input: decisionInput,
+        expectedDecision: recommendation.decision,
+        expectedCandidateThreadId: recommendation.candidateThreadId,
+      });
+      setExecution(result);
+      await load();
+    } catch (reason: unknown) {
+      setDecisionError(errorMessage(reason));
+    } finally {
+      setExecutionBusy(false);
+    }
+  }
+
+  return (
+    <section className="agent-instance-card" aria-labelledby="agent-instance-title">
+      <header>
+        <div>
+          <span className="eyebrow">Subagent Threads</span>
+          <h2 id="agent-instance-title">子 Agent 实例</h2>
+          <p>管理 Scope，预览复用决策，并在 CAS Runtime Bridge 中显式提交 Agent 任务。</p>
+        </div>
+        <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </header>
+
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      <form className="agent-reuse-preview" onSubmit={evaluateReuse}>
+        <label>
+          <span>Agent</span>
+          <select
+            onChange={(event) => {
+              setDecisionAgentId(event.target.value);
+              setRecommendation(null);
+              setExecution(null);
+            }}
+            value={decisionAgentId}
+          >
+            <option value="">选择 Agent</option>
+            {agents.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          <span>Task Scope</span>
+          <input
+            onChange={(event) => {
+              setDecisionScope(event.target.value);
+              setRecommendation(null);
+              setExecution(null);
+            }}
+            placeholder="例如 order/refund"
+            value={decisionScope}
+          />
+        </label>
+        <button className="secondary-button" disabled={decisionBusy} type="submit">
+          {decisionBusy ? "评估中…" : "评估复用"}
+        </button>
+        <label className="agent-reuse-full">
+          <span>工作目录</span>
+          <input
+            onChange={(event) => setDecisionCwd(event.target.value)}
+            placeholder="例如 C:\workspace\project（必须是已存在的绝对目录）"
+            value={decisionCwd}
+          />
+        </label>
+        <label className="agent-reuse-full">
+          <span>执行任务</span>
+          <textarea
+            maxLength={100000}
+            onChange={(event) => setDecisionInput(event.target.value)}
+            placeholder="发送给所选 Agent 的完整任务"
+            rows={3}
+            value={decisionInput}
+          />
+        </label>
+        {decisionError && <small className="reuse-decision-error">{decisionError}</small>}
+        {recommendation && (
+          <div className={`reuse-recommendation ${recommendation.decision.toLowerCase()}`}>
+            <strong>{recommendation.decision}</strong>
+            <span>{recommendation.message}</span>
+            <small className="reuse-recommendation-meta">
+              {recommendation.reuseStrategy}
+              {" · "}Context 阈值 {recommendation.contextPressureLimitPercent}%
+              {" · "}Cache {recommendation.cacheHint}
+              {" · "}窗口 {formatRetentionWindow(recommendation.cacheRetentionHintSeconds)}
+              （{cacheRetentionSourceLabel(recommendation.cacheRetentionSource)}）
+            </small>
+            {recommendation.candidateThreadId && (
+              <code title={recommendation.candidateThreadId}>
+                Thread {shortThreadId(recommendation.candidateThreadId)}
+              </code>
+            )}
+            <button
+              className="primary-button reuse-execute-button"
+              disabled={executionBusy}
+              onClick={() => void executeRecommendation()}
+              type="button"
+            >
+              {executionBusy ? "执行中…" : "执行建议"}
+            </button>
+          </div>
+        )}
+        {execution && (
+          <div className="reuse-execution-result">
+            <strong>{execution.action}</strong>
+            <span>{execution.agentName} 的任务已提交，状态 {execution.status}。</span>
+            <code title={execution.threadId}>Thread {shortThreadId(execution.threadId)}</code>
+          </div>
+        )}
+      </form>
+      {!loading && !error && instances.length === 0 && (
+        <div className="usage-empty">尚未捕获到由 CAS Runtime Bridge 管理的子 Agent Thread。</div>
+      )}
+      {!error && instances.length > 0 && (
+        <div className="agent-instance-list">
+          {instances.map((instance) => (
+            <article className="agent-instance-row" key={instance.id}>
+              <div className="agent-instance-main">
+                <div>
+                  <strong>{instance.agentNameSnapshot ?? "Unknown Agent"}</strong>
+                  <span
+                    className={`agent-instance-status ${instance.status.toLowerCase()}`}
+                    title={agentInstanceStatusDescription(instance.status)}
+                  >
+                    {agentInstanceStatusLabel(instance.status)}
+                  </span>
+                </div>
+                <code title={instance.codexThreadId}>Thread {shortThreadId(instance.codexThreadId)}</code>
+                <small>
+                  {formatUsageDate(instance.lastUsedAt)}
+                </small>
+              </div>
+              <dl>
+                <UsageRecordMetric label="Total" value={instance.totalTokens} />
+                <UsageRecordMetric label="Cached" value={instance.cachedInputTokens} />
+                <UsageRecordMetric label="Input" value={instance.inputTokens} />
+                <UsageRecordMetric label="Output" value={instance.outputTokens} />
+              </dl>
+              <div className="agent-instance-scope">
+                <input
+                  aria-label={`${instance.agentNameSnapshot ?? "Agent"} Scope`}
+                  onChange={(event) => setScopeDrafts((current) => ({
+                    ...current,
+                    [instance.id]: event.target.value,
+                  }))}
+                  placeholder="Scope，例如 order/refund"
+                  value={scopeDrafts[instance.id] ?? ""}
+                />
+                <button
+                  className="ghost-button"
+                  disabled={savingScope === instance.id}
+                  onClick={() => void saveScope(instance)}
+                  type="button"
+                >
+                  {savingScope === instance.id ? "保存中…" : "保存 Scope"}
+                </button>
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
+  const [range, setRange] = useState<UsageRange>("7_DAYS");
+  const [customFrom, setCustomFrom] = useState(() => localDateInputValue(new Date()));
+  const [customTo, setCustomTo] = useState(() => localDateInputValue(new Date()));
+  const [agentId, setAgentId] = useState("");
+  const [summary, setSummary] = useState<UsageSummaryResponse | null>(null);
+  const [records, setRecords] = useState<UsageRecordResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadUsage = useCallback(async () => {
+    const query = usageQuery(range, agentId, customFrom, customTo);
+    if (!query) {
+      setError("自定义时间范围无效：结束日期不能早于开始日期。");
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const [nextSummary, nextRecords] = await Promise.all([
+        getUsageSummary(query),
+        listUsageRecords({ ...query, limit: 50 }),
+      ]);
+      setSummary(nextSummary);
+      setRecords(nextRecords);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, [agentId, customFrom, customTo, range]);
+
+  useEffect(() => {
+    void loadUsage();
+  }, [loadUsage]);
+
+  return (
+    <section className="agent-usage-card" aria-labelledby="agent-usage-title">
+      <header className="agent-usage-heading">
+        <div>
+          <span className="eyebrow">Agent Usage</span>
+          <h2 id="agent-usage-title">Token 使用</h2>
+          <p>统计 CAS Runtime Bridge 已确认的累计 Usage，不包含费用估算。</p>
+        </div>
+        <button
+          className="secondary-button"
+          disabled={loading}
+          onClick={() => void loadUsage()}
+          type="button"
+        >
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </header>
+
+      <div className="agent-usage-filters">
+        <label>
+          <span>Agent</span>
+          <select onChange={(event) => setAgentId(event.target.value)} value={agentId}>
+            <option value="">全部记录（含 Primary）</option>
+            {agents.map((agent) => (
+              <option key={agent.id} value={agent.id}>
+                {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <div className="usage-range-switch" aria-label="Usage 时间范围">
+          {([
+            ["TODAY", "今天"],
+            ["7_DAYS", "7 天"],
+            ["ALL", "全部"],
+            ["CUSTOM", "自定义"],
+          ] as const).map(([value, label]) => (
+            <button
+              aria-pressed={range === value}
+              className={range === value ? "active" : ""}
+              key={value}
+              onClick={() => setRange(value)}
+              type="button"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        {range === "CUSTOM" && (
+          <div className="usage-custom-range">
+            <label>
+              <span>开始</span>
+              <input
+                max={customTo}
+                onChange={(event) => setCustomFrom(event.target.value)}
+                type="date"
+                value={customFrom}
+              />
+            </label>
+            <label>
+              <span>结束</span>
+              <input
+                min={customFrom}
+                onChange={(event) => setCustomTo(event.target.value)}
+                type="date"
+                value={customTo}
+              />
+            </label>
+          </div>
+        )}
+      </div>
+
+      {error && <div className="inline-error" role="alert">{error}</div>}
+
+      {summary && !error && (
+        <div className="usage-summary-grid">
+          <UsageMetric label="Total" value={summary.totalTokens} />
+          <UsageMetric label="Threads" value={summary.recordCount} />
+          <UsageMetric label="Input" value={summary.inputTokens} />
+          <UsageMetric label="Cached input" value={summary.cachedInputTokens} />
+          <UsageMetric label="Output" value={summary.outputTokens} />
+          <UsageMetric label="Reasoning" value={summary.reasoningOutputTokens} />
+        </div>
+      )}
+
+      <div className="usage-status-legend" aria-label="Usage 状态说明">
+        {(["LIVE", "FINAL", "PARTIAL", "UNKNOWN"] as UsageStatus[]).map((status) => (
+          <span key={status} title={usageStatusDescription(status)}>
+            <i className={`usage-status ${status.toLowerCase()}`}>{status}</i>
+            {usageStatusShortDescription(status)}
+          </span>
+        ))}
+      </div>
+
+      {!loading && !error && records.length === 0 && (
+        <div className="usage-empty">当前筛选范围还没有可靠的 Token Usage。</div>
+      )}
+
+      {!error && records.length > 0 && (
+        <div className="usage-record-list" aria-label="Usage 会话明细">
+          {records.map((record) => (
+            <article className="usage-record" key={record.id}>
+              <header>
+                <div>
+                  <strong>
+                    {record.providerNameSnapshot ?? "Unknown provider"}
+                    {" / "}
+                    {record.modelNameSnapshot ?? "Unknown model"}
+                  </strong>
+                  <small>
+                    {record.agentNameSnapshot ?? "Primary / 未归属 Agent"}
+                    {" · "}
+                    {formatUsageDate(record.updatedAt)}
+                  </small>
+                </div>
+                <span
+                  className={`usage-status ${record.usageStatus.toLowerCase()}`}
+                  title={usageStatusDescription(record.usageStatus)}
+                >
+                  {record.usageStatus}
+                </span>
+              </header>
+              <dl>
+                <UsageRecordMetric label="Total" value={record.totalTokens} />
+                <UsageRecordMetric label="Input" value={record.inputTokens} />
+                <UsageRecordMetric label="Cached" value={record.cachedInputTokens} />
+                <UsageRecordMetric label="Output" value={record.outputTokens} />
+                <UsageRecordMetric label="Reasoning" value={record.reasoningOutputTokens} />
+              </dl>
+              <footer>
+                <code title={record.codexThreadId}>
+                  Thread {shortThreadId(record.codexThreadId)}
+                </code>
+                <span>{record.parentThreadId ? "Subagent" : "Primary"}</span>
+                <span>{record.source.replaceAll("_", " ")}</span>
+              </footer>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UsageMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <article title={new Intl.NumberFormat("en-US").format(value)}>
+      <span>{label}</span>
+      <strong>{formatTokenCount(value)}</strong>
+    </article>
+  );
+}
+
+function UsageRecordMetric({ label, value }: { label: string; value: number }) {
+  return (
+    <div>
+      <dt>{label}</dt>
+      <dd title={new Intl.NumberFormat("en-US").format(value)}>{formatTokenCount(value)}</dd>
+    </div>
+  );
+}
+
+function usageQuery(
+  range: UsageRange,
+  agentId: string,
+  customFrom: string,
+  customTo: string,
+): UsageQueryRequest | null {
+  const query: UsageQueryRequest = agentId ? { agentId } : {};
+  if (range === "ALL") return query;
+  const from = new Date();
+  from.setHours(0, 0, 0, 0);
+  const to = new Date(from);
+  to.setDate(to.getDate() + 1);
+  if (range === "7_DAYS") from.setDate(from.getDate() - 6);
+  if (range === "CUSTOM") {
+    const customStart = new Date(`${customFrom}T00:00:00`);
+    const customEnd = new Date(`${customTo}T00:00:00`);
+    if (
+      !customFrom
+      || !customTo
+      || Number.isNaN(customStart.getTime())
+      || Number.isNaN(customEnd.getTime())
+      || customEnd < customStart
+    ) {
+      return null;
+    }
+    customEnd.setDate(customEnd.getDate() + 1);
+    return { ...query, from: customStart.toISOString(), to: customEnd.toISOString() };
+  }
+  return { ...query, from: from.toISOString(), to: to.toISOString() };
+}
+
+function usageStatusDescription(status: UsageStatus): string {
+  return {
+    LIVE: "会话仍在运行，Token 数字可能继续增长。",
+    FINAL: "Thread 已完成，当前累计 Usage 已确认。",
+    PARTIAL: "Provider、旧协议或异常断流只提供了部分可靠字段。",
+    UNKNOWN: "没有可靠 Usage，CAS 不会使用本地分词器猜测精确值。",
+  }[status];
+}
+
+function usageStatusShortDescription(status: UsageStatus): string {
+  return {
+    LIVE: "仍在更新",
+    FINAL: "已确认",
+    PARTIAL: "部分数据",
+    UNKNOWN: "无法确认",
+  }[status];
+}
+
+function agentInstanceStatusLabel(status: AgentThreadInstanceStatus): string {
+  return {
+    RUNNING: "运行中",
+    IDLE: "空闲",
+    RECOVERY_REQUIRED: "需要恢复",
+    CLOSED: "已关闭",
+    UNKNOWN: "未知",
+  }[status];
+}
+
+function agentInstanceStatusDescription(status: AgentThreadInstanceStatus): string {
+  return {
+    RUNNING: "Thread 当前正在执行 Turn。",
+    IDLE: "最近一次 Turn 已完成，Thread 可以作为后续复用候选。",
+    RECOVERY_REQUIRED: "Thread 曾异常中断，复用前必须显式恢复。",
+    CLOSED: "Thread 已关闭，不再参与复用。",
+    UNKNOWN: "CAS 尚未获得足够事件来判断 Thread 状态。",
+  }[status];
+}
+
+function formatUsageDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatRetentionWindow(seconds: number | null): string {
+  if (seconds === null) return "未知";
+  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+  return `${Math.round(seconds / 60 * 10) / 10} 分钟`;
+}
+
+function cacheRetentionSourceLabel(
+  source: AgentThreadInstanceRecommendation["cacheRetentionSource"],
+): string {
+  return {
+    NONE: "未配置",
+    PROVIDER: "Provider",
+    AGENT_OVERRIDE: "Agent",
+  }[source];
+}
+
+function localDateInputValue(date: Date): string {
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60_000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+function shortThreadId(value: string): string {
+  return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
 function CreateAgentPanel({
@@ -1156,6 +2064,9 @@ function CreateAgentPanel({
   const [reasoningPolicy, setReasoningPolicy] = useState<ReasoningPolicy>(
     initial?.defaultReasoningPolicy ?? "MODEL_DEFAULT",
   );
+  const [reuseStrategy, setReuseStrategy] = useState<AgentReuseStrategy>("AUTO");
+  const [cacheRetentionOverrideSeconds, setCacheRetentionOverrideSeconds] =
+    useState<number | null>(null);
   const [modelId, setModelId] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1172,6 +2083,8 @@ function CreateAgentPanel({
     setInstruction("");
     setSandboxPolicy(preset?.defaultSandboxPolicy ?? "INHERIT");
     setReasoningPolicy(preset?.defaultReasoningPolicy ?? "MODEL_DEFAULT");
+    setReuseStrategy("AUTO");
+    setCacheRetentionOverrideSeconds(null);
     setError(null);
     setInvalidField(null);
   }
@@ -1187,6 +2100,7 @@ function CreateAgentPanel({
       instruction,
       instructionRequired: !templateKey,
       roleKey,
+      cacheRetentionOverrideSeconds,
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -1204,6 +2118,8 @@ function CreateAgentPanel({
         enabled: true,
         sandboxPolicy,
         reasoningPolicy,
+        reuseStrategy,
+        cacheRetentionOverrideSeconds,
         modelId: modelId || null,
         roleKey,
         orchestrationPhase,
@@ -1255,7 +2171,7 @@ function CreateAgentPanel({
         </label>
 
         <label className="field">
-          <span>Key</span>
+          <span>Agent Key（内部标识）</span>
           <input
             aria-invalid={invalidField === "agentKey"}
             maxLength={64}
@@ -1308,6 +2224,16 @@ function CreateAgentPanel({
           <small>决定 Primary 在什么阶段委派该 Agent。</small>
         </label>
 
+        <ReuseStrategyField value={reuseStrategy} onChange={setReuseStrategy} />
+        <AgentCacheRetentionField
+          invalid={invalidField === "cacheRetentionOverrideSeconds"}
+          onChange={(value) => {
+            setCacheRetentionOverrideSeconds(value);
+            if (invalidField === "cacheRetentionOverrideSeconds") setInvalidField(null);
+          }}
+          value={cacheRetentionOverrideSeconds}
+        />
+
         <label className="field full-width">
           <span>Description</span>
           <textarea
@@ -1351,7 +2277,7 @@ function CreateAgentPanel({
         />
 
         <label className="field full-width">
-          <span>Model <em>Optional</em></span>
+          <span>供应商 / 模型 <em>Optional</em></span>
           <select
             aria-invalid={invalidField === "modelId"}
             onChange={(event) => {
@@ -1376,7 +2302,7 @@ function CreateAgentPanel({
             ))}
           </select>
           {selectedModel?.compatibility === "UNKNOWN" && (
-            <em>该 Model 兼容性未知；后端允许保存并保留明确警告。</em>
+            <em>该 Model 可保存，但启用 Agent 前必须在 Models 页面完成工具闭环测试。</em>
           )}
           {invalidField === "modelId" && <small className="field-error">所选 Model 不存在或与该 Agent 不兼容。</small>}
         </label>
@@ -1441,6 +2367,7 @@ function AgentDetailPanel({
       instruction: agent.instruction,
       instructionRequired: true,
       roleKey: agent.roleKey ?? "",
+      cacheRetentionOverrideSeconds: agent.cacheRetentionOverrideSeconds,
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -1456,6 +2383,8 @@ function AgentDetailPanel({
         instruction: agent.instruction,
         sandboxPolicy: agent.sandboxPolicy,
         reasoningPolicy: agent.reasoningPolicy,
+        reuseStrategy: agent.reuseStrategy,
+        cacheRetentionOverrideSeconds: agent.cacheRetentionOverrideSeconds,
         modelId: modelId || null,
         roleKey: agent.roleKey ?? "",
         orchestrationPhase: agent.orchestrationPhase ?? "EXECUTION",
@@ -1496,7 +2425,14 @@ function AgentDetailPanel({
         <div>
           <span className="eyebrow">Agent Detail</span>
           <h2>{agent.name}</h2>
-          <p><code>{agent.agentKey}</code> · {agent.agentType}{isActive ? " · 当前使用" : ""}</p>
+          <p>
+            <code>
+              {agent.modelBinding
+                ? `${agent.modelBinding.providerName} / ${agent.modelBinding.displayName}`
+                : "未绑定供应商 / 模型"}
+            </code>
+            {" · "}{agent.agentType}{isActive ? " · 当前使用" : ""}
+          </p>
         </div>
         <button className="ghost-button" disabled={saving} onClick={onBack}>返回列表</button>
       </div>
@@ -1518,7 +2454,7 @@ function AgentDetailPanel({
         </label>
 
         <label className="field">
-          <span>Key</span>
+          <span>Agent Key（内部标识）</span>
           <div className="static-value">{agent.agentKey}</div>
           <small>身份字段不可在普通编辑中修改。</small>
         </label>
@@ -1560,6 +2496,19 @@ function AgentDetailPanel({
           </select>
           <small>{isActive ? "当前启用时不可修改 Phase。" : "Primary 据此决定委派阶段。"}</small>
         </label>
+
+        <ReuseStrategyField
+          value={agent.reuseStrategy}
+          onChange={(value) => setAgent({ ...agent, reuseStrategy: value })}
+        />
+        <AgentCacheRetentionField
+          invalid={invalidField === "cacheRetentionOverrideSeconds"}
+          onChange={(value) => {
+            setAgent({ ...agent, cacheRetentionOverrideSeconds: value });
+            if (invalidField === "cacheRetentionOverrideSeconds") setInvalidField(null);
+          }}
+          value={agent.cacheRetentionOverrideSeconds}
+        />
 
         <label className="field full-width">
           <span>Description</span>
@@ -1603,7 +2552,7 @@ function AgentDetailPanel({
         />
 
         <label className="field full-width">
-          <span>Model</span>
+          <span>供应商 / 模型</span>
           <select
             aria-invalid={invalidField === "modelId"}
             onChange={(event) => {
@@ -1706,6 +2655,84 @@ function PolicyFields({
   );
 }
 
+function ReuseStrategyField({
+  onChange,
+  value,
+}: {
+  onChange: (value: AgentReuseStrategy) => void;
+  value: AgentReuseStrategy;
+}) {
+  return (
+    <label className="field">
+      <span>Thread 复用策略</span>
+      <select
+        onChange={(event) => onChange(event.target.value as AgentReuseStrategy)}
+        value={value}
+      >
+        <option value="AUTO">自动（推荐）</option>
+        <option value="HOT">偏热</option>
+        <option value="COLD">偏冷</option>
+      </select>
+      <small>这是调度偏好；Scope、运行状态与 Context 健康仍优先。</small>
+    </label>
+  );
+}
+
+function AgentCacheRetentionField({
+  invalid,
+  onChange,
+  value,
+}: {
+  invalid: boolean;
+  onChange: (value: number | null) => void;
+  value: number | null;
+}) {
+  const inputId = useId();
+  const [referenceOpen, setReferenceOpen] = useState(false);
+  return (
+    <>
+      {referenceOpen && (
+        <DocumentationReferenceDialog
+          description="缓存时长可能随模式、模型和系统负载变化；这里只提供填写 Agent 软调度窗口时的资料入口。"
+          eyebrow="Cache Reference"
+          note="CAS 不把缓存时长当作 SLA。请按实际接口模式选取保守值，并以 Usage 中的 Cached Input 验证。"
+          onClose={() => setReferenceOpen(false)}
+          references={cacheRetentionReferences}
+          title="各厂商缓存时长参考"
+          titleId="cache-retention-reference-title"
+        />
+      )}
+      <div className="field">
+        <div className="cache-retention-heading">
+          <button className="reference-link" onClick={() => setReferenceOpen(true)} type="button">
+            各厂商缓存时长参考
+          </button>
+          <label htmlFor={inputId}>缓存复用窗口（分钟）<em>Optional</em></label>
+        </div>
+        <input
+          aria-invalid={invalid}
+          id={inputId}
+          max={525600}
+          min={0.1}
+          onChange={(event) => {
+            const minutes = event.currentTarget.valueAsNumber;
+            onChange(Number.isFinite(minutes) ? Math.round(minutes * 60) : null);
+          }}
+          placeholder="留空继承 Provider"
+          step={0.1}
+          type="number"
+          value={value === null ? "" : value / 60}
+        />
+        <small className={invalid ? "field-error" : undefined}>
+          {invalid
+            ? "缓存复用窗口必须大于 0，且不能超过 525600 分钟。"
+            : "仅作为软调度提示；与 Provider 配置同时存在时采用更短值。"}
+        </small>
+      </div>
+    </>
+  );
+}
+
 const ALL_REASONING_POLICIES: ReasoningPolicy[] = [
   "MODEL_DEFAULT",
   "LOW",
@@ -1759,6 +2786,7 @@ function availabilityLabel(value: AgentSummary["availability"]): string {
     MODEL_MISSING: "Needs model",
     PROVIDER_UNAVAILABLE: "Provider unavailable",
     INCOMPATIBLE_MODEL: "Incompatible",
+    UNVERIFIED_MODEL: "Needs test",
     INVALID_CONFIGURATION: "Invalid",
   } as const;
   return labels[value];
@@ -1948,6 +2976,7 @@ function ProviderRow({
           <code>{provider.providerKey}</code>
           <span>Responses API</span>
           <span>{provider.providerType === "PRESET" ? "Preset" : "Custom"}</span>
+          <span>Cache {provider.cacheSupport}</span>
         </p>
       </div>
       <div className="model-count">
@@ -2081,7 +3110,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
         <div>
           <span className="eyebrow">Models</span>
           <h1>可绑定模型</h1>
-          <p>查看模型来自哪里，以及是否已确认兼容 Codex Multi-Agent。</p>
+          <p>验证 Responses API、Function Calling 工具闭环与 Codex Multi-Agent 兼容性。</p>
         </div>
         {!panelOpen && enabledProviders.length > 0 && (
           <button
@@ -2576,14 +3605,14 @@ function lifecycleDescription(model: ModelSummary): string {
 }
 
 function verificationDescription(value: ModelSummary["lastTestStatus"]): string {
-  if (value === null) return "尚未使用当前 Provider Credential 发起基础 Responses API 测试。";
+  if (value === null) return "尚未使用当前 Provider Credential 发起 Responses Function Calling 工具闭环测试。";
   const descriptions = {
-    SUCCESS: "最近一次基础 Responses API 测试通过；这不代表完整 Codex 兼容性已验证。",
+    SUCCESS: "最近一次 Responses API 与 Function Calling 工具闭环测试通过。",
     CREDENTIAL_MISSING: "Provider Credential 不存在或已从系统凭据库移除。",
     AUTH_FAILED: "Provider 拒绝了当前 Credential。",
     MODEL_NOT_FOUND: "Provider 不识别当前 Model ID。",
     RATE_LIMITED: "Provider 在最近一次测试时触发了限流。",
-    PROTOCOL_ERROR: "Endpoint 未返回有效的 Responses API 响应。",
+    PROTOCOL_ERROR: "Endpoint 未返回有效 Responses 响应，或未完成 Function Calling 工具闭环。",
     UNREACHABLE: "最近一次测试无法连接 Provider，或请求超时。",
     SERVER_ERROR: "Provider 在最近一次测试时返回服务端错误。",
   } as const;
@@ -2609,15 +3638,75 @@ function formatTokenCount(value: number): string {
 
 type ProviderKind = "deepseek" | "custom";
 
-const responsesApiReferences = [
-  { name: "DeepSeek", support: "Responses API", url: "https://api-docs.deepseek.com/zh-cn/guides/responses_api" },
-  { name: "阿里云百炼", support: "OpenAI 兼容", url: "https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api?mode=pure" },
-  { name: "腾讯云 TokenHub", support: "兼容转换", url: "https://cloud.tencent.com.cn/document/product/1823/133813" },
-  { name: "Xiaomi MiMo", support: "Responses API", url: "https://mimo.mi.com/docs/zh-CN/api/chat/responses" },
-  { name: "火山引擎 · 火山方舟", support: "Responses API", url: "https://docs.volcengine.com/docs/6492/2241837?lang=zh" },
-  { name: "Infercom", support: "Responses API", url: "https://docs.infercom.ai/en/features/responses-api" },
-  { name: "MiniMax", support: "Responses API", url: "https://platform.minimax.io/docs/api-reference/responses-create" },
-] as const;
+interface DocumentationReference {
+  readonly name: string;
+  readonly support: string;
+  readonly links: readonly { readonly label: string; readonly url: string }[];
+  readonly description?: string;
+}
+
+const responsesApiReferences: DocumentationReference[] = [
+  { name: "DeepSeek", support: "Responses API", links: [{ label: "Responses API 文档", url: "https://api-docs.deepseek.com/zh-cn/guides/responses_api" }] },
+  { name: "阿里云百炼", support: "OpenAI 兼容", links: [
+    { label: "Responses API 文档", url: "https://help.aliyun.com/zh/model-studio/compatibility-with-openai-responses-api?mode=pure" },
+    { label: "模型与工具能力", url: "https://help.aliyun.com/en/model-studio/text-generation-model/" },
+  ], description: "用于 CAS/Codex Agent 时，应选择模型能力表中标明支持内置工具的模型；不支持内置工具的模型无法保证完整的工具调用与 Agent 工具闭环，最终以 CAS Model 工具闭环测试结果为准。" },
+  { name: "腾讯云 TokenHub", support: "兼容转换", links: [{ label: "Responses API 文档", url: "https://cloud.tencent.com.cn/document/product/1823/133813" }] },
+  { name: "Xiaomi MiMo", support: "Responses API", links: [{ label: "Responses API 文档", url: "https://mimo.mi.com/docs/zh-CN/api/chat/responses" }] },
+  { name: "火山引擎 · 火山方舟", support: "Responses API", links: [{ label: "Responses API 文档", url: "https://docs.volcengine.com/docs/6492/2241837?lang=zh" }] },
+  { name: "Infercom", support: "Responses API", links: [{ label: "Responses API 文档", url: "https://docs.infercom.ai/en/features/responses-api" }] },
+  { name: "MiniMax", support: "Responses API", links: [{ label: "Responses API 文档", url: "https://platform.minimax.io/docs/api-reference/responses-create" }] },
+];
+
+const cacheRetentionReferences: DocumentationReference[] = [
+  {
+    name: "DeepSeek",
+    support: "自动缓存 · 通常数小时至数天",
+    links: [{ label: "上下文硬盘缓存", url: "https://api-docs.deepseek.com/zh-cn/guides/kv_cache/" }],
+    description: "官方说明为尽力而为，缓存不再使用后通常会在数小时至数天后清理。",
+  },
+  {
+    name: "阿里百炼（阿里云）",
+    support: "显式 5 分钟 · 隐式无固定时长",
+    links: [{
+      label: "Context Cache",
+      url: "https://www.alibabacloud.com/help/zh/model-studio/context-cache?spm=a2c63.p38356.help-menu-search-2400256.d_1",
+    }],
+    description: "显式缓存命中后会重置 5 分钟；隐式缓存由系统定期清理。",
+  },
+  {
+    name: "火山方舟",
+    support: "以官方文档当前说明为准",
+    links: [{
+      label: "上下文缓存",
+      url: "https://ark.volcengine.com/region:cn-beijing/docs/82379/1602228?lang=zh",
+    }],
+  },
+  {
+    name: "MiniMax",
+    support: "被动缓存动态 · 主动缓存 5 分钟",
+    links: [
+      {
+        label: "Prompt 缓存",
+        url: "https://platform.minimaxi.com/docs/api-reference/text-prompt-caching",
+      },
+      {
+        label: "Anthropic 主动缓存",
+        url: "https://platform.minimaxi.com/docs/api-reference/anthropic-api-compatible-cache",
+      },
+    ],
+    description: "被动缓存会按系统负载调整；Anthropic 兼容主动缓存命中后刷新 5 分钟生命周期。",
+  },
+  {
+    name: "ChatGPT（OpenAI）",
+    support: "无官方明示 · 社区讨论约 30 分钟",
+    links: [{
+      label: "OpenAI 社区讨论",
+      url: "https://community.openai.com/t/gpt-5-6-prompt-caching-fails-on-partial-prefixes/1386887/6?utm_source=chatgpt.com",
+    }],
+    description: "该时长来自社区讨论，不是 OpenAI 官方承诺，不应作为保证值。",
+  },
+];
 
 interface ProviderFormState {
   providerKey: string;
@@ -2656,6 +3745,21 @@ function EditProviderPanel({
   const [name, setName] = useState(provider.name);
   const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
   const [enabled, setEnabled] = useState(provider.enabled);
+  const [cacheSupport, setCacheSupport] = useState<ProviderCacheSupport>(
+    provider.cacheProfile.cacheSupport,
+  );
+  const [retentionType, setRetentionType] = useState<ProviderCacheRetentionType>(
+    provider.cacheProfile.retentionType,
+  );
+  const [retentionMinutes, setRetentionMinutes] = useState(
+    provider.cacheProfile.retentionHintSeconds === null
+      ? ""
+      : String(provider.cacheProfile.retentionHintSeconds / 60),
+  );
+  const [cacheSource, setCacheSource] = useState(provider.cacheProfile.source ?? "");
+  const [cacheVerifiedAt, setCacheVerifiedAt] = useState(
+    provider.cacheProfile.lastVerifiedAt ?? "",
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -2683,6 +3787,15 @@ function EditProviderPanel({
         baseUrl,
         enabled,
         confirmOriginChange,
+        cacheProfile: {
+          cacheSupport,
+          retentionType,
+          retentionHintSeconds: retentionType === "UNKNOWN"
+            ? null
+            : Math.round(Number(retentionMinutes) * 60),
+          source: cacheSource.trim() || null,
+          lastVerifiedAt: cacheVerifiedAt || null,
+        },
       });
       onUpdated();
     } catch (reason: unknown) {
@@ -2745,6 +3858,80 @@ function EditProviderPanel({
             <small>停用后，该 Provider 及其 Model 不进入配置生成。</small>
           </span>
         </label>
+
+        <section className="cache-profile-editor full-width" aria-labelledby="cache-profile-title">
+          <header>
+            <div>
+              <strong id="cache-profile-title">Provider Cache Profile</strong>
+              <small>仅作为 Thread 复用软提示，不作为请求正确性的依赖。</small>
+            </div>
+          </header>
+          <div className="cache-profile-grid">
+            <label className="field">
+              <span>Cache Support</span>
+              <select
+                onChange={(event) => {
+                  const value = event.target.value as ProviderCacheSupport;
+                  setCacheSupport(value);
+                  if (value !== "SUPPORTED") {
+                    setRetentionType("UNKNOWN");
+                    setRetentionMinutes("");
+                  }
+                }}
+                value={cacheSupport}
+              >
+                <option value="UNKNOWN">Unknown</option>
+                <option value="SUPPORTED">Supported</option>
+                <option value="UNSUPPORTED">Unsupported</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Retention Type</span>
+              <select
+                disabled={cacheSupport !== "SUPPORTED"}
+                onChange={(event) => {
+                  const value = event.target.value as ProviderCacheRetentionType;
+                  setRetentionType(value);
+                  if (value === "UNKNOWN") setRetentionMinutes("");
+                }}
+                value={retentionType}
+              >
+                <option value="UNKNOWN">Unknown</option>
+                <option value="APPROXIMATE">Approximate</option>
+                <option value="GUARANTEED">Guaranteed</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Retention Hint（分钟）</span>
+              <input
+                disabled={retentionType === "UNKNOWN"}
+                min={1}
+                onChange={(event) => setRetentionMinutes(event.target.value)}
+                required={retentionType !== "UNKNOWN"}
+                step={1}
+                type="number"
+                value={retentionMinutes}
+              />
+            </label>
+            <label className="field">
+              <span>Last Verified</span>
+              <input
+                onChange={(event) => setCacheVerifiedAt(event.target.value)}
+                type="date"
+                value={cacheVerifiedAt}
+              />
+            </label>
+            <label className="field full-width">
+              <span>Source</span>
+              <input
+                maxLength={2048}
+                onChange={(event) => setCacheSource(event.target.value)}
+                placeholder="官方文档 URL 或内部验证说明"
+                value={cacheSource}
+              />
+            </label>
+          </div>
+        </section>
 
         {error && (
           <div className="inline-error full-width" role="alert">
@@ -2992,6 +4179,36 @@ function AddProviderPanel({
 }
 
 function ProviderResponsesReferenceDialog({ onClose }: { onClose: () => void }) {
+  return (
+    <DocumentationReferenceDialog
+      description="以下厂商已提供相关文档；实际 Codex 兼容性仍以 Model 连接测试为准。"
+      eyebrow="Provider Reference"
+      note="外部文档可能调整 Endpoint、支持模型或参数范围，请以厂商最新内容为准。"
+      onClose={onClose}
+      references={responsesApiReferences}
+      title="Responses API 支持参考"
+      titleId="responses-reference-title"
+    />
+  );
+}
+
+function DocumentationReferenceDialog({
+  description,
+  eyebrow,
+  note,
+  onClose,
+  references,
+  title,
+  titleId,
+}: {
+  description: string;
+  eyebrow: string;
+  note: string;
+  onClose: () => void;
+  references: readonly DocumentationReference[];
+  title: string;
+  titleId: string;
+}) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [openError, setOpenError] = useState<string | null>(null);
 
@@ -3012,7 +4229,7 @@ function ProviderResponsesReferenceDialog({ onClose }: { onClose: () => void }) 
 
   return (
     <dialog
-      aria-labelledby="responses-reference-title"
+      aria-labelledby={titleId}
       className="responses-reference-dialog"
       onCancel={(event) => {
         event.preventDefault();
@@ -3026,9 +4243,9 @@ function ProviderResponsesReferenceDialog({ onClose }: { onClose: () => void }) 
       <section className="responses-reference-card">
         <header>
           <div>
-            <span className="eyebrow">Provider Reference</span>
-            <h2 id="responses-reference-title">Responses API 支持参考</h2>
-            <p>以下厂商已提供相关文档；实际 Codex 兼容性仍以 Model 连接测试为准。</p>
+            <span className="eyebrow">{eyebrow}</span>
+            <h2 id={titleId}>{title}</h2>
+            <p>{description}</p>
           </div>
           <button aria-label="关闭" autoFocus className="ghost-button" onClick={onClose} type="button">
             关闭
@@ -3036,27 +4253,35 @@ function ProviderResponsesReferenceDialog({ onClose }: { onClose: () => void }) 
         </header>
 
         <ul className="responses-reference-list">
-          {responsesApiReferences.map((reference) => (
+          {references.map((reference) => (
             <li key={reference.name}>
-              <span>
-                <strong>{reference.name}</strong>
-                <small>{reference.support}</small>
-              </span>
-              <button
-                className="reference-doc-link"
-                onClick={() => void openReference(reference.url)}
-                type="button"
-              >
-                查看文档 ↗
-              </button>
+              <div className="reference-info">
+                <span>
+                  <strong>{reference.name}</strong>
+                  <small>{reference.support}</small>
+                </span>
+                {reference.description && (
+                  <small className="reference-description">{reference.description}</small>
+                )}
+              </div>
+              <div className="reference-links">
+                {reference.links.map((link, i) => (
+                  <button
+                    key={i}
+                    className="reference-doc-link"
+                    onClick={() => void openReference(link.url)}
+                    type="button"
+                  >
+                    {link.label} ↗
+                  </button>
+                ))}
+              </div>
             </li>
           ))}
         </ul>
 
         {openError && <small className="responses-reference-error">{openError}</small>}
-        <small className="responses-reference-note">
-          外部文档可能调整 Endpoint、支持模型或参数范围，请以厂商最新内容为准。
-        </small>
+        <small className="responses-reference-note">{note}</small>
       </section>
     </dialog>
   );
@@ -3071,33 +4296,31 @@ function EnvironmentDetails({
   environment: CodexEnvironmentResponse;
   onRedetect: () => void;
 }) {
+  const configAccess =
+    environment.configurationReadable && environment.configurationWritable
+      ? "配置可读写"
+      : `${environment.configurationReadable ? "可读" : "不可读"} / ${environment.configurationWritable ? "可写" : "不可写"}`;
+
   return (
-    <section className="environment-card">
-      <div className="environment-heading">
-        <div>
-          <span className="eyebrow">Codex Environment</span>
-          <h2>{environment.supported ? "客户端满足当前基线" : "客户端需要处理"}</h2>
-          <p className="environment-tip">
-            如果当前目录或者显示不正确，请手动进行一次重新检测 Codex。
-          </p>
-        </div>
-        <div className="environment-actions">
-          <span className={environment.supported ? "result ready" : "result blocked"}>
-            {environment.supported ? "READY" : "BLOCKED"}
-          </span>
-          <button className="secondary-button" disabled={detecting} onClick={onRedetect} type="button">
-            {detecting ? "检测中…" : "重新检测 Codex"}
-          </button>
-        </div>
-      </div>
-      <dl>
-        <EnvironmentField label="Executable" value={environment.executablePath} />
-        <EnvironmentField label="CODEX_HOME" value={environment.codexHome} />
-        <EnvironmentField
-          label="Config access"
-          value={`${environment.configurationReadable ? "可读" : "不可读"} / ${environment.configurationWritable ? "可写" : "不可写"}`}
+    <section className="environment-card overview-environment-card">
+      <div className="baseline-status">
+        <span
+          aria-hidden="true"
+          className={`baseline-indicator ${environment.supported ? "ready" : "blocked"}`}
         />
-      </dl>
+        <strong>{environment.supported ? "客户端满足当前基线" : "客户端需要处理"}</strong>
+        <small>{configAccess}</small>
+      </div>
+      <div className="baseline-home" title={environment.codexHome ?? undefined}>
+        <span>CODEX_HOME</span>
+        <code>{environment.codexHome ?? "未知"}</code>
+      </div>
+      <div className="baseline-actions">
+        <small>目录或显示异常时重新检测</small>
+        <button className="ghost-button" disabled={detecting} onClick={onRedetect} type="button">
+          {detecting ? "检测中…" : "重新检测"}
+        </button>
+      </div>
       {environment.issues.length > 0 && (
         <ul className="issue-list">
           {environment.issues.map((issue) => (
@@ -3128,7 +4351,8 @@ type AgentFormField =
   | "description"
   | "instruction"
   | "modelId"
-  | "reasoningPolicy";
+  | "reasoningPolicy"
+  | "cacheRetentionOverrideSeconds";
 
 function invalidAgentField(values: {
   agentKey?: string;
@@ -3137,6 +4361,7 @@ function invalidAgentField(values: {
   instruction: string;
   instructionRequired: boolean;
   roleKey: string;
+  cacheRetentionOverrideSeconds: number | null;
 }): AgentFormField | null {
   if (values.agentKey !== undefined && !/^[a-z][a-z0-9_-]{0,63}$/.test(values.agentKey)) {
     return "agentKey";
@@ -3146,6 +4371,15 @@ function invalidAgentField(values: {
   if (!values.description.trim() || values.description.length > 2000) return "description";
   if (values.instructionRequired && !values.instruction.trim()) return "instruction";
   if (values.instruction.length > 100000) return "instruction";
+  if (
+    values.cacheRetentionOverrideSeconds !== null
+    && (
+      values.cacheRetentionOverrideSeconds <= 0
+      || values.cacheRetentionOverrideSeconds > 31_536_000
+    )
+  ) {
+    return "cacheRetentionOverrideSeconds";
+  }
   return null;
 }
 
@@ -3160,6 +4394,7 @@ function agentErrorField(reason: unknown): AgentFormField | null {
       "instruction",
       "modelId",
       "reasoningPolicy",
+      "cacheRetentionOverrideSeconds",
     ].includes(field ?? "")
   ) {
     return field as AgentFormField;

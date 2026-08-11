@@ -240,7 +240,10 @@ impl SqliteProviderRepository {
             .query_row(
                 "SELECT p.id, p.provider_key, p.name, p.provider_type, p.base_url, p.protocol,
                         p.enabled, p.source, p.preset_id, p.created_at, p.updated_at, c.id,
-                        (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id)
+                        (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id),
+                        p.cache_support, p.cache_retention_type,
+                        p.cache_retention_hint_seconds, p.cache_profile_source,
+                        p.cache_profile_verified_at
                  FROM providers p
                  LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
                  WHERE p.id = ?1",
@@ -264,7 +267,10 @@ impl SqliteProviderRepository {
             .prepare(
                 "SELECT p.id, p.provider_key, p.name, p.provider_type, p.base_url, p.protocol,
                         p.enabled, p.source, p.preset_id, p.created_at, p.updated_at, c.id,
-                        (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id)
+                        (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id),
+                        p.cache_support, p.cache_retention_type,
+                        p.cache_retention_hint_seconds, p.cache_profile_source,
+                        p.cache_profile_verified_at
                  FROM providers p
                  LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
                  WHERE (?1 IS NULL OR p.provider_key LIKE ?1 OR p.name LIKE ?1)
@@ -287,13 +293,42 @@ impl SqliteProviderRepository {
         let changed = self.connection.execute(
             "UPDATE providers
              SET name = ?2, base_url = ?3, enabled = ?4,
+                 cache_support = CASE WHEN ?5 THEN ?6 ELSE cache_support END,
+                 cache_retention_type = CASE WHEN ?5 THEN ?7 ELSE cache_retention_type END,
+                 cache_retention_hint_seconds =
+                    CASE WHEN ?5 THEN ?8 ELSE cache_retention_hint_seconds END,
+                 cache_profile_source =
+                    CASE WHEN ?5 THEN ?9 ELSE cache_profile_source END,
+                 cache_profile_verified_at =
+                    CASE WHEN ?5 THEN ?10 ELSE cache_profile_verified_at END,
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![
                 provider.id,
                 provider.name,
                 provider.base_url,
-                provider.enabled
+                provider.enabled,
+                provider.cache_profile.is_some(),
+                provider
+                    .cache_profile
+                    .as_ref()
+                    .map(|profile| profile.cache_support.as_str()),
+                provider
+                    .cache_profile
+                    .as_ref()
+                    .map(|profile| profile.retention_type.as_str()),
+                provider
+                    .cache_profile
+                    .as_ref()
+                    .and_then(|profile| profile.retention_hint_seconds),
+                provider
+                    .cache_profile
+                    .as_ref()
+                    .and_then(|profile| profile.source.as_deref()),
+                provider
+                    .cache_profile
+                    .as_ref()
+                    .and_then(|profile| profile.last_verified_at.as_deref()),
             ],
         )?;
         if changed == 0 {
@@ -359,6 +394,11 @@ fn map_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
         updated_at: row.get(10)?,
         credential_configured: row.get::<_, Option<String>>(11)?.is_some(),
         model_count: row.get(12)?,
+        cache_support: row.get(13)?,
+        cache_retention_type: row.get(14)?,
+        cache_retention_hint_seconds: row.get(15)?,
+        cache_profile_source: row.get(16)?,
+        cache_profile_verified_at: row.get(17)?,
     })
 }
 
@@ -424,6 +464,7 @@ struct PendingProviderUpdate {
     base_url: String,
     enabled: bool,
     confirm_origin_change: bool,
+    cache_profile: Option<PendingProviderCacheProfile>,
 }
 
 impl TryFrom<ProviderUpdateRequest> for PendingProviderUpdate {
@@ -438,6 +479,57 @@ impl TryFrom<ProviderUpdateRequest> for PendingProviderUpdate {
             base_url: request.base_url,
             enabled: request.enabled,
             confirm_origin_change: request.confirm_origin_change,
+            cache_profile: request
+                .cache_profile
+                .map(PendingProviderCacheProfile::try_from)
+                .transpose()?,
+        })
+    }
+}
+
+struct PendingProviderCacheProfile {
+    cache_support: CacheSupport,
+    retention_type: CacheRetentionType,
+    retention_hint_seconds: Option<i64>,
+    source: Option<String>,
+    last_verified_at: Option<String>,
+}
+
+impl TryFrom<ProviderCacheProfileInput> for PendingProviderCacheProfile {
+    type Error = ProviderServiceError;
+
+    fn try_from(profile: ProviderCacheProfileInput) -> Result<Self, Self::Error> {
+        let retention_hint_seconds = profile.retention_hint_seconds;
+        if retention_hint_seconds.is_some_and(|seconds| seconds <= 0) {
+            return Err(ProviderServiceError::InvalidField(
+                "cacheProfile.retentionHintSeconds",
+            ));
+        }
+        if profile.cache_support != CacheSupport::Supported
+            && (profile.retention_type != CacheRetentionType::Unknown
+                || retention_hint_seconds.is_some())
+        {
+            return Err(ProviderServiceError::InvalidField(
+                "cacheProfile.retentionType",
+            ));
+        }
+        if (profile.retention_type == CacheRetentionType::Unknown)
+            != retention_hint_seconds.is_none()
+        {
+            return Err(ProviderServiceError::InvalidField(
+                "cacheProfile.retentionHintSeconds",
+            ));
+        }
+        Ok(Self {
+            cache_support: profile.cache_support,
+            retention_type: profile.retention_type,
+            retention_hint_seconds,
+            source: normalize_optional_text(profile.source, "cacheProfile.source", 2_048)?,
+            last_verified_at: normalize_optional_text(
+                profile.last_verified_at,
+                "cacheProfile.lastVerifiedAt",
+                64,
+            )?,
         })
     }
 }
@@ -464,6 +556,26 @@ fn validate_text(
     (!value.trim().is_empty() && value.len() <= max_length)
         .then_some(())
         .ok_or(ProviderServiceError::InvalidField(field))
+}
+
+fn normalize_optional_text(
+    value: Option<String>,
+    field: &'static str,
+    max_length: usize,
+) -> Result<Option<String>, ProviderServiceError> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.len() > max_length {
+                Err(ProviderServiceError::InvalidField(field))
+            } else if value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value.to_owned()))
+            }
+        })
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn validate_base_url(value: &str) -> Result<(), ProviderServiceError> {
@@ -520,6 +632,11 @@ struct ProviderRecord {
     updated_at: String,
     credential_configured: bool,
     model_count: u32,
+    cache_support: String,
+    cache_retention_type: String,
+    cache_retention_hint_seconds: Option<i64>,
+    cache_profile_source: Option<String>,
+    cache_profile_verified_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -543,6 +660,54 @@ pub(crate) struct ProviderUpdateRequest {
     enabled: bool,
     #[serde(default)]
     confirm_origin_change: bool,
+    #[serde(default)]
+    cache_profile: Option<ProviderCacheProfileInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCacheProfileInput {
+    cache_support: CacheSupport,
+    retention_type: CacheRetentionType,
+    retention_hint_seconds: Option<i64>,
+    source: Option<String>,
+    last_verified_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum CacheSupport {
+    Unknown,
+    Supported,
+    Unsupported,
+}
+
+impl CacheSupport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Supported => "SUPPORTED",
+            Self::Unsupported => "UNSUPPORTED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum CacheRetentionType {
+    Unknown,
+    Approximate,
+    Guaranteed,
+}
+
+impl CacheRetentionType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::Approximate => "APPROXIMATE",
+            Self::Guaranteed => "GUARANTEED",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -601,6 +766,7 @@ pub(crate) struct ProviderSummary {
     status: ProviderStatus,
     credential_status: CredentialStatus,
     model_count: u32,
+    cache_support: String,
 }
 
 impl From<ProviderRecord> for ProviderSummary {
@@ -621,8 +787,19 @@ impl From<ProviderRecord> for ProviderSummary {
             status,
             credential_status: CredentialStatus::from(provider.credential_configured),
             model_count: provider.model_count,
+            cache_support: provider.cache_support,
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProviderCacheProfileResponse {
+    cache_support: String,
+    retention_type: String,
+    retention_hint_seconds: Option<i64>,
+    source: Option<String>,
+    last_verified_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -641,6 +818,7 @@ pub(crate) struct ProviderDetailResponse {
     credential_status: CredentialStatus,
     model_count: u32,
     last_check: Option<ProviderCheckSummary>,
+    cache_profile: ProviderCacheProfileResponse,
     created_at: String,
     updated_at: String,
 }
@@ -661,6 +839,13 @@ impl From<ProviderRecord> for ProviderDetailResponse {
             credential_status: CredentialStatus::from(provider.credential_configured),
             model_count: provider.model_count,
             last_check: None,
+            cache_profile: ProviderCacheProfileResponse {
+                cache_support: provider.cache_support,
+                retention_type: provider.cache_retention_type,
+                retention_hint_seconds: provider.cache_retention_hint_seconds,
+                source: provider.cache_profile_source,
+                last_verified_at: provider.cache_profile_verified_at,
+            },
             created_at: provider.created_at,
             updated_at: provider.updated_at,
         }
@@ -1048,6 +1233,7 @@ mod tests {
             base_url: "https://other.example.com/v1".to_owned(),
             enabled: false,
             confirm_origin_change,
+            cache_profile: None,
         };
 
         let error = match service.update(update(false)) {
@@ -1060,6 +1246,34 @@ mod tests {
         assert_eq!(updated.name, "Updated Provider");
         assert_eq!(updated.base_url, "https://other.example.com/v1");
         assert!(!updated.enabled);
+    }
+
+    #[test]
+    fn provider_cache_profile_is_validated_and_persisted() {
+        let service = ProviderService::in_memory();
+        let provider = service
+            .create_with_secret_store(request("provider-cache"), |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+        let updated = service
+            .update(ProviderUpdateRequest {
+                provider_id: provider.id,
+                name: "Cache Provider".to_owned(),
+                base_url: "https://provider.example.com/v1".to_owned(),
+                enabled: true,
+                confirm_origin_change: false,
+                cache_profile: Some(ProviderCacheProfileInput {
+                    cache_support: CacheSupport::Supported,
+                    retention_type: CacheRetentionType::Approximate,
+                    retention_hint_seconds: Some(3_600),
+                    source: Some("https://provider.example.com/cache".to_owned()),
+                    last_verified_at: Some("2026-08-11".to_owned()),
+                }),
+            })
+            .unwrap();
+
+        assert_eq!(updated.cache_profile.cache_support, "SUPPORTED");
+        assert_eq!(updated.cache_profile.retention_type, "APPROXIMATE");
+        assert_eq!(updated.cache_profile.retention_hint_seconds, Some(3_600));
     }
 
     #[test]

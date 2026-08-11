@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 10;
+const LATEST_SCHEMA_VERSION: i64 = 15;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -48,6 +48,31 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         10,
         "orchestration_exclusions",
         include_str!("../migrations/0010_orchestration_exclusions.sql"),
+    ),
+    (
+        11,
+        "generic_agent_multi_agent_capability",
+        include_str!("../migrations/0011_generic_agent_multi_agent_capability.sql"),
+    ),
+    (
+        12,
+        "token_usage_records",
+        include_str!("../migrations/0012_token_usage_records.sql"),
+    ),
+    (
+        13,
+        "agent_thread_instances",
+        include_str!("../migrations/0013_agent_thread_instances.sql"),
+    ),
+    (
+        14,
+        "agent_reuse_and_provider_cache",
+        include_str!("../migrations/0014_agent_reuse_and_provider_cache.sql"),
+    ),
+    (
+        15,
+        "agent_cache_retention_override",
+        include_str!("../migrations/0015_agent_cache_retention_override.sql"),
     ),
 ];
 
@@ -168,7 +193,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO schema_migrations (version, name, applied_at)
-                VALUES (11, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (16, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -200,7 +225,21 @@ mod tests {
                     model_id, capability, status, source, confidence
                  ) VALUES (
                     'model', 'CODEX_MULTI_AGENT_V2', 'SUPPORTED', 'TEST', 'VERIFIED'
-                 );",
+                 );
+                 INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (
+                    'agent', 'executor', 'Executor', 'description', 'instruction', 'CUSTOM', 1,
+                    'WORKSPACE_WRITE', 'HIGH', 'USER', 1, '2026-01-01', '2026-01-01'
+                 );
+                 INSERT INTO agent_required_capabilities (agent_id, capability)
+                 VALUES ('agent', 'CODEX_MULTI_AGENT_V2');
+                 INSERT INTO agent_preferred_capabilities (agent_id, capability)
+                 VALUES ('agent', 'CODEX_MULTI_AGENT_V2');
+                 INSERT INTO agent_preferred_capabilities (agent_id, capability)
+                 VALUES ('agent', 'CODEX_MULTI_AGENT');
+                 ",
             )
             .unwrap();
 
@@ -214,5 +253,21 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(capabilities, vec!["CODEX_MULTI_AGENT"]);
+
+        for table in [
+            "agent_required_capabilities",
+            "agent_preferred_capabilities",
+        ] {
+            let capabilities = connection
+                .prepare(&format!(
+                    "SELECT capability FROM {table} WHERE agent_id = 'agent' ORDER BY capability"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(capabilities, vec!["CODEX_MULTI_AGENT"]);
+        }
     }
 }

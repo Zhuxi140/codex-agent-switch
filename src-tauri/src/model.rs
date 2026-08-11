@@ -322,20 +322,87 @@ impl SqliteModelRepository {
         id: &str,
         result: &ModelConnectionTestResponse,
     ) -> Result<(), ModelRepositoryError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let latency_ms = result
             .latency_ms
             .map(|value| i64::try_from(value).unwrap_or(i64::MAX));
-        let changed = self.connection.execute(
+        let timestamp =
+            transaction.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+                row.get::<_, String>(0)
+            })?;
+        let changed = transaction.execute(
             "UPDATE models
              SET last_test_status = ?2,
-                 last_tested_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 last_tested_at = ?4,
                  last_test_latency_ms = ?3
              WHERE id = ?1",
-            params![id, result.status.as_str(), latency_ms],
+            params![id, result.status.as_str(), latency_ms, timestamp],
         )?;
         if changed == 0 {
             return Err(ModelRepositoryError::NotFound);
         }
+        if let Some(supported) = result.responses_api_verified {
+            upsert_probe_capability(
+                &transaction,
+                id,
+                "RESPONSES_API",
+                supported,
+                &timestamp,
+                &result.message,
+            )?;
+        }
+        if let Some(supported) = result.tool_loop_verified {
+            for capability in ["TOOL_CALLING", "CODEX_MULTI_AGENT"] {
+                upsert_probe_capability(
+                    &transaction,
+                    id,
+                    capability,
+                    supported,
+                    &timestamp,
+                    &result.message,
+                )?;
+            }
+        }
+        match (result.responses_api_verified, result.tool_loop_verified) {
+            (_, Some(true)) => {
+                transaction.execute(
+                    "UPDATE models
+                     SET compatibility_level =
+                            CASE WHEN source = 'PRESET' THEN 'NATIVE' ELSE 'COMPATIBLE' END,
+                         compatibility_source = 'RUNTIME_PROBE',
+                         compatibility_verified_at = ?2,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![id, timestamp],
+                )?;
+            }
+            (_, Some(false)) => {
+                transaction.execute(
+                    "UPDATE models
+                     SET compatibility_level = 'GATEWAY_REQUIRED',
+                         compatibility_source = 'RUNTIME_PROBE',
+                         compatibility_verified_at = ?2,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![id, timestamp],
+                )?;
+            }
+            (Some(false), _) => {
+                transaction.execute(
+                    "UPDATE models
+                     SET compatibility_level = 'UNSUPPORTED',
+                         compatibility_source = 'RUNTIME_PROBE',
+                         compatibility_verified_at = ?2,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![id, timestamp],
+                )?;
+            }
+            _ => {}
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -365,6 +432,43 @@ impl SqliteModelRepository {
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(ModelRepositoryError::from)
     }
+}
+
+fn upsert_probe_capability(
+    transaction: &Transaction<'_>,
+    model_id: &str,
+    capability: &str,
+    supported: bool,
+    verified_at: &str,
+    message: &str,
+) -> Result<(), rusqlite::Error> {
+    let status = if supported {
+        "SUPPORTED"
+    } else {
+        "UNSUPPORTED"
+    };
+    let details = serde_json::to_string(&serde_json::json!({
+        "probe": "responses-tool-loop",
+        "version": 2,
+        "message": message
+    }))
+    .expect("probe details must serialize");
+    transaction.execute(
+        "INSERT INTO model_capabilities (
+            model_id, capability, status, source, confidence, verified_at,
+            evidence_version, details_json
+         ) VALUES (?1, ?2, ?3, 'RUNTIME_PROBE', 'VERIFIED', ?4,
+                   'responses-tool-loop-v2', ?5)
+         ON CONFLICT(model_id, capability) DO UPDATE SET
+            status = excluded.status,
+            source = excluded.source,
+            confidence = excluded.confidence,
+            verified_at = excluded.verified_at,
+            evidence_version = excluded.evidence_version,
+            details_json = excluded.details_json",
+        params![model_id, capability, status, verified_at, details],
+    )?;
+    Ok(())
 }
 
 fn model_select() -> &'static str {
@@ -438,26 +542,161 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
     };
     authorization.set_sensitive(true);
 
+    let basic_response = execute_probe_request(
+        &client,
+        &endpoint,
+        &authorization,
+        &serde_json::json!({
+            "model": target.model_id,
+            "input": "Reply with CAS_RESPONSES_OK.",
+            "max_output_tokens": 64,
+            "stream": false,
+            "store": false
+        }),
+        started,
+    );
+    let (status, body, request_id) = match basic_response {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    let latency_ms = Some(elapsed_ms(started));
+    if !status.is_success() {
+        return classify_probe_response(status, &body, latency_ms, request_id);
+    }
+    if parse_responses_body(&body).is_none() {
+        return ModelConnectionTestResponse::protocol_error_with_message(
+            latency_ms,
+            request_id,
+            "Endpoint 基础请求未返回有效的 Responses API 响应。",
+        );
+    }
+
+    let probe_tool = serde_json::json!({
+        "type": "function",
+        "name": "cas_probe",
+        "description": "Return the supplied probe value.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "value": { "type": "string" }
+            },
+            "required": ["value"]
+        }
+    });
+    let probe_prompt = "Call cas_probe exactly once with value CAS_OK.";
+    let tool_call_response = execute_probe_request(
+        &client,
+        &endpoint,
+        &authorization,
+        &serde_json::json!({
+            "model": target.model_id,
+            "input": [{ "role": "user", "content": probe_prompt }],
+            "max_output_tokens": 128,
+            "tools": [probe_tool.clone()],
+            // 与 Codex 实际运行一致；DeepSeek 思考模式会拒绝 required。
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "stream": false,
+            "store": false
+        }),
+        started,
+    );
+    let (status, body, request_id) = match tool_call_response {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    let latency_ms = Some(elapsed_ms(started));
+    if !status.is_success() {
+        let classified = classify_probe_response(status, &body, latency_ms, request_id.clone());
+        return if classified.status == ModelConnectionTestStatus::ProtocolError {
+            ModelConnectionTestResponse::tool_call_error(
+                latency_ms,
+                request_id,
+                provider_error_message(&body).as_deref(),
+            )
+        } else {
+            classified
+        };
+    }
+    let first_response = match parse_responses_body(&body) {
+        Some(response) => response,
+        None => {
+            return ModelConnectionTestResponse::tool_call_error(latency_ms, request_id, None);
+        }
+    };
+    let (tool_input, _) = match build_tool_result_input(&first_response, probe_prompt) {
+        Some(input) => input,
+        None => {
+            return ModelConnectionTestResponse::tool_call_error(latency_ms, request_id, None);
+        }
+    };
+
+    let tool_result_response = execute_probe_request(
+        &client,
+        &endpoint,
+        &authorization,
+        &serde_json::json!({
+            "model": target.model_id,
+            "input": tool_input,
+            "max_output_tokens": 128,
+            "tools": [probe_tool],
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "stream": false,
+            "store": false
+        }),
+        started,
+    );
+    let (status, body, request_id) = match tool_result_response {
+        Ok(response) => response,
+        Err(error) => return error,
+    };
+    let latency_ms = Some(elapsed_ms(started));
+    if status.is_success() {
+        return if parse_responses_body(&body).is_some() {
+            ModelConnectionTestResponse::success(latency_ms, request_id)
+        } else {
+            ModelConnectionTestResponse::tool_result_error(latency_ms, request_id, None)
+        };
+    }
+    let classified = classify_probe_response(status, &body, latency_ms, request_id.clone());
+    if classified.status == ModelConnectionTestStatus::ProtocolError {
+        ModelConnectionTestResponse::tool_result_error(
+            latency_ms,
+            request_id,
+            provider_error_message(&body).as_deref(),
+        )
+    } else {
+        classified
+    }
+}
+
+fn execute_probe_request(
+    client: &Client,
+    endpoint: &Url,
+    authorization: &HeaderValue,
+    body: &Value,
+    started: Instant,
+) -> Result<(StatusCode, Vec<u8>, Option<String>), ModelConnectionTestResponse> {
     let response = client
-        .post(endpoint)
-        .header(AUTHORIZATION, authorization)
+        .post(endpoint.clone())
+        .header(AUTHORIZATION, authorization.clone())
         .header(
             "user-agent",
             concat!("Codex-Agent-Switch/", env!("CARGO_PKG_VERSION")),
         )
-        .json(&serde_json::json!({
-            "model": target.model_id,
-            "input": "Reply with OK.",
-            "max_output_tokens": 16,
-            "stream": false
-        }))
-        .send();
-    let mut response = match response {
-        Ok(response) => response,
-        Err(_) => return ModelConnectionTestResponse::unreachable(Some(elapsed_ms(started))),
-    };
+        .json(body)
+        .send()
+        .map_err(|_| ModelConnectionTestResponse::unreachable(Some(elapsed_ms(started))))?;
+    read_probe_response(response, started)
+}
+
+fn read_probe_response(
+    mut response: reqwest::blocking::Response,
+    started: Instant,
+) -> Result<(StatusCode, Vec<u8>, Option<String>), ModelConnectionTestResponse> {
     let status = response.status();
-    let request_id = ["x-request-id", "request-id"]
+    let header_request_id = ["x-request-id", "request-id"]
         .into_iter()
         .find_map(|name| response.headers().get(name))
         .and_then(|value| value.to_str().ok())
@@ -470,9 +709,64 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         .read_to_end(&mut body);
     let latency_ms = Some(elapsed_ms(started));
     if read_result.is_err() || body.len() > 256 * 1024 {
-        return ModelConnectionTestResponse::protocol_error(latency_ms, request_id);
+        return Err(ModelConnectionTestResponse::protocol_error(
+            latency_ms,
+            header_request_id,
+        ));
     }
-    classify_probe_response(status, &body, latency_ms, request_id)
+    let request_id = header_request_id.or_else(|| {
+        serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("request_id")
+                    .or_else(|| value.get("requestId"))
+                    .or_else(|| value.get("error")?.get("request_id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|value| value.len() <= 256)
+    });
+    Ok((status, body, request_id))
+}
+
+fn parse_responses_body(body: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .filter(|value| value.get("object").and_then(Value::as_str) == Some("response"))
+}
+
+fn build_tool_result_input(response: &Value, prompt: &str) -> Option<(Vec<Value>, String)> {
+    let output = response.get("output")?.as_array()?;
+    let function_call = output
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))?;
+    let call_id = function_call.get("call_id")?.as_str()?.to_owned();
+    let mut input = vec![serde_json::json!({ "role": "user", "content": prompt })];
+    for item in output {
+        input.push(item.clone());
+        if item.get("type").and_then(Value::as_str) == Some("function_call")
+            && item.get("call_id").and_then(Value::as_str) == Some(call_id.as_str())
+        {
+            input.push(serde_json::json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "CAS_PROBE_RESULT"
+            }));
+        }
+    }
+    Some((input, call_id))
+}
+
+fn provider_error_message(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .or_else(|| value.get("error").filter(|error| error.is_string()))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)?;
+    Some(message.chars().take(1000).collect())
 }
 
 fn responses_endpoint(base_url: &str) -> Result<Url, ()> {
@@ -496,16 +790,7 @@ fn classify_probe_response(
     provider_request_id: Option<String>,
 ) -> ModelConnectionTestResponse {
     if status.is_success() {
-        let valid = serde_json::from_slice::<Value>(body)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("object")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .is_some_and(|object| object == "response");
-        return if valid {
+        return if parse_responses_body(body).is_some() {
             ModelConnectionTestResponse::success(latency_ms, provider_request_id)
         } else {
             ModelConnectionTestResponse::protocol_error(latency_ms, provider_request_id)
@@ -799,7 +1084,11 @@ pub(crate) struct ModelConnectionTestResponse {
     status: ModelConnectionTestStatus,
     latency_ms: Option<u64>,
     provider_request_id: Option<String>,
-    message: &'static str,
+    message: String,
+    #[serde(skip)]
+    responses_api_verified: Option<bool>,
+    #[serde(skip)]
+    tool_loop_verified: Option<bool>,
 }
 
 impl ModelConnectionTestResponse {
@@ -807,13 +1096,17 @@ impl ModelConnectionTestResponse {
         status: ModelConnectionTestStatus,
         latency_ms: Option<u64>,
         provider_request_id: Option<String>,
-        message: &'static str,
+        message: impl Into<String>,
+        responses_api_verified: Option<bool>,
+        tool_loop_verified: Option<bool>,
     ) -> Self {
         Self {
             status,
             latency_ms,
             provider_request_id,
-            message,
+            message: message.into(),
+            responses_api_verified,
+            tool_loop_verified,
         }
     }
 
@@ -822,7 +1115,9 @@ impl ModelConnectionTestResponse {
             ModelConnectionTestStatus::Success,
             latency_ms,
             provider_request_id,
-            "Model 已通过最小 Responses API 请求验证。",
+            "Model 已通过 Responses API 与 Function Calling 工具闭环验证。",
+            Some(true),
+            Some(true),
         )
     }
 
@@ -832,6 +1127,8 @@ impl ModelConnectionTestResponse {
             None,
             None,
             "Provider Credential 不存在或已从系统凭据库移除。",
+            None,
+            None,
         )
     }
 
@@ -841,6 +1138,8 @@ impl ModelConnectionTestResponse {
             latency_ms,
             provider_request_id,
             "Provider 拒绝了当前 Credential。",
+            None,
+            None,
         )
     }
 
@@ -850,6 +1149,8 @@ impl ModelConnectionTestResponse {
             latency_ms,
             provider_request_id,
             "Provider 不识别当前 Model ID。",
+            None,
+            None,
         )
     }
 
@@ -859,15 +1160,75 @@ impl ModelConnectionTestResponse {
             latency_ms,
             provider_request_id,
             "Provider 当前触发限流，请稍后重试。",
+            None,
+            None,
         )
     }
 
     fn protocol_error(latency_ms: Option<u64>, provider_request_id: Option<String>) -> Self {
+        Self::protocol_error_with_message(
+            latency_ms,
+            provider_request_id,
+            "Endpoint 未返回有效的 Responses API 响应。",
+        )
+    }
+
+    fn protocol_error_with_message(
+        latency_ms: Option<u64>,
+        provider_request_id: Option<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self::new(
             ModelConnectionTestStatus::ProtocolError,
             latency_ms,
             provider_request_id,
-            "Endpoint 未返回有效的 Responses API 响应。",
+            message,
+            Some(false),
+            None,
+        )
+    }
+
+    fn tool_call_error(
+        latency_ms: Option<u64>,
+        provider_request_id: Option<String>,
+        provider_message: Option<&str>,
+    ) -> Self {
+        let mut message =
+            "Responses API 基础请求成功，但 Provider 未完成 Function Calling 工具调用，不能用于 Codex Agent。"
+                .to_owned();
+        if let Some(provider_message) = provider_message {
+            message.push_str(" Provider: ");
+            message.push_str(provider_message);
+        }
+        Self::new(
+            ModelConnectionTestStatus::ProtocolError,
+            latency_ms,
+            provider_request_id,
+            message,
+            Some(true),
+            Some(false),
+        )
+    }
+
+    fn tool_result_error(
+        latency_ms: Option<u64>,
+        provider_request_id: Option<String>,
+        provider_message: Option<&str>,
+    ) -> Self {
+        let mut message =
+            "Responses API 首轮成功，但 Provider 拒绝 Function Calling 工具结果，不能用于 Codex Agent。"
+                .to_owned();
+        if let Some(provider_message) = provider_message {
+            message.push_str(" Provider: ");
+            message.push_str(provider_message);
+        }
+        Self::new(
+            ModelConnectionTestStatus::ProtocolError,
+            latency_ms,
+            provider_request_id,
+            message,
+            Some(true),
+            Some(false),
         )
     }
 
@@ -877,6 +1238,8 @@ impl ModelConnectionTestResponse {
             latency_ms,
             None,
             "无法连接 Provider，或请求在 20 秒内未完成。",
+            None,
+            None,
         )
     }
 
@@ -886,6 +1249,8 @@ impl ModelConnectionTestResponse {
             latency_ms,
             provider_request_id,
             "Provider 返回了服务端错误。",
+            None,
+            None,
         )
     }
 }
@@ -1550,7 +1915,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_test_status_is_saved_without_changing_compatibility() {
+    fn tool_loop_test_updates_runtime_compatibility_and_capabilities() {
         let service = ModelService::in_memory();
         let provider_id = insert_provider(&service);
         let model = service
@@ -1572,7 +1937,117 @@ mod tests {
         assert_eq!(saved.last_test_status.as_deref(), Some("SUCCESS"));
         assert_eq!(saved.last_test_latency_ms, Some(42));
         assert!(saved.last_tested_at.is_some());
-        assert_eq!(saved.compatibility_level, "UNKNOWN");
+        assert_eq!(saved.compatibility_level, "COMPATIBLE");
+        assert_eq!(saved.compatibility_source, "RUNTIME_PROBE");
+        for capability in ["RESPONSES_API", "TOOL_CALLING", "CODEX_MULTI_AGENT"] {
+            assert!(
+                saved
+                    .capabilities
+                    .iter()
+                    .any(|record| record.capability == capability && record.status == "SUPPORTED")
+            );
+        }
+
+        let transient = ModelConnectionTestResponse::rate_limited(
+            Some(45),
+            Some("request-rate-limit".to_owned()),
+        );
+        repository
+            .record_connection_test(&model.id, &transient)
+            .unwrap();
+        assert_eq!(
+            repository
+                .find_by_id(&model.id)
+                .unwrap()
+                .compatibility_level,
+            "COMPATIBLE"
+        );
+
+        let failed = ModelConnectionTestResponse::tool_call_error(
+            Some(48),
+            Some("request-tool-call".to_owned()),
+            Some("tools are not supported"),
+        );
+        repository
+            .record_connection_test(&model.id, &failed)
+            .unwrap();
+        let saved = repository.find_by_id(&model.id).unwrap();
+        assert_eq!(saved.compatibility_level, "GATEWAY_REQUIRED");
+        assert!(saved.capabilities.iter().any(|record| {
+            record.capability == "RESPONSES_API" && record.status == "SUPPORTED"
+        }));
+        for capability in ["TOOL_CALLING", "CODEX_MULTI_AGENT"] {
+            assert!(
+                saved.capabilities.iter().any(
+                    |record| record.capability == capability && record.status == "UNSUPPORTED"
+                )
+            );
+        }
+
+        let failed = ModelConnectionTestResponse::tool_result_error(
+            Some(50),
+            Some("request-tool-result".to_owned()),
+            Some("role tool is invalid"),
+        );
+        repository
+            .record_connection_test(&model.id, &failed)
+            .unwrap();
+        let saved = repository.find_by_id(&model.id).unwrap();
+        assert_eq!(saved.last_test_status.as_deref(), Some("PROTOCOL_ERROR"));
+        assert_eq!(saved.compatibility_level, "GATEWAY_REQUIRED");
+        for capability in ["TOOL_CALLING", "CODEX_MULTI_AGENT"] {
+            assert!(
+                saved.capabilities.iter().any(
+                    |record| record.capability == capability && record.status == "UNSUPPORTED"
+                )
+            );
+        }
+
+        let failed = ModelConnectionTestResponse::protocol_error_with_message(
+            Some(20),
+            Some("request-basic".to_owned()),
+            "not a Responses endpoint",
+        );
+        repository
+            .record_connection_test(&model.id, &failed)
+            .unwrap();
+        let saved = repository.find_by_id(&model.id).unwrap();
+        assert_eq!(saved.compatibility_level, "UNSUPPORTED");
+        assert!(saved.capabilities.iter().any(|record| {
+            record.capability == "RESPONSES_API" && record.status == "UNSUPPORTED"
+        }));
+    }
+
+    #[test]
+    fn tool_result_is_inserted_immediately_after_matching_function_call() {
+        let response = serde_json::json!({
+            "object": "response",
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "准备调用工具" }]
+                },
+                {
+                    "type": "function_call",
+                    "name": "cas_probe",
+                    "arguments": "{\"value\":\"CAS_OK\"}",
+                    "call_id": "call-1"
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "稍后完成" }]
+                }
+            ]
+        });
+
+        let (input, call_id) = build_tool_result_input(&response, "probe").unwrap();
+
+        assert_eq!(call_id, "call-1");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call-1");
     }
 
     #[test]

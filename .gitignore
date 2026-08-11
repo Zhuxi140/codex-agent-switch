@@ -3,6 +3,7 @@ dist/
 .npm-cache/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/binaries/
 *.log
 .env
 .env.*

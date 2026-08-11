@@ -2,7 +2,7 @@
 
 一个 Tauri 2 桌面工具，用于管理 Codex（multi-agent）各个 subagent 角色使用的模型——**不手改 Codex 配置**，在 GUI 中完成 Provider / Model / Agent 的绑定、应用与诊断。
 
-当前版本：**0.2.0**（开发中，未发布正式产物）
+当前版本：**0.2.0**（首个 Windows 安装包版本）
 
 ---
 
@@ -100,6 +100,13 @@ Codex 支持多 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但�
 - **Codex CLI ≥ 0.144.0**：Store 版需将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`（WindowsApps 无执行别名）
 - 其余（WebView2 Runtime）Windows 11 自带；全部 Rust 依赖离线可构建
 
+## 安装与构建
+
+- 普通用户：运行发布产物中的 `Codex Agent Switch_0.2.0_x64-setup.exe`，按向导安装。
+- 开发者生成安装包：在仓库根目录运行 `npm.cmd run bundle:windows`。
+- 安装包会同时携带 `cas-helper.exe`，无需单独复制凭据助手。
+- 默认按当前用户安装，不要求管理员权限；首次运行后再在设置页检测 Codex 环境。
+
 ---
 
 ## Roadmap 与当前进度
@@ -116,7 +123,6 @@ Codex 支持多 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但�
 **剩余事项：**
 
 - E2E 第 5 步：真实委派（隔离 `CODEX_HOME` + `codex login` + executor 真实调用 DeepSeek，验收 `/agent` 出现 executor、返回 `CAS_DEEPSEEK_E2E_OK`）
-- 发布产物流程（绿色版两 exe / NSIS 安装器）
 
 **明确不做（当前阶段）：** Token 监控、复杂调度算法、关键词路由引擎、可视化编排器、多个写 Agent 并行改同一工作区、Provider 专用调度、自动修改项目级 `AGENTS.md`。
 

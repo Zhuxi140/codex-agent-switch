@@ -18,6 +18,13 @@ pub(crate) enum Appearance {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum OrchestrationFailurePolicy {
+    StrictStop,
+    PrimaryFallback,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SettingsResponse {
@@ -26,6 +33,7 @@ pub(crate) struct SettingsResponse {
     pub(crate) update_channel: String,
     pub(crate) custom_codex_home: Option<String>,
     pub(crate) custom_font_family: Option<String>,
+    pub(crate) orchestration_failure_policy: OrchestrationFailurePolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,6 +46,7 @@ pub(crate) struct SettingsUpdateRequest {
     custom_codex_home: NullableStringUpdate,
     #[serde(default)]
     custom_font_family: NullableStringUpdate,
+    orchestration_failure_policy: Option<OrchestrationFailurePolicy>,
 }
 
 #[derive(Debug, Default)]
@@ -128,6 +137,14 @@ pub(crate) fn update_settings(
             }
         }
     }
+    if let Some(policy) = request.orchestration_failure_policy {
+        upsert_setting(
+            &transaction,
+            "orchestration_failure_policy",
+            orchestration_failure_policy_value(policy),
+            "STRING",
+        )?;
+    }
     transaction.commit()?;
     read_settings(&connection)
 }
@@ -147,13 +164,14 @@ pub(crate) fn read_custom_codex_home(
         .map(PathBuf::from))
 }
 
-fn read_settings(connection: &Connection) -> Result<SettingsResponse, SettingsError> {
+pub(crate) fn read_settings(connection: &Connection) -> Result<SettingsResponse, SettingsError> {
     let mut response = SettingsResponse {
         appearance: Appearance::System,
         auto_backup_enabled: true,
         update_channel: DEFAULT_UPDATE_CHANNEL.to_owned(),
         custom_codex_home: None,
         custom_font_family: None,
+        orchestration_failure_policy: OrchestrationFailurePolicy::StrictStop,
     };
     let mut statement = connection.prepare(
         "SELECT setting_key, setting_value FROM application_settings ORDER BY setting_key",
@@ -179,6 +197,10 @@ fn read_settings(connection: &Connection) -> Result<SettingsResponse, SettingsEr
             }
             "custom_codex_home" => response.custom_codex_home = value,
             "custom_font_family" => response.custom_font_family = value,
+            "orchestration_failure_policy" => {
+                response.orchestration_failure_policy =
+                    parse_orchestration_failure_policy(value.as_deref())?;
+            }
             _ => {}
         }
     }
@@ -254,6 +276,25 @@ fn appearance_value(appearance: Appearance) -> &'static str {
         Appearance::System => "SYSTEM",
         Appearance::Light => "LIGHT",
         Appearance::Dark => "DARK",
+    }
+}
+
+fn parse_orchestration_failure_policy(
+    value: Option<&str>,
+) -> Result<OrchestrationFailurePolicy, SettingsError> {
+    match value {
+        Some("STRICT_STOP") => Ok(OrchestrationFailurePolicy::StrictStop),
+        Some("PRIMARY_FALLBACK") => Ok(OrchestrationFailurePolicy::PrimaryFallback),
+        _ => Err(SettingsError::InvalidStoredValue),
+    }
+}
+
+pub(crate) fn orchestration_failure_policy_value(
+    policy: OrchestrationFailurePolicy,
+) -> &'static str {
+    match policy {
+        OrchestrationFailurePolicy::StrictStop => "STRICT_STOP",
+        OrchestrationFailurePolicy::PrimaryFallback => "PRIMARY_FALLBACK",
     }
 }
 
@@ -355,12 +396,17 @@ mod tests {
                     codex_home.to_string_lossy().into_owned(),
                 ),
                 custom_font_family: NullableStringUpdate::Value("Segoe UI".to_owned()),
+                orchestration_failure_policy: Some(OrchestrationFailurePolicy::PrimaryFallback),
             },
         )
         .unwrap();
         assert_eq!(updated.appearance, Appearance::Dark);
         assert_eq!(updated.custom_codex_home.as_deref(), codex_home.to_str());
         assert_eq!(updated.custom_font_family.as_deref(), Some("Segoe UI"));
+        assert_eq!(
+            updated.orchestration_failure_policy,
+            OrchestrationFailurePolicy::PrimaryFallback
+        );
 
         let cleared = update_settings(
             &database,
@@ -370,6 +416,7 @@ mod tests {
                 update_channel: None,
                 custom_codex_home: NullableStringUpdate::Null,
                 custom_font_family: NullableStringUpdate::Null,
+                orchestration_failure_policy: None,
             },
         )
         .unwrap();
@@ -391,6 +438,7 @@ mod tests {
                 update_channel: None,
                 custom_codex_home: NullableStringUpdate::Missing,
                 custom_font_family: NullableStringUpdate::Missing,
+                orchestration_failure_policy: None,
             },
         )
         .unwrap_err();

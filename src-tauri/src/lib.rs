@@ -6,7 +6,9 @@ mod domain;
 mod model;
 mod persistence;
 mod provider;
+mod runtime_bridge;
 mod settings;
+mod usage;
 
 use serde::Serialize;
 use tauri::Manager;
@@ -36,7 +38,18 @@ use provider::{
     ProviderGetRequest, ProviderListRequest, ProviderService, ProviderSummary,
     ProviderUpdateRequest,
 };
+use runtime_bridge::{
+    AgentThreadExecutionResponse, ManagedSessionResponse, ManagedSessionResumeRequest,
+    ManagedSessionStartRequest, ManagedTurnStartRequest, ManagedTurnStartResponse,
+    RuntimeBridgeService, RuntimeBridgeStatusResponse,
+};
 use settings::{SettingsResponse, SettingsUpdateRequest};
+use usage::{
+    AgentThreadExecutionRequest, AgentThreadInstanceListRequest,
+    AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
+    AgentThreadInstanceResponse, AgentThreadInstanceScopeRequest, UsageListRequest,
+    UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
+};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -367,6 +380,121 @@ fn diagnostics_run(
     state.run_diagnostics(request).map_err(ApiError::from)
 }
 
+#[tauri::command]
+fn usage_get_summary(
+    state: tauri::State<'_, UsageService>,
+    request: UsageQueryRequest,
+) -> Result<UsageSummaryResponse, ApiError> {
+    state.summary(request)
+}
+
+#[tauri::command]
+fn usage_list_records(
+    state: tauri::State<'_, UsageService>,
+    request: UsageListRequest,
+) -> Result<Vec<UsageRecordResponse>, ApiError> {
+    state.list(request)
+}
+
+#[tauri::command]
+fn agent_thread_instance_list(
+    state: tauri::State<'_, UsageService>,
+    request: AgentThreadInstanceListRequest,
+) -> Result<Vec<AgentThreadInstanceResponse>, ApiError> {
+    state.list_agent_instances(request)
+}
+
+#[tauri::command]
+fn agent_thread_instance_set_scope(
+    state: tauri::State<'_, UsageService>,
+    request: AgentThreadInstanceScopeRequest,
+) -> Result<AgentThreadInstanceResponse, ApiError> {
+    state.set_agent_instance_scope(request)
+}
+
+#[tauri::command]
+fn agent_thread_instance_recommend(
+    state: tauri::State<'_, UsageService>,
+    request: AgentThreadInstanceRecommendRequest,
+) -> Result<AgentThreadInstanceRecommendation, ApiError> {
+    state.recommend_agent_instance(request)
+}
+
+#[tauri::command]
+fn agent_thread_instance_execute(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    request: AgentThreadExecutionRequest,
+) -> Result<AgentThreadExecutionResponse, ApiError> {
+    bridge.execute_agent_thread(request)
+}
+
+#[tauri::command]
+fn usage_monitor_start(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    configuration: tauri::State<'_, ConfigurationService>,
+) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+    let environment = configuration.environment().map_err(ApiError::from)?;
+    let executable = environment.executable_path.ok_or_else(|| {
+        ApiError::new(
+            "CODEX_EXECUTABLE_NOT_FOUND",
+            "未找到 Codex 可执行文件。",
+            false,
+            None,
+        )
+    })?;
+    let codex_home = environment.codex_home.ok_or_else(|| {
+        ApiError::new(
+            "CODEX_HOME_UNRESOLVED",
+            "无法定位 CODEX_HOME。",
+            false,
+            None,
+        )
+    })?;
+    bridge.start(
+        std::path::Path::new(&executable),
+        std::path::Path::new(&codex_home),
+        environment.version,
+    )
+}
+
+#[tauri::command]
+fn usage_monitor_stop(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+    bridge.stop()
+}
+
+#[tauri::command]
+fn usage_monitor_status(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+    bridge.status()
+}
+
+#[tauri::command]
+fn usage_managed_session_start(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    request: ManagedSessionStartRequest,
+) -> Result<ManagedSessionResponse, ApiError> {
+    bridge.managed_session_start(request)
+}
+
+#[tauri::command]
+fn usage_managed_session_resume(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    request: ManagedSessionResumeRequest,
+) -> Result<ManagedSessionResponse, ApiError> {
+    bridge.managed_session_resume(request)
+}
+
+#[tauri::command]
+fn usage_managed_turn_start(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    request: ManagedTurnStartRequest,
+) -> Result<ManagedTurnStartResponse, ApiError> {
+    bridge.managed_turn_start(request)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -377,6 +505,8 @@ pub fn run() {
             app.manage(ProviderService::open(&database_path)?);
             app.manage(ModelService::open(&database_path)?);
             app.manage(AgentService::open(&database_path)?);
+            app.manage(UsageService::open(&database_path)?);
+            app.manage(RuntimeBridgeService::open(&database_path, &data_home)?);
             app.manage(ConfigurationService::open(&database_path, &data_home)?);
             Ok(())
         })
@@ -418,7 +548,19 @@ pub fn run() {
             snapshot_list,
             snapshot_get,
             snapshot_restore,
-            diagnostics_run
+            diagnostics_run,
+            usage_get_summary,
+            usage_list_records,
+            agent_thread_instance_list,
+            agent_thread_instance_set_scope,
+            agent_thread_instance_recommend,
+            agent_thread_instance_execute,
+            usage_monitor_start,
+            usage_monitor_stop,
+            usage_monitor_status,
+            usage_managed_session_start,
+            usage_managed_session_resume,
+            usage_managed_turn_start
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Agent Switch");

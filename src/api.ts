@@ -36,6 +36,7 @@ export interface CodexEnvironmentResponse extends CodexEnvironmentSummary {
 }
 
 export type Appearance = "SYSTEM" | "LIGHT" | "DARK";
+export type OrchestrationFailurePolicy = "STRICT_STOP" | "PRIMARY_FALLBACK";
 
 export interface SettingsResponse {
   appearance: Appearance;
@@ -43,6 +44,7 @@ export interface SettingsResponse {
   updateChannel: string;
   customCodexHome: string | null;
   customFontFamily: string | null;
+  orchestrationFailurePolicy: OrchestrationFailurePolicy;
 }
 
 export interface SettingsUpdateRequest {
@@ -51,6 +53,7 @@ export interface SettingsUpdateRequest {
   updateChannel?: string;
   customCodexHome?: string | null;
   customFontFamily?: string | null;
+  orchestrationFailurePolicy?: OrchestrationFailurePolicy;
 }
 
 export type ConfigurationStatus =
@@ -198,6 +201,16 @@ export function restoreSnapshot(snapshotId: string): Promise<SnapshotRestoreResp
 export type ProviderProtocol = "RESPONSES";
 export type ProviderStatus = "READY" | "DISABLED";
 export type CredentialStatus = "CONFIGURED" | "MISSING" | "STORE_UNAVAILABLE";
+export type ProviderCacheSupport = "UNKNOWN" | "SUPPORTED" | "UNSUPPORTED";
+export type ProviderCacheRetentionType = "UNKNOWN" | "APPROXIMATE" | "GUARANTEED";
+
+export interface ProviderCacheProfile {
+  cacheSupport: ProviderCacheSupport;
+  retentionType: ProviderCacheRetentionType;
+  retentionHintSeconds: number | null;
+  source: string | null;
+  lastVerifiedAt: string | null;
+}
 
 export interface ProviderSummary {
   id: string;
@@ -210,6 +223,7 @@ export interface ProviderSummary {
   status: ProviderStatus;
   credentialStatus: CredentialStatus;
   modelCount: number;
+  cacheSupport: ProviderCacheSupport;
 }
 
 export interface ProviderDetailResponse {
@@ -226,6 +240,7 @@ export interface ProviderDetailResponse {
   credentialStatus: CredentialStatus;
   modelCount: number;
   lastCheck: null;
+  cacheProfile: ProviderCacheProfile;
   createdAt: string;
   updatedAt: string;
 }
@@ -249,6 +264,7 @@ export interface ProviderUpdateRequest {
   baseUrl: string;
   enabled: boolean;
   confirmOriginChange?: boolean;
+  cacheProfile?: ProviderCacheProfile;
 }
 
 export interface DeleteResult {
@@ -415,6 +431,7 @@ export type AgentAvailability =
   | "MODEL_MISSING"
   | "PROVIDER_UNAVAILABLE"
   | "INCOMPATIBLE_MODEL"
+  | "UNVERIFIED_MODEL"
   | "INVALID_CONFIGURATION";
 
 export interface AgentModelReference {
@@ -444,11 +461,14 @@ export interface AgentSummary {
   model: AgentModelReference | null;
   availability: AgentAvailability;
   reasoningPolicy: ReasoningPolicy;
+  reuseStrategy: AgentReuseStrategy;
+  cacheRetentionOverrideSeconds: number | null;
   roleKey: string | null;
   orchestrationPhase: OrchestrationPhase | null;
 }
 
 export type OrchestrationPhase = "DISCOVERY" | "EXECUTION" | "VERIFICATION" | "REVIEW";
+export type AgentReuseStrategy = "AUTO" | "HOT" | "COLD";
 
 export interface AgentDetailResponse {
   id: string;
@@ -460,6 +480,8 @@ export interface AgentDetailResponse {
   enabled: boolean;
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
+  reuseStrategy: AgentReuseStrategy;
+  cacheRetentionOverrideSeconds: number | null;
   roleKey: string | null;
   orchestrationPhase: OrchestrationPhase | null;
   requiredCapabilities: string[];
@@ -492,6 +514,8 @@ export interface AgentCreateRequest {
   enabled: boolean;
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
+  reuseStrategy: AgentReuseStrategy;
+  cacheRetentionOverrideSeconds: number | null;
   modelId?: string | null;
   roleKey: string;
   orchestrationPhase?: OrchestrationPhase | null;
@@ -504,6 +528,8 @@ export interface AgentUpdateRequest {
   instruction: string;
   sandboxPolicy: SandboxPolicy;
   reasoningPolicy: ReasoningPolicy;
+  reuseStrategy: AgentReuseStrategy;
+  cacheRetentionOverrideSeconds: number | null;
   modelId?: string | null;
   roleKey: string;
   orchestrationPhase: OrchestrationPhase;
@@ -539,4 +565,264 @@ export function removeAgentModelBinding(agentId: string): Promise<AgentDetailRes
 
 export function deleteAgent(agentId: string): Promise<void> {
   return invoke("agent_delete", { request: { agentId } });
+}
+
+export type UsageStatus = "LIVE" | "FINAL" | "PARTIAL" | "UNKNOWN";
+export type UsageSource =
+  | "CODEX_APP_SERVER"
+  | "CODEX_EXEC_JSONL"
+  | "RESPONSES_PROXY";
+
+export interface UsageQueryRequest {
+  agentId?: string | null;
+  providerId?: string | null;
+  modelId?: string | null;
+  codexSessionId?: string | null;
+  from?: string | null;
+  to?: string | null;
+}
+
+export interface UsageListRequest extends UsageQueryRequest {
+  limit?: number;
+}
+
+export interface UsageSummaryResponse {
+  recordCount: number;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+export interface UsageRecordResponse {
+  id: string;
+  codexSessionId: string;
+  codexThreadId: string;
+  parentThreadId: string | null;
+  agentId: string | null;
+  agentNameSnapshot: string | null;
+  providerId: string | null;
+  providerNameSnapshot: string | null;
+  modelId: string | null;
+  modelNameSnapshot: string | null;
+  inputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+  modelContextWindow: number | null;
+  usageStatus: UsageStatus;
+  source: UsageSource;
+  startedAt: string;
+  completedAt: string | null;
+  updatedAt: string;
+}
+
+export type AgentThreadInstanceStatus =
+  | "RUNNING"
+  | "IDLE"
+  | "RECOVERY_REQUIRED"
+  | "CLOSED"
+  | "UNKNOWN";
+
+export interface AgentThreadInstanceResponse {
+  id: string;
+  agentId: string | null;
+  agentNameSnapshot: string | null;
+  codexThreadId: string;
+  parentThreadId: string | null;
+  scopeKey: string | null;
+  status: AgentThreadInstanceStatus;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  contextWindow: number | null;
+  createdAt: string;
+  lastUsedAt: string;
+  closedAt: string | null;
+}
+
+export interface AgentThreadInstanceRecommendation {
+  decision: "REUSE" | "SPAWN";
+  reasonCode:
+    | "EXACT_SCOPE_IDLE"
+    | "CONTEXT_PRESSURE"
+    | "CACHE_HINT_PRESSURE"
+    | "NO_HEALTHY_IDLE_THREAD"
+    | "NO_SCOPE_MATCH";
+  message: string;
+  scopeKey: string;
+  candidateInstanceId: string | null;
+  candidateThreadId: string | null;
+  contextPressurePercent: number | null;
+  contextPressureLimitPercent: number;
+  reuseStrategy: AgentReuseStrategy;
+  cacheSupport: ProviderCacheSupport;
+  cacheRetentionType: ProviderCacheRetentionType;
+  cacheRetentionHintSeconds: number | null;
+  cacheRetentionSource: "NONE" | "PROVIDER" | "AGENT_OVERRIDE";
+  cacheHint:
+    | "UNKNOWN"
+    | "UNSUPPORTED"
+    | "SUPPORTED_NO_RETENTION_HINT"
+    | "WITHIN_RETENTION_HINT"
+    | "OUTSIDE_RETENTION_HINT";
+  candidateAgeSeconds: number | null;
+}
+
+export interface AgentThreadExecutionResponse {
+  action: "REUSED" | "SPAWNED";
+  decision: "REUSE" | "SPAWN";
+  reasonCode: AgentThreadInstanceRecommendation["reasonCode"];
+  agentId: string;
+  agentName: string;
+  scopeKey: string;
+  threadId: string;
+  turnId: string;
+  status: ManagedSessionStatus;
+}
+
+export function getUsageSummary(
+  request: UsageQueryRequest = {},
+): Promise<UsageSummaryResponse> {
+  return invoke<UsageSummaryResponse>("usage_get_summary", { request });
+}
+
+export function listUsageRecords(
+  request: UsageListRequest = {},
+): Promise<UsageRecordResponse[]> {
+  return invoke<UsageRecordResponse[]>("usage_list_records", { request });
+}
+
+export function listAgentThreadInstances(
+  request: { agentId?: string | null; limit?: number } = {},
+): Promise<AgentThreadInstanceResponse[]> {
+  return invoke<AgentThreadInstanceResponse[]>("agent_thread_instance_list", { request });
+}
+
+export function setAgentThreadInstanceScope(
+  threadId: string,
+  scopeKey: string | null,
+): Promise<AgentThreadInstanceResponse> {
+  return invoke<AgentThreadInstanceResponse>("agent_thread_instance_set_scope", {
+    request: { threadId, scopeKey },
+  });
+}
+
+export function recommendAgentThreadInstance(
+  agentId: string,
+  scopeKey: string,
+): Promise<AgentThreadInstanceRecommendation> {
+  return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_recommend", {
+    request: { agentId, scopeKey },
+  });
+}
+
+export function executeAgentThread(request: {
+  agentId: string;
+  scopeKey: string;
+  cwd: string;
+  input: string;
+  expectedDecision: "REUSE" | "SPAWN";
+  expectedCandidateThreadId: string | null;
+}): Promise<AgentThreadExecutionResponse> {
+  return invoke<AgentThreadExecutionResponse>("agent_thread_instance_execute", { request });
+}
+
+export type RuntimeBridgeStatus =
+  | "STOPPED"
+  | "STARTING"
+  | "RUNNING"
+  | "DEGRADED"
+  | "FAILED";
+
+export type ProtocolCompatibility =
+  | "UNVERIFIED"
+  | "COMPATIBLE"
+  | "LEGACY_COMPATIBLE"
+  | "DEGRADED";
+
+export type SchemaCapability =
+  | "SUPPORTED"
+  | "NOT_DECLARED"
+  | "INCOMPATIBLE"
+  | "UNAVAILABLE";
+
+export type ManagedSessionStatus =
+  | "IDLE"
+  | "RUNNING"
+  | "DETACHED"
+  | "RECOVERY_REQUIRED"
+  | "FAILED";
+
+export interface ManagedSessionResponse {
+  threadId: string;
+  sessionId: string | null;
+  origin: "STARTED" | "RESUMED";
+  status: ManagedSessionStatus;
+  cwd: string | null;
+  activeTurnId: string | null;
+  attachedAt: string;
+}
+
+export interface RuntimeBridgeStatusResponse {
+  status: RuntimeBridgeStatus;
+  protocolCompatibility: ProtocolCompatibility;
+  schemaCapability: SchemaCapability;
+  managedSessionCapability: SchemaCapability;
+  agentExecutionCapability: SchemaCapability;
+  codexVersion: string | null;
+  serverUserAgent: string | null;
+  usageEventCount: number;
+  malformedEventCount: number;
+  startedAt: string | null;
+  lastEventAt: string | null;
+  lastError: string | null;
+  managedSession: ManagedSessionResponse | null;
+}
+
+export function startUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {
+  return invoke<RuntimeBridgeStatusResponse>("usage_monitor_start");
+}
+
+export function stopUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {
+  return invoke<RuntimeBridgeStatusResponse>("usage_monitor_stop");
+}
+
+export function getUsageMonitorStatus(): Promise<RuntimeBridgeStatusResponse> {
+  return invoke<RuntimeBridgeStatusResponse>("usage_monitor_status");
+}
+
+export function startManagedUsageSession(cwd: string): Promise<ManagedSessionResponse> {
+  return invoke<ManagedSessionResponse>("usage_managed_session_start", {
+    request: { cwd },
+  });
+}
+
+export function resumeManagedUsageSession(
+  threadId: string,
+  cwd?: string,
+): Promise<ManagedSessionResponse> {
+  return invoke<ManagedSessionResponse>("usage_managed_session_resume", {
+    request: { threadId, cwd },
+  });
+}
+
+export interface ManagedTurnStartResponse {
+  threadId: string;
+  turnId: string;
+  status: ManagedSessionStatus;
+}
+
+export function startManagedUsageTurn(
+  threadId: string,
+  input: string,
+): Promise<ManagedTurnStartResponse> {
+  return invoke<ManagedTurnStartResponse>("usage_managed_turn_start", {
+    request: { threadId, input },
+  });
 }

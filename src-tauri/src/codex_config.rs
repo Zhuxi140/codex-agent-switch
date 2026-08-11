@@ -12,6 +12,9 @@ const ORCHESTRATION_BEGIN: &str = "<<< CAS ORCHESTRATION v1 >>>";
 const ORCHESTRATION_END: &str = "<<< END CAS ORCHESTRATION v1 >>>";
 const GLOBAL_ORCHESTRATION_BEGIN: &str = "<!-- CAS ORCHESTRATION v1 BEGIN -->";
 const GLOBAL_ORCHESTRATION_END: &str = "<!-- CAS ORCHESTRATION v1 END -->";
+pub(crate) const ORCHESTRATION_RUNTIME_CONTRACT: &str =
+    "CAS_RUNTIME_CONTRACT=V1_PLAINTEXT_WORKSPACE";
+const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的执行 Agent，不是 Primary。直接执行父 Agent 交付的任务，不得重新套用 Primary 编排流程，也不得递归创建同职责子 Agent。若项目说明与当前磁盘中的文件或代码状态冲突，先读取并核对磁盘事实，以当前代码状态和父 Agent 的明确任务为准。";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -27,6 +30,10 @@ pub(crate) struct OrchestrationBaseline {
     pub(crate) default_permissions: Option<String>,
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) agents_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) multi_agent_v2_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) multi_agent_v2_captured: bool,
     #[serde(default)]
     pub(crate) global_instructions_path: Option<String>,
     #[serde(default)]
@@ -245,15 +252,31 @@ pub(crate) fn capture_orchestration_baseline(
         })
         .transpose()?
         .flatten();
+    let multi_agent_v2_enabled = optional_multi_agent_v2(&document)?;
     Ok(OrchestrationBaseline {
         permission_style,
         default_permissions,
         sandbox_mode,
         agents_enabled,
+        multi_agent_v2_enabled,
+        multi_agent_v2_captured: true,
         global_instructions_path: None,
         global_instructions_existed: false,
         global_instructions_content: None,
     })
+}
+
+pub(crate) fn upgrade_orchestration_baseline(
+    existing: &str,
+    baseline: &mut OrchestrationBaseline,
+) -> Result<bool, ConfigError> {
+    if baseline.multi_agent_v2_captured {
+        return Ok(false);
+    }
+    let document = existing.parse::<DocumentMut>()?;
+    baseline.multi_agent_v2_enabled = optional_multi_agent_v2(&document)?;
+    baseline.multi_agent_v2_captured = true;
+    Ok(true)
 }
 
 pub(crate) fn capture_project_exclusion_baseline(
@@ -375,15 +398,16 @@ pub(crate) fn upsert_orchestration_projection(
     match baseline.permission_style {
         PermissionStyle::DefaultPermissions => {
             document.remove("sandbox_mode");
-            document["default_permissions"] = value(":read-only");
+            document["default_permissions"] = value(":workspace");
         }
         PermissionStyle::SandboxMode => {
             document.remove("default_permissions");
-            document["sandbox_mode"] = value("read-only");
+            document["sandbox_mode"] = value("workspace-write");
         }
     }
     ensure_agents_table(&mut document)?;
     document["agents"]["enabled"] = value(true);
+    set_multi_agent_v2(&mut document, false)?;
     Ok(render_document(document, existing))
 }
 
@@ -419,6 +443,7 @@ pub(crate) fn remove_orchestration_projection(
         }
     }
     restore_agents_enabled(&mut document, baseline.agents_enabled)?;
+    restore_multi_agent_v2(&mut document, baseline.multi_agent_v2_enabled)?;
     Ok(render_document(document, existing))
 }
 
@@ -460,6 +485,7 @@ pub(crate) fn restore_orchestration_projection(
         .and_then(Item::as_value)
         .and_then(TomlValue::as_bool);
     restore_agents_enabled(&mut document, snapshot_agents_enabled)?;
+    restore_multi_agent_v2(&mut document, optional_multi_agent_v2(&snapshot_document)?)?;
     Ok(render_document(document, current))
 }
 
@@ -471,7 +497,7 @@ pub(crate) fn orchestration_projection_semantic(
     let Some(block) = orchestration_block(&instructions)? else {
         return Ok(None);
     };
-    let semantic = serde_json::json!({
+    let mut semantic = serde_json::json!({
         "block": block,
         "defaultPermissions": optional_string(&document, "default_permissions")?,
         "sandboxMode": optional_string(&document, "sandbox_mode")?,
@@ -482,6 +508,9 @@ pub(crate) fn orchestration_projection_semantic(
             .and_then(Item::as_value)
             .and_then(TomlValue::as_bool),
     });
+    if block.contains(ORCHESTRATION_RUNTIME_CONTRACT) {
+        semantic["multiAgentV2"] = optional_multi_agent_v2(&document)?.into();
+    }
     Ok(Some(
         serde_json::to_string(&semantic).expect("JSON value must serialize"),
     ))
@@ -492,13 +521,8 @@ pub(crate) fn upsert_global_orchestration_projection(
     instructions: &str,
 ) -> Result<String, ConfigError> {
     let unmanaged = remove_global_orchestration_projection(existing, None)?;
-    let separator = if unmanaged.is_empty() || unmanaged.ends_with("\n\n") {
-        ""
-    } else if unmanaged.ends_with('\n') {
-        "\n"
-    } else {
-        "\n\n"
-    };
+    let unmanaged = unmanaged.trim_end_matches(['\r', '\n']);
+    let separator = if unmanaged.is_empty() { "" } else { "\n\n" };
     Ok(format!(
         "{unmanaged}{separator}{GLOBAL_ORCHESTRATION_BEGIN}\n{instructions}\n{GLOBAL_ORCHESTRATION_END}\n"
     ))
@@ -508,30 +532,18 @@ pub(crate) fn remove_global_orchestration_projection(
     existing: &str,
     original: Option<&str>,
 ) -> Result<String, ConfigError> {
-    let Some((start, end)) = marked_block_range(
+    let unmanaged = remove_marked_blocks(
         existing,
         GLOBAL_ORCHESTRATION_BEGIN,
         GLOBAL_ORCHESTRATION_END,
         "AGENTS.md",
-    )?
-    else {
-        return Ok(existing.to_owned());
-    };
-    if end == existing.len()
-        && let Some(original) = original
+    )?;
+    if let Some(original) = original
+        && unmanaged.trim_end() == original.trim_end()
     {
-        let separator = if original.is_empty() || original.ends_with("\n\n") {
-            ""
-        } else if original.ends_with('\n') {
-            "\n"
-        } else {
-            "\n\n"
-        };
-        if existing[..start] == format!("{original}{separator}") {
-            return Ok(original.to_owned());
-        }
+        return Ok(original.to_owned());
     }
-    Ok(format!("{}{}", &existing[..start], &existing[end..]))
+    Ok(unmanaged)
 }
 
 pub(crate) fn global_orchestration_projection_semantic(
@@ -584,6 +596,62 @@ fn ensure_agents_table(document: &mut DocumentMut) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn optional_multi_agent_v2(document: &DocumentMut) -> Result<Option<bool>, ConfigError> {
+    document
+        .get("features")
+        .map(|item| {
+            item.as_table()
+                .ok_or(ConfigError::InvalidStructure("features"))?
+                .get("multi_agent_v2")
+                .map(|enabled| {
+                    enabled
+                        .as_value()
+                        .and_then(TomlValue::as_bool)
+                        .ok_or(ConfigError::InvalidStructure("features.multi_agent_v2"))
+                })
+                .transpose()
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn ensure_features_table(document: &mut DocumentMut) -> Result<(), ConfigError> {
+    if !document.contains_key("features") {
+        document["features"] = Item::Table(Table::new());
+    }
+    document["features"]
+        .as_table()
+        .ok_or(ConfigError::InvalidStructure("features"))?;
+    Ok(())
+}
+
+fn set_multi_agent_v2(document: &mut DocumentMut, enabled: bool) -> Result<(), ConfigError> {
+    ensure_features_table(document)?;
+    document["features"]["multi_agent_v2"] = value(enabled);
+    Ok(())
+}
+
+fn restore_multi_agent_v2(
+    document: &mut DocumentMut,
+    original: Option<bool>,
+) -> Result<(), ConfigError> {
+    match original {
+        Some(original) => set_multi_agent_v2(document, original),
+        None => {
+            if let Some(features) = document.get_mut("features") {
+                let features = features
+                    .as_table_mut()
+                    .ok_or(ConfigError::InvalidStructure("features"))?;
+                features.remove("multi_agent_v2");
+                if features.is_empty() {
+                    document.remove("features");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 fn restore_agents_enabled(
     document: &mut DocumentMut,
     original: Option<bool>,
@@ -619,10 +687,27 @@ fn orchestration_block(instructions: &str) -> Result<Option<String>, ConfigError
 }
 
 fn remove_orchestration_block(instructions: &str) -> Result<String, ConfigError> {
-    let Some(block) = orchestration_block(instructions)? else {
-        return Ok(instructions.to_owned());
-    };
-    Ok(instructions.replacen(&block, "", 1).trim_end().to_owned())
+    Ok(remove_marked_blocks(
+        instructions,
+        ORCHESTRATION_BEGIN,
+        ORCHESTRATION_END,
+        "developer_instructions",
+    )?
+    .trim_end()
+    .to_owned())
+}
+
+fn remove_marked_blocks(
+    content: &str,
+    begin: &str,
+    end: &str,
+    field: &'static str,
+) -> Result<String, ConfigError> {
+    let mut unmanaged = content.to_owned();
+    while let Some((start, block_end)) = marked_block_range(&unmanaged, begin, end, field)? {
+        unmanaged.replace_range(start..block_end, "");
+    }
+    Ok(unmanaged)
 }
 
 fn marked_block_range(
@@ -637,6 +722,9 @@ fn marked_block_range(
         }
         return Ok(None);
     };
+    if content.find(end).is_some_and(|end| end < start) {
+        return Err(ConfigError::InvalidStructure(field));
+    }
     let tail = &content[start..];
     let Some(end_offset) = tail.find(end) else {
         return Err(ConfigError::InvalidStructure(field));
@@ -649,9 +737,6 @@ fn marked_block_range(
     } else {
         block_end
     };
-    if content[block_end..].contains(begin) {
-        return Err(ConfigError::InvalidStructure(field));
-    }
     Ok(Some((start, block_end)))
 }
 
@@ -667,7 +752,16 @@ pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<Str
     if let Some(sandbox_mode) = agent.sandbox_mode {
         document["sandbox_mode"] = value(sandbox_mode);
     }
-    document["developer_instructions"] = value(agent.developer_instructions);
+    let developer_instructions = if agent.developer_instructions.trim().is_empty() {
+        DELEGATED_AGENT_INSTRUCTIONS.to_owned()
+    } else {
+        format!(
+            "{}\n\n{}",
+            agent.developer_instructions.trim_end(),
+            DELEGATED_AGENT_INSTRUCTIONS
+        )
+    };
+    document["developer_instructions"] = value(developer_instructions);
     if let Some(path) = agent.model_catalog_path {
         document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
     }
@@ -955,16 +1049,27 @@ developer_instructions = "用户规则"
 [agents]
 enabled = false
 max_threads = 6
+
+[features]
+multi_agent_v2 = true
 "#;
         let baseline = capture_orchestration_baseline(existing).unwrap();
-        let active = upsert_orchestration_projection(existing, "必须委派写入。", &baseline)
+        let instructions = format!("{ORCHESTRATION_RUNTIME_CONTRACT}\n必须委派写入。");
+        let active = upsert_orchestration_projection(existing, &instructions, &baseline)
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        assert_eq!(active["sandbox_mode"].as_str(), Some("read-only"));
+        assert_eq!(active["sandbox_mode"].as_str(), Some("workspace-write"));
         assert!(active.get("default_permissions").is_none());
         assert_eq!(active["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(active["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(active["features"]["multi_agent_v2"].as_bool(), Some(false));
+        let active_semantic = orchestration_projection_semantic(&active.to_string()).unwrap();
+        assert!(
+            active_semantic
+                .as_deref()
+                .is_some_and(|value| value.contains("\"multiAgentV2\":false"))
+        );
 
         let restored = remove_orchestration_projection(&active.to_string(), &baseline)
             .unwrap()
@@ -977,6 +1082,34 @@ max_threads = 6
         );
         assert_eq!(restored["agents"]["enabled"].as_bool(), Some(false));
         assert_eq!(restored["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn legacy_orchestration_baseline_captures_multi_agent_v2_once() {
+        let mut baseline = OrchestrationBaseline {
+            permission_style: PermissionStyle::DefaultPermissions,
+            default_permissions: Some(":workspace".to_owned()),
+            sandbox_mode: None,
+            agents_enabled: None,
+            multi_agent_v2_enabled: None,
+            multi_agent_v2_captured: false,
+            global_instructions_path: None,
+            global_instructions_existed: false,
+            global_instructions_content: None,
+        };
+
+        assert!(
+            upgrade_orchestration_baseline("[features]\nmulti_agent_v2 = true\n", &mut baseline)
+                .unwrap()
+        );
+        assert_eq!(baseline.multi_agent_v2_enabled, Some(true));
+        assert!(baseline.multi_agent_v2_captured);
+        assert!(
+            !upgrade_orchestration_baseline("[features]\nmulti_agent_v2 = false\n", &mut baseline)
+                .unwrap()
+        );
+        assert_eq!(baseline.multi_agent_v2_enabled, Some(true));
     }
 
     #[test]
@@ -997,6 +1130,45 @@ max_threads = 6
             global_orchestration_projection_semantic(&active).unwrap(),
             global_orchestration_projection_semantic(&active.replace('\n', "\r\n")).unwrap()
         );
+    }
+
+    #[test]
+    fn global_orchestration_rebuilds_duplicate_managed_blocks() {
+        let existing = format!(
+            "# 用户规则\n\n{GLOBAL_ORCHESTRATION_BEGIN}\n旧规则一\n{GLOBAL_ORCHESTRATION_END}\n\n{GLOBAL_ORCHESTRATION_BEGIN}\n旧规则二\n{GLOBAL_ORCHESTRATION_END}\n"
+        );
+
+        let active = upsert_global_orchestration_projection(&existing, "最新规则").unwrap();
+
+        assert_eq!(active.matches(GLOBAL_ORCHESTRATION_BEGIN).count(), 1);
+        assert_eq!(active.matches(GLOBAL_ORCHESTRATION_END).count(), 1);
+        assert!(active.starts_with("# 用户规则"));
+        assert!(active.contains("最新规则"));
+        assert!(!active.contains("旧规则一"));
+        assert!(!active.contains("旧规则二"));
+    }
+
+    #[test]
+    fn agent_projection_keeps_user_instructions_and_adds_execution_identity() {
+        let projection = AgentProjection {
+            agent_key: "executor",
+            description: "执行实现任务",
+            model_id: "model",
+            provider_id: "cas_provider",
+            reasoning_effort: Some("medium"),
+            sandbox_mode: Some("workspace-write"),
+            developer_instructions: "保留用户规则。",
+            model_catalog_path: None,
+        };
+
+        let rendered = render_agent_projection(&projection).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        let instructions = document["developer_instructions"].as_str().unwrap();
+
+        assert!(instructions.starts_with("保留用户规则。"));
+        assert!(instructions.contains("你是由 Primary 委派的执行 Agent，不是 Primary"));
+        assert!(instructions.contains("不得递归创建同职责子 Agent"));
+        assert!(instructions.contains("以当前代码状态和父 Agent 的明确任务为准"));
     }
 
     #[test]
