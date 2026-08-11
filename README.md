@@ -6,6 +6,7 @@
   <a href="https://img.shields.io/badge/版本-0.2.0-blue"><img src="https://img.shields.io/badge/版本-0.2.0-blue" alt="版本 0.2.0"></a>
   <a href="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6" alt="平台 Windows 10/11"></a>
   <a href="https://img.shields.io/badge/License-MIT-yellow"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License MIT"></a>
+  <a href="https://github.com/Zhuxi140/codex-agent-switch/actions"><img src="https://img.shields.io/github/actions/workflow/status/Zhuxi140/codex-agent-switch/ci.yml?label=CI" alt="CI"></a>
   <a href="https://img.shields.io/badge/Codex%20CLI-%E2%89%A5%200.144.0-green"><img src="https://img.shields.io/badge/Codex%20CLI-%E2%89%A5%200.144.0-green" alt="Codex CLI ≥ 0.144.0"></a>
 </p>
 
