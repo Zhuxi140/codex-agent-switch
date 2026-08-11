@@ -23,6 +23,9 @@ jobs:
       - name: 前端构建（tsc + vite build）
         run: npm ci && npm run build
 
+      - name: 准备 cas-helper sidecar
+        run: npm run prepare:sidecar
+
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
