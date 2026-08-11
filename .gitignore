@@ -17,3 +17,5 @@ src-tauri/binaries/
 # Internal development documentation stays local.
 *.md
 !/README.md
+!/SECURITY.md
+!/CONTRIBUTING.md

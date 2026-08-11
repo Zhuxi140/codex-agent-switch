@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 前端构建（tsc + vite build）
+        run: npm ci && npm run build
+
+      - name: Rust 单元测试
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust Release 编译
+        run: cargo build --release --manifest-path src-tauri/Cargo.toml
+
+      - name: 上传 Release 可执行文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-agent-switch-release-exe
+          path: src-tauri/target/release/codex-agent-switch.exe
+          if-no-files-found: error

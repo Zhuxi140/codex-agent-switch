@@ -22,6 +22,8 @@
 
 一个 Tauri 2 桌面工具：在 GUI 中管理 Codex 多 Agent 的 Provider / Model / 绑定、编排、调度与 Token 监控——**不手改 Codex 配置**。
 
+> **Codex Agent Switch (CAS)** is a Tauri desktop app for the Codex CLI ecosystem. It manages Provider / Model / Agent bindings, orchestrates sub-agents by role, and monitors token usage through the official `codex app-server` interface — no hand-edited TOML. The philosophy: a flagship model plans and reviews, budget models execute and test, for a better outcome at a better price.
+
 <div style="border: 2px solid #d93025; border-left: 6px solid #d93025; background: #fdf0ef; border-radius: 8px; padding: 12px 16px; margin: 16px 0 24px;">
 
 <strong>⚠️ 当前并不推荐安装使用。</strong><br><br>
@@ -134,10 +136,11 @@ Codex 支持多 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但�
 | **配置应用** | Preview → Apply 两段式；Apply 后回读校验；失败自动回滚；冲突检测；Snapshot 列表 / 详情 / 恢复 |
 | **诊断服务** | 只读检查 Codex 环境、配置可读可写性、Agent 就绪度 |
 
-### 多 Agent 编排（阶段一~三，已发布）
+### 多 Agent 编排（阶段一~四，已发布）
 
 - **运行模式**：Default（Codex 全权）↔ 编排化 Subagent（按 Role 启用多个 CAS 管理子 Agent）；切换自动建 Snapshot、失败回滚；项目排除
 - **Strict Stop 编排**：Primary 只读，Discovery → Execution → Verification → Review 分阶段职责；Executor 缺失或委派失败即停止并报告，严禁静默兜底
+- **Primary Fallback**：设置页可选失败策略；子 Agent 委派失败后 Primary 先显式警告用户，再接管同一任务，结果须记录回退原因；附运行时权限覆盖检测与配套 Diagnostics
 
 ### 用量与调度（0.2.0，已发布）
 
@@ -231,14 +234,14 @@ Codex 支持多 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但�
 
 | 版本 | 编排 | Token 监控 | 调度 / 缓存 |
 |---|---|---|---|
-| **0.2.0（当前）** | 阶段一~三（Strict Stop）✅ | Phase 0~2（POC → 可靠采集 → UI）✅ | 数据模型 + Reuse/Spawn 决策 + 托管执行 ✅ |
-| **P1** | 阶段四（Primary Fallback） | — | 运行时评分、缓存时间实验、AUTO/HOT/COLD 策略深化 |
+| **0.2.0（当前）** | 阶段一~四（Strict Stop + Primary Fallback）✅ | Phase 0~2（POC → 可靠采集 → UI）✅ | 数据模型 + Reuse/Spawn 决策 + 托管执行 ✅ |
+| **P1** | 回退记录数据层、真实 Codex E2E 实跑 | — | 运行时评分、缓存时间实验、AUTO/HOT/COLD 策略深化 |
 | **P2** | 编排深度演进 | — | Cost-aware Scheduling、Thread Pool、自动退休/重建 |
 
 ### 编排（路线一）
 
-- 阶段一~三已完成：Agent 角色元数据（`role_key` + `orchestration_phase`）、多 Agent 绑定与运行模式、Strict Stop 自动编排
-- **剩余（阶段四，P1）**：Primary Fallback 设置与风险提示、回退记录、权限恢复与配套 Diagnostics、真实 Codex E2E（自动创建、等待、结果收束、失败关闭全链路）
+- 阶段一~四已完成：Agent 角色元数据（`role_key` + `orchestration_phase`）、多 Agent 绑定与运行模式、Strict Stop 自动编排、Primary Fallback（失败策略设置与风险提示、权限恢复与配套 Diagnostics；真实 Codex E2E 测试框架已内置，`runtime_bridge.rs` 中按环境变量启用）
+- **剩余（P1）**：系统级回退记录（当前仅指令约束要求模型记录回退原因，尚无独立数据表）、真实 Codex E2E 实跑（自动创建、等待、结果收束、失败关闭全链路）
 - 编排规则基线：`Default` 保留原生行为；`Orchestrated` 同一 Role Key 只启用一个 Agent；Phase 使用四个稳定枚举；Role Key 可扩展；Primary 负责规划/调度/审查/收束，执行 Agent 负责写入
 
 ### Token 使用监控（路线二）
