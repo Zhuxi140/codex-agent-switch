@@ -9,15 +9,58 @@
 
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
+> [!WARNING]
+> **v0.3.0 当前仍不推荐作为稳定生产工具安装使用。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+
 ## v0.3.0 快速开始
 
-1. 从 GitHub Release 下载 `Codex Agent Switch_0.3.0_x64-setup.exe` 并运行安装。
+1. 从 GitHub Release 下载 `Codex.Agent.Switch_0.3.0_x64-setup.exe` 并运行安装。
 2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
 3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
 4. 在 Models 与 Agents 页面绑定模型，并在运行模式中启用编排配置；Preview 后 Apply。
 5. 在用量页面同步原生子 Agent Thread，查看状态和 Token 统计。
 
 安装包当前未进行代码签名；Windows SmartScreen 可能显示警告，请按组织安全策略核验 Release 的 SHA-256。
+
+## 测试状态与客观数据
+
+以下结果对应 v0.3.0 发布前的实际验证，可用仓库中的验证命令复查。
+
+### v0.3.0 发布验证
+
+| 验证项 | 命令 | 真实结果 |
+| --- | --- | --- |
+| Rust 格式 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 通过 |
+| Rust 单测 | `cargo test --manifest-path src-tauri/Cargo.toml` | 105 passed、0 failed、1 ignored |
+| 前端构建 | `npm.cmd run build` | 通过 |
+| Diff 检查 | `git diff --check` | 通过 |
+| NSIS 打包 | `npm.cmd run bundle:windows` | 通过 |
+
+其中 1 个 ignored 测试是依赖外部配置的真实 E2E，不应视为已通过。
+
+### 真实 E2E 覆盖
+
+| 链路 | 状态 | 覆盖边界 |
+| --- | --- | --- |
+| Codex Native `gpt-5.6-terra` 子 Agent | 已人工验证 | 已完成 SPAWN → 执行 → 结果返回，并写入目标文件 |
+| DeepSeek Responses 子 Agent | 已有成功实测 | 仅说明该实测配置可运行，不外推至其他 Provider 或模型 |
+| 外部配置 E2E 自动化 | 未纳入默认测试 | 仍依赖实际 Provider、模型与工具协议配置 |
+| 阿里及其他 Provider | 待测试 | 不声明已通过 |
+
+### 效率对比（待持续实测）
+
+CAS 只统计 Token，不统计费用。下表仅列出可客观采集的指标；当前尚未形成可比较的完整样本，因此不虚构数字，也不宣称 CAS 更省 Token 或更快。
+
+| 指标 | 不用 CAS | 使用 CAS |
+| --- | --- | --- |
+| 任务总 Token | 待测试 | 待测试 |
+| Primary / 子 Agent Token 分布 | 待测试 | 待测试 |
+| 缓存输入 Token | 待测试 | 待测试 |
+| 任务耗时 | 待测试 | 待测试 |
+| SPAWN / REUSE 次数或命中率 | 待测试 | 待测试 |
+| 任务成功率 / 人工接管次数 | 待测试 | 待测试 |
+
+基准方法：使用同一版本、同一任务集、相同权限和验收标准，对各方案进行多轮运行；先公布每轮原始 Token、耗时与成功结果，再计算汇总指标。在样本足够前，不以任何费用、性能或效率结论进行宣传。
 
 ## 多 Agent 编排
 
