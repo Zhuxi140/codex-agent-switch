@@ -1,12 +1,12 @@
 [package]
 name = "codex-agent-switch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Codex multi-agent model binding manager"
 authors = ["Codex Agent Switch contributors"]
 edition = "2024"
 
 [workspace]
-members = ["cas-helper", "crates/cas-secret-store"]
+members = ["cas-helper", "crates/cas-scheduler", "crates/cas-secret-store"]
 resolver = "3"
 
 [lib]
@@ -17,6 +17,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+cas-scheduler = { path = "crates/cas-scheduler" }
 cas-secret-store = { path = "crates/cas-secret-store" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }

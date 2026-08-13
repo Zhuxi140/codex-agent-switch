@@ -63,7 +63,7 @@ pub(crate) struct AgentProjection<'a> {
     pub(crate) agent_key: &'a str,
     pub(crate) description: &'a str,
     pub(crate) model_id: &'a str,
-    pub(crate) provider_id: &'a str,
+    pub(crate) provider_id: Option<&'a str>,
     pub(crate) reasoning_effort: Option<&'a str>,
     pub(crate) sandbox_mode: Option<&'a str>,
     pub(crate) developer_instructions: &'a str,
@@ -745,7 +745,9 @@ pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<Str
     document["name"] = value(agent.agent_key);
     document["description"] = value(agent.description);
     document["model"] = value(agent.model_id);
-    document["model_provider"] = value(agent.provider_id);
+    if let Some(provider_id) = agent.provider_id {
+        document["model_provider"] = value(provider_id);
+    }
     if let Some(reasoning_effort) = agent.reasoning_effort {
         document["model_reasoning_effort"] = value(reasoning_effort);
     }
@@ -1154,7 +1156,7 @@ multi_agent_v2 = true
             agent_key: "executor",
             description: "执行实现任务",
             model_id: "model",
-            provider_id: "cas_provider",
+            provider_id: Some("cas_provider"),
             reasoning_effort: Some("medium"),
             sandbox_mode: Some("workspace-write"),
             developer_instructions: "保留用户规则。",
@@ -1169,6 +1171,26 @@ multi_agent_v2 = true
         assert!(instructions.contains("你是由 Primary 委派的执行 Agent，不是 Primary"));
         assert!(instructions.contains("不得递归创建同职责子 Agent"));
         assert!(instructions.contains("以当前代码状态和父 Agent 的明确任务为准"));
+    }
+
+    #[test]
+    fn native_agent_projection_omits_custom_provider() {
+        let projection = AgentProjection {
+            agent_key: "executor",
+            description: "执行实现任务",
+            model_id: "gpt-5.6-luna",
+            provider_id: None,
+            reasoning_effort: Some("high"),
+            sandbox_mode: Some("workspace-write"),
+            developer_instructions: "执行任务。",
+            model_catalog_path: None,
+        };
+
+        let rendered = render_agent_projection(&projection).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(document["model"].as_str(), Some("gpt-5.6-luna"));
+        assert!(document.get("model_provider").is_none());
     }
 
     #[test]

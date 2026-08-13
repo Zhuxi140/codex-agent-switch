@@ -6,7 +6,8 @@ use std::str::FromStr;
 use std::sync::Mutex;
 
 use cas_secret_store::{
-    CredentialId, SecretStoreError, SecretValue, delete as delete_secret, store as store_secret,
+    CredentialId, SecretStoreError, SecretValue, delete as delete_secret, exists as secret_exists,
+    store as store_secret,
 };
 use rusqlite::{Connection, ErrorCode, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -79,7 +80,7 @@ impl ProviderService {
     }
 
     pub(crate) fn delete(&self, request: ProviderDeleteRequest) -> Result<DeleteResult, ApiError> {
-        self.delete_with_secret_store(request, delete_secret)
+        self.delete_with_secret_store(request, delete_secret, secret_exists)
             .map_err(ApiError::from)
     }
 
@@ -94,13 +95,18 @@ impl ProviderService {
         Delete: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
     {
         let pending = PendingProvider::try_from(request)?;
-        let credential_id_text = Uuid::new_v4().to_string();
-        let credential_id = CredentialId::from_str(&credential_id_text)
-            .map_err(|_| ProviderServiceError::Unexpected)?;
-        let secret = SecretValue::from_string(pending.secret)
-            .map_err(|_| ProviderServiceError::InvalidField("auth.secret"))?;
-
-        store(credential_id, &secret).map_err(ProviderServiceError::SecretStore)?;
+        let credential = pending
+            .secret
+            .map(|secret| {
+                let id_text = Uuid::new_v4().to_string();
+                let id = CredentialId::from_str(&id_text)
+                    .map_err(|_| ProviderServiceError::Unexpected)?;
+                let secret = SecretValue::from_string(secret)
+                    .map_err(|_| ProviderServiceError::InvalidField("auth.secret"))?;
+                store(id, &secret).map_err(ProviderServiceError::SecretStore)?;
+                Ok::<_, ProviderServiceError>((id, id_text))
+            })
+            .transpose()?;
 
         let aggregate = NewProviderAggregate {
             id: Uuid::new_v4().to_string(),
@@ -111,7 +117,7 @@ impl ProviderService {
             enabled: pending.enabled,
             source: pending.source,
             preset_id: pending.preset_id,
-            credential_id: credential_id_text,
+            credential_id: credential.as_ref().map(|(_, id)| id.clone()),
             initial_models: pending.initial_models,
         };
 
@@ -122,20 +128,27 @@ impl ProviderService {
         });
         match result {
             Ok(provider) => Ok(provider),
-            Err(error) => match delete(credential_id) {
-                Ok(true) => Err(error),
-                Ok(false) | Err(_) => Err(ProviderServiceError::OrphanSecret(credential_id)),
-            },
+            Err(error) => {
+                let Some((credential_id, _)) = credential else {
+                    return Err(error);
+                };
+                match delete(credential_id) {
+                    Ok(true) => Err(error),
+                    Ok(false) | Err(_) => Err(ProviderServiceError::OrphanSecret(credential_id)),
+                }
+            }
         }
     }
 
-    fn delete_with_secret_store<Delete>(
+    fn delete_with_secret_store<Delete, Exists>(
         &self,
         request: ProviderDeleteRequest,
         delete: Delete,
+        exists: Exists,
     ) -> Result<DeleteResult, ProviderServiceError>
     where
         Delete: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
+        Exists: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
     {
         let id = parse_uuid(&request.provider_id, "providerId")?;
         let credential_id = self.repository()?.prepare_delete(&id)?;
@@ -143,6 +156,9 @@ impl ProviderService {
             let credential_id = CredentialId::from_str(&credential_id)
                 .map_err(|_| ProviderServiceError::Unexpected)?;
             delete(credential_id).map_err(ProviderServiceError::SecretStore)?;
+            if exists(credential_id).map_err(ProviderServiceError::SecretStore)? {
+                return Err(ProviderServiceError::CredentialCleanupFailed(credential_id));
+            }
         }
         self.repository()?.delete(&id)?;
         Ok(DeleteResult { deleted: true })
@@ -216,15 +232,15 @@ impl SqliteProviderRepository {
             )
             .map_err(RepositoryError::from)?;
 
-        transaction
-            .execute(
+        if let Some(credential_id) = &provider.credential_id {
+            transaction.execute(
                 "INSERT INTO credentials (
                     id, provider_id, credential_key, secret_type, storage_backend, storage_key,
                     created_at, updated_at
                  ) VALUES (?1, ?2, 'primary', 'BEARER_TOKEN', 'WINDOWS_CREDENTIAL_MANAGER', ?1, ?3, ?3)",
-                params![provider.credential_id, provider.id, timestamp],
-            )
-            .map_err(RepositoryError::from)?;
+                params![credential_id, provider.id, timestamp],
+            )?;
+        }
 
         for model in &provider.initial_models {
             insert_preset_model(&transaction, &provider.id, model, &timestamp)
@@ -380,6 +396,7 @@ impl SqliteProviderRepository {
 }
 
 fn map_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
+    let preset_id = row.get::<_, Option<String>>(8)?;
     Ok(ProviderRecord {
         id: row.get(0)?,
         provider_key: row.get(1)?,
@@ -389,7 +406,8 @@ fn map_provider(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProviderRecord> {
         protocol: row.get(5)?,
         enabled: row.get::<_, i64>(6)? != 0,
         source: row.get(7)?,
-        preset_id: row.get(8)?,
+        native_auth: preset_id.as_deref() == Some("codex-native"),
+        preset_id,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         credential_configured: row.get::<_, Option<String>>(11)?.is_some(),
@@ -410,7 +428,7 @@ struct PendingProvider {
     enabled: bool,
     source: &'static str,
     preset_id: Option<String>,
-    secret: String,
+    secret: Option<String>,
     initial_models: Vec<NewPresetModel>,
 }
 
@@ -434,13 +452,15 @@ impl TryFrom<ProviderCreateRequest> for PendingProvider {
             }
             None => Vec::new(),
         };
+        let native = request.preset_id.as_deref() == Some("codex-native");
         let secret = match request.auth {
-            ProviderAuthInput::OsSecretHelper { secret } => secret,
+            ProviderAuthInput::OsSecretHelper { secret } if !native => Some(secret),
             ProviderAuthInput::ExternalEnv { env_key } => {
                 let _ = env_key;
                 return Err(ProviderServiceError::UnsupportedAuthStrategy);
             }
-            ProviderAuthInput::None => return Err(ProviderServiceError::UnsupportedAuthStrategy),
+            ProviderAuthInput::None if native => None,
+            _ => return Err(ProviderServiceError::UnsupportedAuthStrategy),
         };
         let is_preset = request.preset_id.is_some();
 
@@ -614,7 +634,7 @@ struct NewProviderAggregate {
     enabled: bool,
     source: &'static str,
     preset_id: Option<String>,
-    credential_id: String,
+    credential_id: Option<String>,
     initial_models: Vec<NewPresetModel>,
 }
 
@@ -631,6 +651,7 @@ struct ProviderRecord {
     created_at: String,
     updated_at: String,
     credential_configured: bool,
+    native_auth: bool,
     model_count: u32,
     cache_support: String,
     cache_retention_type: String,
@@ -785,7 +806,11 @@ impl From<ProviderRecord> for ProviderSummary {
             protocol: provider.protocol,
             enabled: provider.enabled,
             status,
-            credential_status: CredentialStatus::from(provider.credential_configured),
+            credential_status: if provider.native_auth {
+                CredentialStatus::CodexSession
+            } else {
+                CredentialStatus::from(provider.credential_configured)
+            },
             model_count: provider.model_count,
             cache_support: provider.cache_support,
         }
@@ -825,6 +850,7 @@ pub(crate) struct ProviderDetailResponse {
 
 impl From<ProviderRecord> for ProviderDetailResponse {
     fn from(provider: ProviderRecord) -> Self {
+        let native_auth = provider.native_auth;
         Self {
             id: provider.id,
             provider_key: provider.provider_key,
@@ -832,11 +858,19 @@ impl From<ProviderRecord> for ProviderDetailResponse {
             provider_type: provider.provider_type,
             base_url: provider.base_url,
             protocol: provider.protocol,
-            auth_strategy: AuthStrategy::OsSecretHelper,
+            auth_strategy: if native_auth {
+                AuthStrategy::CodexSession
+            } else {
+                AuthStrategy::OsSecretHelper
+            },
             enabled: provider.enabled,
             source: provider.source,
             preset_id: provider.preset_id,
-            credential_status: CredentialStatus::from(provider.credential_configured),
+            credential_status: if native_auth {
+                CredentialStatus::CodexSession
+            } else {
+                CredentialStatus::from(provider.credential_configured)
+            },
             model_count: provider.model_count,
             last_check: None,
             cache_profile: ProviderCacheProfileResponse {
@@ -856,6 +890,7 @@ impl From<ProviderRecord> for ProviderDetailResponse {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum AuthStrategy {
     OsSecretHelper,
+    CodexSession,
 }
 
 #[derive(Serialize)]
@@ -863,6 +898,7 @@ enum AuthStrategy {
 enum CredentialStatus {
     Configured,
     Missing,
+    CodexSession,
 }
 
 impl From<bool> for CredentialStatus {
@@ -924,7 +960,18 @@ impl From<ProviderServiceError> for ApiError {
         let (code, message, retryable) = match error {
             ProviderServiceError::InvalidField(field) => {
                 details = Some(BTreeMap::from([("field", field.to_owned())]));
-                ("VALIDATION_ERROR", "Provider 字段无效。", false)
+                let message = match field {
+                    "providerKey" => {
+                        "Provider Key 必须以小写字母或数字开头，且只能包含小写字母、数字、-、_。"
+                    }
+                    "name" => "Provider Name 不能为空，且最多 120 个字符。",
+                    "baseUrl" => {
+                        "Base URL 必须是有效地址；远程地址使用 HTTPS，本机回环地址可使用 HTTP。"
+                    }
+                    "auth.secret" => "API Key 不能为空，也不能包含换行。",
+                    _ => "Provider 字段无效。",
+                };
+                ("VALIDATION_ERROR", message, false)
             }
             ProviderServiceError::UnsupportedAuthStrategy => (
                 "PROVIDER_AUTH_STRATEGY_UNSUPPORTED",
@@ -978,6 +1025,14 @@ impl From<ProviderServiceError> for ApiError {
                     false,
                 )
             }
+            ProviderServiceError::CredentialCleanupFailed(id) => {
+                details = Some(BTreeMap::from([("credentialId", id.to_string())]));
+                (
+                    "CREDENTIAL_CLEANUP_FAILED",
+                    "Windows Credential 删除后仍然存在，Provider 未删除；请重试或手动清理该 Credential。",
+                    true,
+                )
+            }
             ProviderServiceError::DatabaseUnavailable
             | ProviderServiceError::Repository(RepositoryError::Persistence(
                 PersistenceError::Unavailable,
@@ -1003,6 +1058,7 @@ pub(crate) enum ProviderServiceError {
     OriginConfirmationRequired,
     SecretStore(SecretStoreError),
     OrphanSecret(CredentialId),
+    CredentialCleanupFailed(CredentialId),
     Repository(RepositoryError),
     DatabaseUnavailable,
     Unexpected,
@@ -1018,6 +1074,9 @@ impl fmt::Display for ProviderServiceError {
             }
             Self::SecretStore(_) => formatter.write_str("secret store operation failed"),
             Self::OrphanSecret(_) => formatter.write_str("orphan secret cleanup required"),
+            Self::CredentialCleanupFailed(_) => {
+                formatter.write_str("credential cleanup verification failed")
+            }
             Self::Repository(error) => write!(formatter, "provider repository failed: {error}"),
             Self::DatabaseUnavailable => formatter.write_str("database unavailable"),
             Self::Unexpected => formatter.write_str("unexpected provider operation failure"),
@@ -1156,6 +1215,31 @@ mod tests {
     }
 
     #[test]
+    fn provider_key_rejects_spaces_with_field_detail() {
+        let service = ProviderService::in_memory();
+        let result = service.create_with_secret_store(
+            request("deep seek"),
+            |_, _| panic!("invalid provider must not store a secret"),
+            |_| panic!("invalid provider must not delete a secret"),
+        );
+        let error = match result {
+            Ok(_) => panic!("provider key with spaces must fail"),
+            Err(error) => error,
+        };
+        let api_error = ApiError::from(error);
+
+        assert_eq!(api_error.code(), "VALIDATION_ERROR");
+        assert_eq!(
+            api_error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("field"))
+                .map(String::as_str),
+            Some("providerKey")
+        );
+    }
+
+    #[test]
     fn secret_store_failure_does_not_create_database_rows() {
         let service = ProviderService::in_memory();
         let result = service.create_with_secret_store(
@@ -1219,6 +1303,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn codex_native_preset_uses_login_session_without_secret() {
+        let service = ProviderService::in_memory();
+        let mut preset = request("codex-native");
+        preset.name = "Codex Native (ChatGPT)".to_owned();
+        preset.preset_id = Some("codex-native".to_owned());
+        preset.base_url = "https://api.openai.com/v1/".to_owned();
+        preset.auth = ProviderAuthInput::None;
+
+        let provider = service
+            .create_with_secret_store(
+                preset,
+                |_, _| panic!("native preset must not store a secret"),
+                |_| panic!("native preset must not delete a secret"),
+            )
+            .unwrap();
+
+        assert!(provider.native_auth);
+        assert!(!provider.credential_configured);
+        assert_eq!(provider.model_count, 3);
+        let detail = service
+            .get(ProviderGetRequest {
+                provider_id: provider.id,
+            })
+            .unwrap();
+        assert!(matches!(detail.auth_strategy, AuthStrategy::CodexSession));
+        assert!(matches!(
+            detail.credential_status,
+            CredentialStatus::CodexSession
+        ));
     }
 
     #[test]
@@ -1291,6 +1407,7 @@ mod tests {
                 deleted.set(true);
                 Ok(true)
             },
+            |_| Ok(false),
         );
         assert!(result.is_ok());
         assert!(deleted.get());
@@ -1309,10 +1426,39 @@ mod tests {
                 provider_id: provider.id,
             },
             |_| panic!("in-use provider must not delete its secret"),
+            |_| panic!("in-use provider must not verify its secret"),
         );
         assert!(matches!(
             result,
             Err(ProviderServiceError::Repository(RepositoryError::InUse))
         ));
+    }
+
+    #[test]
+    fn provider_delete_keeps_database_row_when_credential_cleanup_is_unverified() {
+        let service = ProviderService::in_memory();
+        let provider = service
+            .create_with_secret_store(request("provider-one"), |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+
+        let result = service.delete_with_secret_store(
+            ProviderDeleteRequest {
+                provider_id: provider.id.clone(),
+            },
+            |_| Ok(true),
+            |_| Ok(true),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ProviderServiceError::CredentialCleanupFailed(_))
+        ));
+        assert!(
+            service
+                .repository()
+                .unwrap()
+                .find_by_id(&provider.id)
+                .is_ok()
+        );
     }
 }

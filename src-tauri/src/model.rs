@@ -24,6 +24,7 @@ use crate::provider::ApiError;
 
 const DEEPSEEK_V4_FLASH: &str =
     include_str!("../resources/model-definitions/deepseek-v4-flash.json");
+const CODEX_NATIVE_MODELS: &str = include_str!("../resources/model-definitions/codex-native.json");
 
 pub(crate) struct ModelService {
     repository: Mutex<SqliteModelRepository>,
@@ -107,6 +108,9 @@ impl ModelService {
     ) -> Result<ModelConnectionTestResponse, ApiError> {
         let id = parse_uuid(&request.model_id, "modelId")?;
         let target = self.repository()?.probe_target(&id)?;
+        if target.native {
+            return Err(ModelServiceError::NativeModelProbeNotRequired.into());
+        }
         let result = match target.credential_id.as_deref() {
             None => ModelConnectionTestResponse::credential_missing(),
             Some(credential_id) => {
@@ -299,7 +303,7 @@ impl SqliteModelRepository {
     fn probe_target(&self, id: &str) -> Result<ModelProbeTarget, ModelRepositoryError> {
         self.connection
             .query_row(
-                "SELECT m.model_id, p.base_url, c.id
+                "SELECT m.model_id, p.base_url, c.id, p.preset_id = 'codex-native'
                  FROM models m
                  JOIN providers p ON p.id = m.provider_id
                  LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
@@ -310,6 +314,7 @@ impl SqliteModelRepository {
                         model_id: row.get(0)?,
                         base_url: row.get(1)?,
                         credential_id: row.get(2)?,
+                        native: row.get(3)?,
                     })
                 },
             )
@@ -476,7 +481,8 @@ fn model_select() -> &'static str {
             m.lifecycle, m.compatibility_level, m.context_window, m.max_output_tokens,
             m.reasoning_supported, m.default_reasoning, m.compatibility_source,
             m.minimum_codex_version, m.compatibility_verified_at, m.created_at, m.updated_at,
-            m.last_test_status, m.last_tested_at, m.last_test_latency_ms, m.source
+            m.last_test_status, m.last_tested_at, m.last_test_latency_ms, m.source,
+            p.provider_key, p.preset_id
      FROM models m
      JOIN providers p ON p.id = m.provider_id"
 }
@@ -504,6 +510,8 @@ fn map_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRecord> {
         last_tested_at: row.get(18)?,
         last_test_latency_ms: row.get(19)?,
         source: row.get(20)?,
+        provider_key: row.get(21)?,
+        provider_preset_id: row.get(22)?,
         reasoning_efforts: Vec::new(),
         capabilities: Vec::new(),
     })
@@ -513,6 +521,7 @@ struct ModelProbeTarget {
     model_id: String,
     base_url: String,
     credential_id: Option<String>,
+    native: bool,
 }
 
 fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnectionTestResponse {
@@ -564,11 +573,16 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         return classify_probe_response(status, &body, latency_ms, request_id);
     }
     if parse_responses_body(&body).is_none() {
-        return ModelConnectionTestResponse::protocol_error_with_message(
-            latency_ms,
-            request_id,
-            "Endpoint 基础请求未返回有效的 Responses API 响应。",
-        );
+        let classified = classify_probe_response(status, &body, latency_ms, request_id.clone());
+        return if classified.status == ModelConnectionTestStatus::ModelNotFound {
+            classified
+        } else {
+            ModelConnectionTestResponse::protocol_error_with_message(
+                latency_ms,
+                request_id,
+                "Endpoint 基础请求未返回有效的 Responses API 响应。",
+            )
+        };
     }
 
     let probe_tool = serde_json::json!({
@@ -789,12 +803,8 @@ fn classify_probe_response(
     latency_ms: Option<u64>,
     provider_request_id: Option<String>,
 ) -> ModelConnectionTestResponse {
-    if status.is_success() {
-        return if parse_responses_body(body).is_some() {
-            ModelConnectionTestResponse::success(latency_ms, provider_request_id)
-        } else {
-            ModelConnectionTestResponse::protocol_error(latency_ms, provider_request_id)
-        };
+    if status.is_success() && parse_responses_body(body).is_some() {
+        return ModelConnectionTestResponse::success(latency_ms, provider_request_id);
     }
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return ModelConnectionTestResponse::auth_failed(latency_ms, provider_request_id);
@@ -827,7 +837,9 @@ fn classify_probe_response(
                 || (message.contains("model")
                     && (message.contains("not found")
                         || message.contains("does not exist")
-                        || message.contains("unknown")))
+                        || message.contains("not exist")
+                        || message.contains("unknown")
+                        || message.contains("invalid model")))
         });
     if model_missing {
         ModelConnectionTestResponse::model_not_found(latency_ms, provider_request_id)
@@ -843,15 +855,21 @@ fn elapsed_ms(started: Instant) -> u64 {
 pub(crate) fn initial_models_for_preset(
     preset_id: &str,
 ) -> Result<Vec<NewPresetModel>, CatalogError> {
-    if preset_id != "deepseek" {
-        return Err(CatalogError::UnknownPreset);
-    }
-    let definition: BuiltInModelDefinition =
-        serde_json::from_str(DEEPSEEK_V4_FLASH).map_err(|_| CatalogError::InvalidResource)?;
-    if definition.schema_version != 1 || definition.provider_preset_id != preset_id {
+    let definitions = match preset_id {
+        "deepseek" => vec![
+            serde_json::from_str::<BuiltInModelDefinition>(DEEPSEEK_V4_FLASH)
+                .map_err(|_| CatalogError::InvalidResource)?,
+        ],
+        "codex-native" => serde_json::from_str::<Vec<BuiltInModelDefinition>>(CODEX_NATIVE_MODELS)
+            .map_err(|_| CatalogError::InvalidResource)?,
+        _ => return Err(CatalogError::UnknownPreset),
+    };
+    if definitions.iter().any(|definition| {
+        definition.schema_version != 1 || definition.provider_preset_id != preset_id
+    }) {
         return Err(CatalogError::InvalidResource);
     }
-    Ok(vec![definition.into()])
+    Ok(definitions.into_iter().map(NewPresetModel::from).collect())
 }
 
 pub(crate) fn insert_preset_model(
@@ -1013,6 +1031,8 @@ struct ModelRecord {
     id: String,
     provider_id: String,
     provider_name: String,
+    provider_key: String,
+    provider_preset_id: Option<String>,
     model_id: String,
     display_name: String,
     enabled: bool,
@@ -1148,7 +1168,7 @@ impl ModelConnectionTestResponse {
             ModelConnectionTestStatus::ModelNotFound,
             latency_ms,
             provider_request_id,
-            "Provider 不识别当前 Model ID。",
+            "Provider 不识别当前 Model ID；请检查拼写，并确认该 Provider 已开放此模型。",
             None,
             None,
         )
@@ -1326,6 +1346,8 @@ pub(crate) struct ModelSummary {
     id: String,
     provider_id: String,
     provider_name: String,
+    provider_key: String,
+    provider_preset_id: Option<String>,
     model_id: String,
     display_name: String,
     enabled: bool,
@@ -1352,6 +1374,8 @@ impl From<ModelRecord> for ModelSummary {
             id: model.id,
             provider_id: model.provider_id,
             provider_name: model.provider_name,
+            provider_key: model.provider_key,
+            provider_preset_id: model.provider_preset_id,
             model_id: model.model_id,
             display_name: model.display_name,
             enabled: model.enabled,
@@ -1399,6 +1423,8 @@ impl From<ModelRecord> for ModelDetailResponse {
             provider: ModelProviderResponse {
                 id: model.provider_id,
                 name: model.provider_name,
+                provider_key: model.provider_key,
+                preset_id: model.provider_preset_id,
             },
             model_id: model.model_id,
             display_name: model.display_name,
@@ -1429,9 +1455,12 @@ impl From<ModelRecord> for ModelDetailResponse {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ModelProviderResponse {
     id: String,
     name: String,
+    provider_key: String,
+    preset_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1559,6 +1588,7 @@ pub(crate) enum ModelServiceError {
     InvalidCredentialReference,
     SecretStore(SecretStoreError),
     ProbeTaskFailed,
+    NativeModelProbeNotRequired,
     Repository(ModelRepositoryError),
     DatabaseUnavailable,
 }
@@ -1570,6 +1600,9 @@ impl fmt::Display for ModelServiceError {
             Self::InvalidCredentialReference => formatter.write_str("invalid credential reference"),
             Self::SecretStore(_) => formatter.write_str("secret store operation failed"),
             Self::ProbeTaskFailed => formatter.write_str("model probe task failed"),
+            Self::NativeModelProbeNotRequired => {
+                formatter.write_str("native Codex model does not use a provider probe")
+            }
             Self::Repository(error) => write!(formatter, "model repository failed: {error}"),
             Self::DatabaseUnavailable => formatter.write_str("database unavailable"),
         }
@@ -1650,7 +1683,14 @@ impl From<ModelServiceError> for ApiError {
         let (code, message, retryable) = match error {
             ModelServiceError::InvalidField(field) => {
                 details = Some(BTreeMap::from([("field", field.to_owned())]));
-                ("VALIDATION_ERROR", "Model 字段无效。", false)
+                let message = match field {
+                    "modelId" => "Model ID 不能为空，首尾不能有空格，且不能包含换行。",
+                    "displayName" => "Display Name 不能为空，且最多 160 个字符。",
+                    "contextWindow" => "Context Window 必须是正整数。",
+                    "providerId" => "请选择有效的 Provider。",
+                    _ => "Model 字段无效。",
+                };
+                ("VALIDATION_ERROR", message, false)
             }
             ModelServiceError::SecretStore(SecretStoreError::AccessDenied) => {
                 ("SECRET_STORE_ACCESS_DENIED", "系统凭据库拒绝访问。", false)
@@ -1667,6 +1707,11 @@ impl From<ModelServiceError> for ApiError {
             ModelServiceError::ProbeTaskFailed => {
                 ("MODEL_TEST_FAILED", "Model 测试任务异常终止。", true)
             }
+            ModelServiceError::NativeModelProbeNotRequired => (
+                "NATIVE_MODEL_TEST_NOT_REQUIRED",
+                "Codex 原生模型复用当前 ChatGPT 登录会话，无需 Provider Responses API 测试；实际可用模型由当前 Codex 账号决定。",
+                false,
+            ),
             ModelServiceError::Repository(ModelRepositoryError::NotFound) => {
                 ("MODEL_NOT_FOUND", "Model 不存在。", false)
             }
@@ -1741,6 +1786,21 @@ mod tests {
             initial_models_for_preset("unknown"),
             Err(CatalogError::UnknownPreset)
         ));
+
+        let native_models = initial_models_for_preset("codex-native").unwrap();
+        assert_eq!(native_models.len(), 3);
+        assert_eq!(
+            native_models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna"]
+        );
+        assert!(
+            native_models
+                .iter()
+                .all(|model| model.compatibility_level == "NATIVE")
+        );
     }
 
     #[test]
@@ -2091,6 +2151,18 @@ mod tests {
             None,
         );
         assert_eq!(missing.status, ModelConnectionTestStatus::ModelNotFound);
+        assert!(missing.message.contains("Model ID"));
+
+        let successful_error_envelope = classify_probe_response(
+            StatusCode::OK,
+            br#"{"error":{"type":"invalid_request_error","message":"Model Not Exist"}}"#,
+            Some(12),
+            None,
+        );
+        assert_eq!(
+            successful_error_envelope.status,
+            ModelConnectionTestStatus::ModelNotFound
+        );
 
         let auth = classify_probe_response(StatusCode::UNAUTHORIZED, b"{}", Some(12), None);
         assert_eq!(auth.status, ModelConnectionTestStatus::AuthFailed);

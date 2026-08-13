@@ -11,7 +11,6 @@ import {
   deleteModel,
   deleteProvider,
   deleteProjectExclusion,
-  executeAgentThread,
   getAgent,
   getAppBootstrap,
   getCodexEnvironment,
@@ -32,6 +31,7 @@ import {
   recommendAgentThreadInstance,
   redetectCodex,
   restoreSnapshot,
+  resolveRuntimeModeConflict,
   runDiagnostics,
   setModelEnabled,
   startUsageMonitor,
@@ -50,13 +50,14 @@ import {
   type AgentSummary,
   type AgentThreadInstanceResponse,
   type AgentThreadInstanceRecommendation,
-  type AgentThreadExecutionResponse,
   type AgentThreadInstanceStatus,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
   type ConfigurationStatusResponse,
+  type ConfigurationConflictResponse,
   type DiagnosticsResponse,
   type ModelSummary,
+  type NativeSubagentSyncResponse,
   type OrchestrationPhase,
   type ProviderCreateRequest,
   type ProviderCacheRetentionType,
@@ -76,7 +77,14 @@ import {
   type UsageSummaryResponse,
 } from "./api";
 
-type Page = "overview" | "usage" | "agents" | "providers" | "models" | "diagnostics" | "settings";
+type Page =
+  | "overview"
+  | "usage"
+  | "agents"
+  | "providers"
+  | "models"
+  | "diagnostics"
+  | "settings";
 
 const navigation: Array<{ label: string; page?: Page }> = [
   { label: "概览", page: "overview" },
@@ -243,6 +251,11 @@ function OverviewPage({
   const [policySaving, setPolicySaving] = useState(false);
   const [configurationError, setConfigurationError] = useState<string | null>(null);
   const [configurationSuccess, setConfigurationSuccess] = useState<string | null>(null);
+  const [configurationConflict, setConfigurationConflict] =
+    useState<ConfigurationConflictResponse | null>(null);
+  const [conflictActiveAgentIds, setConflictActiveAgentIds] = useState<string[]>([]);
+  const [conflictBusy, setConflictBusy] = useState(false);
+  const [conflictError, setConflictError] = useState<string | null>(null);
   const [failurePolicy, setFailurePolicy] =
     useState<SettingsResponse["orchestrationFailurePolicy"]>("STRICT_STOP");
 
@@ -306,6 +319,13 @@ function OverviewPage({
     setConfigurationSuccess(null);
     try {
       const result = await withTimeout(switchRuntimeMode(activeAgentIds), "切换运行模式", 15_000);
+      if (result.status === "CONFLICT") {
+        if (!result.conflict) throw new Error("配置冲突详情缺失，请刷新状态后重试。");
+        setConfigurationConflict(result.conflict);
+        setConflictActiveAgentIds(activeAgentIds);
+        setConflictError(null);
+        return;
+      }
       if (result.status === "FAILED_ROLLED_BACK" || result.status === "RECOVERY_REQUIRED") {
         throw new Error(
           result.status === "FAILED_ROLLED_BACK"
@@ -330,6 +350,56 @@ function OverviewPage({
       await reloadConfiguration();
     } finally {
       setOperation(null);
+    }
+  }
+
+  async function handleConflictResolution(strategy: "ADOPT" | "REPLACE") {
+    if (!configurationConflict || conflictBusy) return;
+    if (
+      strategy === "REPLACE"
+      && !window.confirm(
+        "备份并替换冲突的 CAS 配置？CAS 只处理列出的配置片段和 CAS 命名文件，失败时自动恢复。",
+      )
+    ) {
+      return;
+    }
+    setConflictBusy(true);
+    setConflictError(null);
+    try {
+      const result = await withTimeout(
+        resolveRuntimeModeConflict(
+          conflictActiveAgentIds,
+          strategy,
+          configurationConflict,
+        ),
+        strategy === "ADOPT" ? "接管现有配置" : "备份并替换配置",
+        15_000,
+      );
+      if (result.status === "CONFLICT") {
+        if (!result.conflict) throw new Error("配置冲突详情缺失，请取消后重新同步。");
+        setConfigurationConflict(result.conflict);
+        setConflictError("检测到磁盘配置在确认期间发生变化，已刷新冲突详情，请重新确认。");
+        return;
+      }
+      if (result.status === "FAILED_ROLLED_BACK" || result.status === "RECOVERY_REQUIRED") {
+        throw new Error(
+          result.status === "FAILED_ROLLED_BACK"
+            ? "配置替换失败，磁盘内容已自动回滚。"
+            : "配置替换未完成，需要先恢复配置事务。",
+        );
+      }
+      setConfigurationConflict(null);
+      setConflictActiveAgentIds([]);
+      setConfigurationSuccess(
+        strategy === "ADOPT"
+          ? "已接管语义一致的现有配置。"
+          : "已有 CAS 配置已备份并替换。请完全退出并重启 Codex，再新建任务。",
+      );
+      await reloadConfiguration();
+    } catch (reason: unknown) {
+      setConflictError(errorMessage(reason));
+    } finally {
+      setConflictBusy(false);
     }
   }
 
@@ -426,9 +496,26 @@ function OverviewPage({
   const modeReady = selectedMode === "DEFAULT"
     || (selectedAgents.length > 0 && selectedAgents.every((agent) => agent.availability === "READY"));
   const alreadySynchronized = sameMode && configuration?.status === "APPLIED";
+  const runtimeUsesSubagents = currentAgentIds.length > 0 || Boolean(runtimeMode?.legacyActiveAgentId);
+  const restartPending = runtimeUsesSubagents && Boolean(configuration?.restartRecommended);
   const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
   return (
     <>
+      {configurationConflict && (
+        <ConfigurationConflictDialog
+          busy={conflictBusy}
+          conflict={configurationConflict}
+          error={conflictError}
+          onAdopt={() => void handleConflictResolution("ADOPT")}
+          onClose={() => {
+            if (conflictBusy) return;
+            setConfigurationConflict(null);
+            setConflictActiveAgentIds([]);
+            setConflictError(null);
+          }}
+          onReplace={() => void handleConflictResolution("REPLACE")}
+        />
+      )}
       {environment && (
         <EnvironmentDetails
           detecting={detecting}
@@ -460,11 +547,11 @@ function OverviewPage({
             <p>切换时自动创建 Snapshot，并在失败时回滚 CAS-owned 配置。</p>
           </div>
           <span className={`mode-status ${
-            configuration?.restartRecommended
+            restartPending
               ? "restart-required"
               : configuration?.status.toLowerCase() ?? "unavailable"
           }`}>
-            {configuration?.restartRecommended
+            {restartPending
               ? "RESTART REQUIRED"
               : configuration?.status ?? "LOADING"}
           </span>
@@ -472,7 +559,7 @@ function OverviewPage({
 
         {configurationSuccess && <div className="success-banner">{configurationSuccess}</div>}
         {configurationError && <div className="inline-error">{configurationError}</div>}
-        {configuration?.restartRecommended && (
+        {restartPending && (
           <div className="inline-error" role="alert">
             <strong>Codex 尚未加载最新配置</strong>
             <span>
@@ -526,7 +613,7 @@ function OverviewPage({
                 ) : (
                   selectedAgents.map((agent) => (
                     <span key={agent.id}>
-                      {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
                     </span>
                   ))
                 )}
@@ -601,7 +688,7 @@ function OverviewPage({
 
         <div className="mode-switch-actions">
           <span>
-            {configuration?.restartRecommended
+            {restartPending && alreadySynchronized
               ? "磁盘配置已同步，但运行中的 Codex 仍在使用旧配置。"
               : alreadySynchronized
                 ? "当前模式已同步到 Codex。"
@@ -627,7 +714,7 @@ function OverviewPage({
             >
               {operation === "switch"
                 ? "切换中…"
-                : configuration?.restartRecommended
+                : restartPending && alreadySynchronized
                   ? "等待重启 Codex"
                   : alreadySynchronized
                     ? "当前已启用"
@@ -685,6 +772,126 @@ function OverviewPage({
         )}
       </section>
     </>
+  );
+}
+
+function ConfigurationConflictDialog({
+  busy,
+  conflict,
+  error,
+  onAdopt,
+  onClose,
+  onReplace,
+}: {
+  busy: boolean;
+  conflict: ConfigurationConflictResponse;
+  error: string | null;
+  onAdopt: () => void;
+  onClose: () => void;
+  onReplace: () => void;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const externallyModified = conflict.resources.some(
+    (resource) => resource.code === "MANAGED_RESOURCE_CONFLICT",
+  );
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  return (
+    <dialog
+      aria-labelledby="configuration-conflict-title"
+      className="configuration-conflict-dialog"
+      onCancel={(event) => {
+        if (busy) event.preventDefault();
+        else onClose();
+      }}
+      onClick={(event) => {
+        if (!busy && event.target === event.currentTarget) onClose();
+      }}
+      ref={dialogRef}
+    >
+      <section className="configuration-conflict-card">
+        <header>
+          <div>
+            <span className="eyebrow">Configuration Safety</span>
+            <h2 id="configuration-conflict-title">
+              {externallyModified ? "CAS 管理的配置已被外部修改" : "发现已有 Codex 配置"}
+            </h2>
+            <p>
+              {externallyModified
+                ? "CAS 检测到已管理资源在外部发生变化。同步已暂停，磁盘内容尚未改变。"
+                : "当前 CODEX_HOME 已存在 CAS 准备管理的配置，但本机 CAS 尚未登记这些资源的所有权。同步已暂停，磁盘内容尚未改变。"}
+            </p>
+          </div>
+          <button className="ghost-button" disabled={busy} onClick={onClose} type="button">
+            取消同步
+          </button>
+        </header>
+
+        <div className="conflict-home">
+          <span>CODEX_HOME</span>
+          <code title={conflict.codexHome}>{conflict.codexHome}</code>
+        </div>
+
+        <div className="configuration-conflict-list">
+          {conflict.resources.map((resource) => (
+            <article key={`${resource.resourceType}-${resource.logicalKey}`}>
+              <div>
+                <strong>{resource.logicalKey}</strong>
+                <span className="conflict-kind">
+                  {resource.code === "RESOURCE_OWNERSHIP_CONFLICT"
+                    ? "尚未登记所有权"
+                    : "已被外部修改"}
+                </span>
+              </div>
+              <small>{resource.resourceType}</small>
+              <code title={resource.path}>{resource.path}</code>
+              <p>
+                {resource.matchesDesired
+                  ? "磁盘语义与 CAS 当前期望一致。"
+                  : "磁盘语义与 CAS 当前期望不同，不能直接接管。"}
+                {!resource.replaceable && " 此资源不能由 CAS 自动替换。"}
+              </p>
+            </article>
+          ))}
+        </div>
+
+        {!conflict.canAdopt && (
+          <div className="orchestration-warning" role="note">
+            “接管一致配置”仅在所有资源均未登记、且与当前 CAS 期望完全一致时可用。
+            这不会把任意磁盘配置反向导入 CAS。
+          </div>
+        )}
+        {error && <div className="inline-error" role="alert">{error}</div>}
+
+        <footer>
+          <button className="secondary-button" disabled={busy} onClick={onClose} type="button">
+            取消同步
+          </button>
+          <button
+            className="secondary-button"
+            disabled={busy || !conflict.canAdopt}
+            onClick={onAdopt}
+            title={conflict.canAdopt ? undefined : "现有配置与 CAS 期望不完全一致"}
+            type="button"
+          >
+            {busy ? "处理中…" : "接管一致配置"}
+          </button>
+          <button
+            className="danger-button"
+            disabled={busy || conflict.resources.some((resource) => !resource.replaceable)}
+            onClick={onReplace}
+            type="button"
+          >
+            {busy ? "处理中…" : "备份并替换"}
+          </button>
+        </footer>
+      </section>
+    </dialog>
   );
 }
 
@@ -755,7 +962,7 @@ function AgentConfigurationDialog({
                   <option value="">不启用</option>
                   {candidates.map((agent) => (
                     <option key={agent.id} value={agent.id}>
-                      {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
                       {" · "}{availabilityLabel(agent.availability)}
                     </option>
                   ))}
@@ -1338,7 +1545,10 @@ function AgentRow({
       <div className="agent-main">
         <div className="provider-name-line">
           <h2>{agent.name}</h2>
-          <span className={`agent-state ${agent.availability.toLowerCase()}`}>
+          <span
+            className={`agent-state ${agent.availability.toLowerCase()}`}
+            title={availabilityDescription(agent.availability)}
+          >
             {availabilityLabel(agent.availability)}
           </span>
           {isActive && <span className="agent-state current">当前使用</span>}
@@ -1346,7 +1556,7 @@ function AgentRow({
         <p>{agent.description}</p>
         <code>
           {agent.model
-            ? `${agent.model.providerName} / ${agent.model.displayName}`
+            ? `${agent.model.providerKey} / ${agent.model.displayName}`
             : "未绑定供应商 / 模型"}
           {agent.roleKey && agent.orchestrationPhase
             ? ` · ${agent.roleKey} / ${agent.orchestrationPhase}`
@@ -1389,7 +1599,7 @@ function UsagePage() {
         </section>
       )}
       <UsageMonitorCard />
-      <AgentThreadInstancesPanel agents={agents} />
+      <AgentThreadInstancesPanel />
       <AgentUsagePanel agents={agents} />
     </>
   );
@@ -1477,46 +1687,42 @@ function UsageMonitorCard() {
   );
 }
 
-function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
+function AgentThreadInstancesPanel() {
   const [instances, setInstances] = useState<AgentThreadInstanceResponse[]>([]);
+  const [nativeSync, setNativeSync] = useState<NativeSubagentSyncResponse | null>(null);
   const [scopeDrafts, setScopeDrafts] = useState<Record<string, string>>({});
+  const [recommendations, setRecommendations] =
+    useState<Record<string, AgentThreadInstanceRecommendation>>({});
   const [savingScope, setSavingScope] = useState<string | null>(null);
-  const [decisionAgentId, setDecisionAgentId] = useState("");
-  const [decisionScope, setDecisionScope] = useState("");
-  const [decisionCwd, setDecisionCwd] = useState("");
-  const [decisionInput, setDecisionInput] = useState("");
-  const [recommendation, setRecommendation] =
-    useState<AgentThreadInstanceRecommendation | null>(null);
-  const [execution, setExecution] = useState<AgentThreadExecutionResponse | null>(null);
-  const [decisionBusy, setDecisionBusy] = useState(false);
-  const [executionBusy, setExecutionBusy] = useState(false);
-  const [decisionError, setDecisionError] = useState<string | null>(null);
+  const [checkingRecommendation, setCheckingRecommendation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const loaded = await listAgentThreadInstances({ limit: 50 });
-      setInstances(loaded);
-      setScopeDrafts(Object.fromEntries(
-        loaded.map((instance) => [instance.id, instance.scopeKey ?? ""]),
+      setInstances(loaded.items);
+      setNativeSync(loaded.sync);
+      setScopeDrafts((current) => Object.fromEntries(
+        loaded.items.map((instance) => [
+          instance.id,
+          current[instance.id] ?? instance.scopeKey ?? "",
+        ]),
       ));
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
   useEffect(() => {
     void load();
+    const timer = window.setInterval(() => void load(true), 5000);
+    return () => window.clearInterval(timer);
   }, [load]);
-
-  useEffect(() => {
-    if (!decisionAgentId && agents.length > 0) setDecisionAgentId(agents[0].id);
-  }, [agents, decisionAgentId]);
 
   async function saveScope(instance: AgentThreadInstanceResponse) {
     setSavingScope(instance.id);
@@ -1535,50 +1741,25 @@ function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
     }
   }
 
-  async function evaluateReuse(event: FormEvent) {
-    event.preventDefault();
-    setDecisionError(null);
-    setRecommendation(null);
-    setExecution(null);
-    if (!decisionAgentId || !decisionScope.trim()) {
-      setDecisionError("请选择 Agent，并填写 Scope。");
+  async function checkRecommendation(instance: AgentThreadInstanceResponse) {
+    const scope = scopeDrafts[instance.id]?.trim();
+    if (!instance.agentId || !scope) {
+      setError("请先填写并保存 Scope，再评估 Primary 调度约束。");
       return;
     }
-    setDecisionBusy(true);
+    setCheckingRecommendation(instance.id);
+    setError(null);
     try {
-      setRecommendation(await recommendAgentThreadInstance(decisionAgentId, decisionScope));
+      const recommendation = await recommendAgentThreadInstance(
+        instance.agentId,
+        scope,
+        instance.parentThreadId,
+      );
+      setRecommendations((current) => ({ ...current, [instance.id]: recommendation }));
     } catch (reason: unknown) {
-      setDecisionError(errorMessage(reason));
+      setError(errorMessage(reason));
     } finally {
-      setDecisionBusy(false);
-    }
-  }
-
-  async function executeRecommendation() {
-    if (!recommendation || !decisionCwd.trim() || !decisionInput.trim()) {
-      setDecisionError("执行前必须填写绝对工作目录和完整任务。");
-      return;
-    }
-    const action = recommendation.decision === "REUSE" ? "复用现有 Thread" : "创建新 Thread";
-    if (!window.confirm(`${action} 并立即发送任务？该操作会产生真实模型调用。`)) return;
-    setExecutionBusy(true);
-    setDecisionError(null);
-    setExecution(null);
-    try {
-      const result = await executeAgentThread({
-        agentId: decisionAgentId,
-        scopeKey: decisionScope,
-        cwd: decisionCwd,
-        input: decisionInput,
-        expectedDecision: recommendation.decision,
-        expectedCandidateThreadId: recommendation.candidateThreadId,
-      });
-      setExecution(result);
-      await load();
-    } catch (reason: unknown) {
-      setDecisionError(errorMessage(reason));
-    } finally {
-      setExecutionBusy(false);
+      setCheckingRecommendation(null);
     }
   }
 
@@ -1588,103 +1769,39 @@ function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
         <div>
           <span className="eyebrow">Subagent Threads</span>
           <h2 id="agent-instance-title">子 Agent 实例</h2>
-          <p>管理 Scope，预览复用决策，并在 CAS Runtime Bridge 中显式提交 Agent 任务。</p>
+          <p>查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Scope。</p>
         </div>
-        <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
-          {loading ? "刷新中…" : "刷新"}
-        </button>
+        <div className="runtime-monitor-actions">
+          {nativeSync && (
+            <span
+              className={`result ${nativeSync.capability === "SUPPORTED" ? "ready" : "blocked"}`}
+              title={nativeSync.message}
+            >
+              Native {nativeSync.capability}
+            </span>
+          )}
+          <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
+            {loading ? "同步中…" : "同步原生状态"}
+          </button>
+        </div>
       </header>
 
       {error && <div className="inline-error" role="alert">{error}</div>}
-      <form className="agent-reuse-preview" onSubmit={evaluateReuse}>
-        <label>
-          <span>Agent</span>
-          <select
-            onChange={(event) => {
-              setDecisionAgentId(event.target.value);
-              setRecommendation(null);
-              setExecution(null);
-            }}
-            value={decisionAgentId}
-          >
-            <option value="">选择 Agent</option>
-            {agents.map((agent) => (
-              <option key={agent.id} value={agent.id}>
-                {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span>Task Scope</span>
-          <input
-            onChange={(event) => {
-              setDecisionScope(event.target.value);
-              setRecommendation(null);
-              setExecution(null);
-            }}
-            placeholder="例如 order/refund"
-            value={decisionScope}
-          />
-        </label>
-        <button className="secondary-button" disabled={decisionBusy} type="submit">
-          {decisionBusy ? "评估中…" : "评估复用"}
-        </button>
-        <label className="agent-reuse-full">
-          <span>工作目录</span>
-          <input
-            onChange={(event) => setDecisionCwd(event.target.value)}
-            placeholder="例如 C:\workspace\project（必须是已存在的绝对目录）"
-            value={decisionCwd}
-          />
-        </label>
-        <label className="agent-reuse-full">
-          <span>执行任务</span>
-          <textarea
-            maxLength={100000}
-            onChange={(event) => setDecisionInput(event.target.value)}
-            placeholder="发送给所选 Agent 的完整任务"
-            rows={3}
-            value={decisionInput}
-          />
-        </label>
-        {decisionError && <small className="reuse-decision-error">{decisionError}</small>}
-        {recommendation && (
-          <div className={`reuse-recommendation ${recommendation.decision.toLowerCase()}`}>
-            <strong>{recommendation.decision}</strong>
-            <span>{recommendation.message}</span>
-            <small className="reuse-recommendation-meta">
-              {recommendation.reuseStrategy}
-              {" · "}Context 阈值 {recommendation.contextPressureLimitPercent}%
-              {" · "}Cache {recommendation.cacheHint}
-              {" · "}窗口 {formatRetentionWindow(recommendation.cacheRetentionHintSeconds)}
-              （{cacheRetentionSourceLabel(recommendation.cacheRetentionSource)}）
-            </small>
-            {recommendation.candidateThreadId && (
-              <code title={recommendation.candidateThreadId}>
-                Thread {shortThreadId(recommendation.candidateThreadId)}
-              </code>
-            )}
-            <button
-              className="primary-button reuse-execute-button"
-              disabled={executionBusy}
-              onClick={() => void executeRecommendation()}
-              type="button"
-            >
-              {executionBusy ? "执行中…" : "执行建议"}
-            </button>
-          </div>
-        )}
-        {execution && (
-          <div className="reuse-execution-result">
-            <strong>{execution.action}</strong>
-            <span>{execution.agentName} 的任务已提交，状态 {execution.status}。</span>
-            <code title={execution.threadId}>Thread {shortThreadId(execution.threadId)}</code>
-          </div>
-        )}
-      </form>
+      {nativeSync && (
+        <small
+          className={nativeSync.capability === "SUPPORTED"
+            ? "runtime-monitor-note"
+            : "runtime-monitor-warning"}
+          title={nativeSync.sourcePath ?? undefined}
+        >
+          {nativeSync.message}
+          {nativeSync.capability === "SUPPORTED"
+            ? ` 已识别 ${nativeSync.discoveredCount} 个，映射 ${nativeSync.syncedCount} 个，未映射 ${nativeSync.unmappedCount} 个。`
+            : ""}
+        </small>
+      )}
       {!loading && !error && instances.length === 0 && (
-        <div className="usage-empty">尚未捕获到由 CAS Runtime Bridge 管理的子 Agent Thread。</div>
+        <div className="usage-empty">尚未识别到可映射的 Primary 原生子 Agent Thread。</div>
       )}
       {!error && instances.length > 0 && (
         <div className="agent-instance-list">
@@ -1707,17 +1824,33 @@ function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
               </div>
               <dl>
                 <UsageRecordMetric label="Total" value={instance.totalTokens} />
-                <UsageRecordMetric label="Cached" value={instance.cachedInputTokens} />
-                <UsageRecordMetric label="Input" value={instance.inputTokens} />
-                <UsageRecordMetric label="Output" value={instance.outputTokens} />
+                <UsageRecordMetric
+                  label="Cached"
+                  value={hasDetailedInstanceUsage(instance) ? instance.cachedInputTokens : null}
+                />
+                <UsageRecordMetric
+                  label="Input"
+                  value={hasDetailedInstanceUsage(instance) ? instance.inputTokens : null}
+                />
+                <UsageRecordMetric
+                  label="Output"
+                  value={hasDetailedInstanceUsage(instance) ? instance.outputTokens : null}
+                />
               </dl>
               <div className="agent-instance-scope">
                 <input
                   aria-label={`${instance.agentNameSnapshot ?? "Agent"} Scope`}
-                  onChange={(event) => setScopeDrafts((current) => ({
-                    ...current,
-                    [instance.id]: event.target.value,
-                  }))}
+                  onChange={(event) => {
+                    setScopeDrafts((current) => ({
+                      ...current,
+                      [instance.id]: event.target.value,
+                    }));
+                    setRecommendations((current) => {
+                      const next = { ...current };
+                      delete next[instance.id];
+                      return next;
+                    });
+                  }}
                   placeholder="Scope，例如 order/refund"
                   value={scopeDrafts[instance.id] ?? ""}
                 />
@@ -1729,7 +1862,38 @@ function AgentThreadInstancesPanel({ agents }: { agents: AgentSummary[] }) {
                 >
                   {savingScope === instance.id ? "保存中…" : "保存 Scope"}
                 </button>
+                <button
+                  className="ghost-button"
+                  disabled={checkingRecommendation === instance.id}
+                  onClick={() => void checkRecommendation(instance)}
+                  type="button"
+                >
+                  {checkingRecommendation === instance.id ? "评估中…" : "评估复用"}
+                </button>
               </div>
+              {(() => {
+                const recommendation = recommendations[instance.id];
+                return recommendation && (
+                  <div
+                    className={`reuse-recommendation ${recommendation.decision.toLowerCase()}`}
+                    title="该结果已限定到此 Instance 所属的 Primary Thread；实际委派前 helper 会再次实时查询。"
+                  >
+                    <strong>{recommendation.decision}</strong>
+                    <span>{recommendation.message}</span>
+                    <span className="reuse-recommendation-meta">
+                      {recommendation.reasonCode}
+                      {" · "}Context {recommendation.contextPressurePercent ?? "—"}
+                      /{recommendation.contextPressureLimitPercent}%
+                      {" · "}Cache {recommendation.cacheHint}
+                    </span>
+                    {recommendation.candidateThreadId && (
+                      <code title={recommendation.candidateThreadId}>
+                        {shortThreadId(recommendation.candidateThreadId)}
+                      </code>
+                    )}
+                  </div>
+                );
+              })()}
             </article>
           ))}
         </div>
@@ -1800,7 +1964,7 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
             <option value="">全部记录（含 Primary）</option>
             {agents.map((agent) => (
               <option key={agent.id} value={agent.id}>
-                {agent.model?.providerName ?? "未绑定供应商"} / {agent.name}
+                {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
               </option>
             ))}
           </select>
@@ -1928,13 +2092,20 @@ function UsageMetric({ label, value }: { label: string; value: number }) {
   );
 }
 
-function UsageRecordMetric({ label, value }: { label: string; value: number }) {
+function UsageRecordMetric({ label, value }: { label: string; value: number | null }) {
   return (
     <div>
       <dt>{label}</dt>
-      <dd title={new Intl.NumberFormat("en-US").format(value)}>{formatTokenCount(value)}</dd>
+      <dd title={value === null ? "当前数据源不提供该 Token 明细" : new Intl.NumberFormat("en-US").format(value)}>
+        {value === null ? "—" : formatTokenCount(value)}
+      </dd>
     </div>
   );
+}
+
+function hasDetailedInstanceUsage(instance: AgentThreadInstanceResponse): boolean {
+  return instance.totalTokens === 0
+    || instance.inputTokens + instance.cachedInputTokens + instance.outputTokens > 0;
 }
 
 function usageQuery(
@@ -2009,22 +2180,6 @@ function agentInstanceStatusDescription(status: AgentThreadInstanceStatus): stri
 function formatUsageDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
-}
-
-function formatRetentionWindow(seconds: number | null): string {
-  if (seconds === null) return "未知";
-  if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
-  return `${Math.round(seconds / 60 * 10) / 10} 分钟`;
-}
-
-function cacheRetentionSourceLabel(
-  source: AgentThreadInstanceRecommendation["cacheRetentionSource"],
-): string {
-  return {
-    NONE: "未配置",
-    PROVIDER: "Provider",
-    AGENT_OVERRIDE: "Agent",
-  }[source];
 }
 
 function localDateInputValue(date: Date): string {
@@ -2297,7 +2452,7 @@ function CreateAgentPanel({
                 key={model.id}
                 value={model.id}
               >
-                {model.providerName} / {model.displayName} — {compatibilityLabel(model.compatibility)}
+                {model.providerKey} / {model.displayName} — {compatibilityLabel(model.compatibility)}
               </option>
             ))}
           </select>
@@ -2428,7 +2583,7 @@ function AgentDetailPanel({
           <p>
             <code>
               {agent.modelBinding
-                ? `${agent.modelBinding.providerName} / ${agent.modelBinding.displayName}`
+                ? `${agent.modelBinding.providerKey} / ${agent.modelBinding.displayName}`
                 : "未绑定供应商 / 模型"}
             </code>
             {" · "}{agent.agentType}{isActive ? " · 当前使用" : ""}
@@ -2575,7 +2730,7 @@ function AgentDetailPanel({
                 key={model.id}
                 value={model.id}
               >
-                {model.providerName} / {model.displayName} — {compatibilityLabel(model.compatibility)}
+                {model.providerKey} / {model.displayName} — {compatibilityLabel(model.compatibility)}
               </option>
             ))}
           </select>
@@ -2792,6 +2947,18 @@ function availabilityLabel(value: AgentSummary["availability"]): string {
   return labels[value];
 }
 
+function availabilityDescription(value: AgentSummary["availability"]): string {
+  const descriptions = {
+    READY: "Agent 已启用，Provider、Model 与兼容性检查均已就绪。",
+    MODEL_MISSING: "Agent 尚未绑定 Model。",
+    PROVIDER_UNAVAILABLE: "绑定 Model 所属的 Provider 已停用或不可用。",
+    INCOMPATIBLE_MODEL: "绑定 Model 未通过 Codex Agent 兼容性要求。",
+    UNVERIFIED_MODEL: "绑定 Model 尚未通过 Responses API 与工具闭环测试。",
+    INVALID_CONFIGURATION: "绑定 Model 已停用；请在 Models 页面重新启用或更换绑定。",
+  } as const;
+  return descriptions[value];
+}
+
 function ProvidersPage() {
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2820,7 +2987,7 @@ function ProvidersPage() {
 
   function handleCreated() {
     setAdding(false);
-    setSuccess("Provider 已安全保存。Credential 不会在界面中回显。");
+    setSuccess("Provider 已保存；Codex Native 复用当前登录，其余 Credential 不会在界面中回显。");
     void load();
   }
 
@@ -2849,7 +3016,7 @@ function ProvidersPage() {
     setSuccess(null);
     try {
       await deleteProvider(provider.id);
-      setSuccess("Provider 及其 Credential 已删除。");
+      setSuccess("Provider 及其关联 Credential（如有）已删除。");
       await load();
     } catch (reason: unknown) {
       setActionError(errorMessage(reason));
@@ -2866,7 +3033,7 @@ function ProvidersPage() {
         <div>
           <span className="eyebrow">Providers</span>
           <h1>模型服务来源</h1>
-          <p>管理 Codex Agent 使用的 Responses API Provider。</p>
+          <p>管理第三方 Responses API，以及复用当前 ChatGPT 登录的 Codex 原生模型。</p>
         </div>
         {!panelOpen && (
           <button
@@ -2952,9 +3119,12 @@ function ProviderRow({
   onEdit: () => void;
   provider: ProviderSummary;
 }) {
-  const ready = provider.status === "READY" && provider.credentialStatus === "CONFIGURED";
+  const ready = provider.status === "READY"
+    && (provider.credentialStatus === "CONFIGURED" || provider.credentialStatus === "CODEX_SESSION");
   const label =
-    provider.credentialStatus !== "CONFIGURED"
+    provider.credentialStatus === "CODEX_SESSION"
+      ? "Codex session"
+      : provider.credentialStatus !== "CONFIGURED"
       ? "Credential missing"
       : provider.status === "DISABLED"
         ? "Disabled"
@@ -2969,11 +3139,11 @@ function ProviderRow({
       />
       <div className="provider-main">
         <div className="provider-name-line">
-          <h2>{provider.name}</h2>
+          <h2>{provider.providerKey}</h2>
           <span className={`result ${ready ? "ready" : "blocked"}`}>{label}</span>
         </div>
         <p>
-          <code>{provider.providerKey}</code>
+          <span>{provider.name}</span>
           <span>Responses API</span>
           <span>{provider.providerType === "PRESET" ? "Preset" : "Custom"}</span>
           <span>Cache {provider.cacheSupport}</span>
@@ -3004,7 +3174,11 @@ function ProviderIcon({
 }) {
   return (
     <span className={className} aria-hidden="true">
-      {presetId === "deepseek" ? <DeepSeekLogo /> : name.trim().slice(0, 2).toUpperCase() || "?"}
+      {presetId === "deepseek"
+        ? <DeepSeekLogo />
+        : presetId === "codex-native"
+          ? ">_"
+          : name.trim().slice(0, 2).toUpperCase() || "?"}
     </span>
   );
 }
@@ -3102,6 +3276,9 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
   }
 
   const enabledProviders = providers.filter((provider) => provider.enabled);
+  const addableProviders = enabledProviders.filter(
+    (provider) => provider.presetId !== "codex-native",
+  );
   const panelOpen = adding || editing !== null;
 
   return (
@@ -3112,7 +3289,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
           <h1>可绑定模型</h1>
           <p>验证 Responses API、Function Calling 工具闭环与 Codex Multi-Agent 兼容性。</p>
         </div>
-        {!panelOpen && enabledProviders.length > 0 && (
+        {!panelOpen && addableProviders.length > 0 && (
           <button
             className="primary-button"
             onClick={() => {
@@ -3137,7 +3314,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
         <AddModelPanel
           onCancel={() => setAdding(false)}
           onCreated={handleCreated}
-          providers={enabledProviders}
+          providers={addableProviders}
         />
       )}
 
@@ -3173,7 +3350,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
           <div className="empty-icon">M</div>
           <h2>还没有 Model</h2>
           <p>手动添加 Provider 实际接受的 Model ID；能力信息默认保持 Unknown。</p>
-          {enabledProviders.length > 0 ? (
+          {addableProviders.length > 0 ? (
             <button className="primary-button" onClick={() => setAdding(true)}>添加 Model</button>
           ) : (
             <button className="secondary-button" onClick={onOpenProviders}>启用 Provider</button>
@@ -3242,18 +3419,20 @@ function ModelRow({
         ? "Unknown"
         : model.lifecycle;
   const verification = model.lastTestStatus === null
-    ? "Untested"
+    ? model.providerPresetId === "codex-native" ? "Codex Native" : "Untested"
     : model.lastTestStatus === "SUCCESS"
       ? "Passed"
       : modelTestStatusLabel(model.lastTestStatus);
   const verificationClass = model.lastTestStatus === null
-    ? "untested"
+    ? model.providerPresetId === "codex-native" ? "passed" : "untested"
     : model.lastTestStatus === "SUCCESS"
       ? "passed"
       : "failed";
   const lifecycleTitle = lifecycleDescription(model);
   const verificationTitle = [
-    verificationDescription(model.lastTestStatus),
+    model.providerPresetId === "codex-native"
+      ? "原生模型复用当前 Codex 的 ChatGPT 登录会话；实际可用性由当前账号与 Codex 客户端决定。"
+      : verificationDescription(model.lastTestStatus),
     model.lastTestedAt === null
       ? null
       : `最近测试：${new Date(model.lastTestedAt).toLocaleString()}${
@@ -3261,8 +3440,11 @@ function ModelRow({
       }`,
   ].filter(Boolean).join("\n");
   return (
-    <tr>
-      <td>{model.providerName}</td>
+    <tr className={!model.enabled ? "model-disabled" : undefined}>
+      <td>
+        <code>{model.providerKey}</code>
+        <small>{model.providerName}</small>
+      </td>
       <td>
         <strong>{model.displayName}</strong>
         <code>{model.modelId}</code>
@@ -3291,8 +3473,13 @@ function ModelRow({
       </td>
       <td>
         <div className="row-actions">
-          <button className="secondary-button" disabled={deleting || testing} onClick={onTest}>
-            {testing ? "测试中…" : "测试"}
+          <button
+            className="secondary-button"
+            disabled={deleting || testing || model.providerPresetId === "codex-native"}
+            onClick={onTest}
+            title={model.providerPresetId === "codex-native" ? "Codex 原生模型无需第三方 Responses API 测试" : undefined}
+          >
+            {model.providerPresetId === "codex-native" ? "原生" : testing ? "测试中…" : "测试"}
           </button>
           <button className="ghost-button" disabled={deleting || testing} onClick={onEdit}>编辑</button>
           <button className="danger-button" disabled={deleting || testing} onClick={onDelete}>
@@ -3365,6 +3552,7 @@ function AddModelPanel({
   const [modelId, setModelId] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [contextWindow, setContextWindow] = useState("");
+  const [modelIdError, setModelIdError] = useState<string | null>(null);
   const [contextError, setContextError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -3372,12 +3560,17 @@ function AddModelPanel({
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const parsedContextWindow = contextWindow.trim() === "" ? null : Number(contextWindow);
+    if (modelId.length === 0 || modelId.trim() !== modelId || /[\r\n]/.test(modelId)) {
+      setModelIdError("Model ID 不能为空，首尾不能有空格，且不能包含换行。");
+      return;
+    }
     if (parsedContextWindow !== null && (!Number.isSafeInteger(parsedContextWindow) || parsedContextWindow <= 0)) {
       setContextError("Context Window 必须是正整数。");
       return;
     }
     setSaving(true);
     setError(null);
+    setModelIdError(null);
     setContextError(null);
     try {
       await addModel({
@@ -3389,6 +3582,9 @@ function AddModelPanel({
       onCreated();
     } catch (reason: unknown) {
       setError(errorMessage(reason));
+      if (errorCode(reason) === "MODEL_ID_CONFLICT" || errorField(reason) === "modelId") {
+        setModelIdError(errorMessage(reason));
+      }
     } finally {
       setSaving(false);
     }
@@ -3414,7 +3610,9 @@ function AddModelPanel({
             value={providerId}
           >
             {providers.map((provider) => (
-              <option key={provider.id} value={provider.id}>{provider.name}</option>
+              <option key={provider.id} value={provider.id}>
+                {provider.providerKey} — {provider.name}
+              </option>
             ))}
           </select>
           <small>Model 与 Provider 的组合在 CAS 内唯一。</small>
@@ -3423,14 +3621,20 @@ function AddModelPanel({
         <label className="field">
           <span>Model ID</span>
           <input
+            aria-invalid={modelIdError ? true : undefined}
             autoFocus
             maxLength={200}
-            onChange={(event) => setModelId(event.target.value)}
+            onChange={(event) => {
+              setModelId(event.target.value);
+              setModelIdError(null);
+            }}
             placeholder="provider/model-name"
             required
             value={modelId}
           />
-          <small>必须与 Provider API 接受的标识完全一致。</small>
+          <small className={modelIdError ? "field-error" : undefined}>
+            {modelIdError ?? "必须与 Provider API 接受的标识完全一致。"}
+          </small>
         </label>
 
         <label className="field">
@@ -3530,6 +3734,14 @@ function EditModelPanel({
       </div>
 
       <form className="provider-form" onSubmit={submit}>
+        <div className="field full-width">
+          <span>Provider</span>
+          <div className="static-value">
+            <code>{model.providerKey}</code> — {model.providerName}
+          </div>
+          <small>Model 绑定的 Provider 不可在编辑时更换。</small>
+        </div>
+
         <label className="field full-width">
           <span>Display Name</span>
           <input
@@ -3585,7 +3797,7 @@ function compatibilityLabel(value: ModelSummary["compatibility"]): string {
 function compatibilityDescription(value: ModelSummary["compatibility"]): string {
   const descriptions = {
     NATIVE: "有较强证据确认该模型针对 Codex 或其所需行为完成原生适配。",
-    COMPATIBLE: "并非专为 Codex 适配，但 CAS 已验证所需核心能力可以工作。",
+    COMPATIBLE: "CAS 已通过 Responses API 与 Function Calling 工具闭环验证，当前可用于 Codex Agent；这不表示 Codex 官方原生适配。",
     GATEWAY_REQUIRED: "当前不能直接用于 Codex，需要协议转换网关。",
     UNSUPPORTED: "存在明确的不兼容问题，不能用于 Codex Agent。",
     UNKNOWN: "CAS 暂无足够证据判断该模型是否兼容 Codex Agent。",
@@ -3636,7 +3848,7 @@ function formatTokenCount(value: number): string {
   return new Intl.NumberFormat("en-US", { notation: "compact" }).format(value);
 }
 
-type ProviderKind = "deepseek" | "custom";
+type ProviderKind = "codex-native" | "deepseek" | "custom";
 
 interface DocumentationReference {
   readonly name: string;
@@ -3717,6 +3929,13 @@ interface ProviderFormState {
 }
 
 const formDefaults: Record<ProviderKind, ProviderFormState> = {
+  "codex-native": {
+    providerKey: "codex-native",
+    name: "Codex Native (ChatGPT)",
+    baseUrl: "https://api.openai.com/v1/",
+    secret: "",
+    enabled: true,
+  },
   deepseek: {
     providerKey: "deepseek",
     name: "DeepSeek",
@@ -3811,7 +4030,11 @@ function EditProviderPanel({
         <div>
           <span className="eyebrow">Edit Provider</span>
           <h2>编辑 {provider.name}</h2>
-          <p>Credential 保持原值，不会读取或回显。</p>
+          <p>
+            {provider.presetId === "codex-native"
+              ? "该预设复用当前 Codex 的 ChatGPT 登录会话，不保存 API Key。"
+              : "Credential 保持原值，不会读取或回显。"}
+          </p>
         </div>
         <button className="ghost-button" disabled={saving} onClick={onCancel}>取消</button>
       </div>
@@ -3834,18 +4057,26 @@ function EditProviderPanel({
           <small>稳定身份不可修改。</small>
         </div>
 
-        <label className="field full-width">
-          <span>Base URL</span>
-          <input
-            inputMode="url"
-            maxLength={2048}
-            onChange={(event) => setBaseUrl(event.target.value)}
-            required
-            type="url"
-            value={baseUrl}
-          />
-          <small>跨 Origin 修改会要求额外确认；远程地址必须使用 HTTPS。</small>
-        </label>
+        {provider.presetId === "codex-native" ? (
+          <div className="field full-width">
+            <span>Authentication</span>
+            <div className="static-value">Current Codex / ChatGPT session</div>
+            <small>可用模型与配额由当前登录账号和 Codex 客户端决定。</small>
+          </div>
+        ) : (
+          <label className="field full-width">
+            <span>Base URL</span>
+            <input
+              inputMode="url"
+              maxLength={2048}
+              onChange={(event) => setBaseUrl(event.target.value)}
+              required
+              type="url"
+              value={baseUrl}
+            />
+            <small>跨 Origin 修改会要求额外确认；远程地址必须使用 HTTPS。</small>
+          </label>
+        )}
 
         <label className="enabled-field full-width">
           <input
@@ -3982,6 +4213,13 @@ function AddProviderPanel({
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!/^[a-z0-9][a-z0-9_-]*$/.test(form.providerKey)) {
+      setInvalidField("providerKey");
+      setInvalidFieldMessage(
+        "Provider Key 不能包含空格；必须以小写字母或数字开头，且只能包含小写字母、数字、-、_。",
+      );
+      return;
+    }
     setSaving(true);
     setError(null);
     setInvalidField(null);
@@ -3989,10 +4227,12 @@ function AddProviderPanel({
     const request: ProviderCreateRequest = {
       providerKey: form.providerKey,
       name: form.name,
-      presetId: kind === "deepseek" ? "deepseek" : null,
+      presetId: kind === "custom" ? null : kind,
       baseUrl: form.baseUrl,
       protocol: "RESPONSES",
-      auth: { strategy: "OS_SECRET_HELPER", secret: form.secret },
+      auth: kind === "codex-native"
+        ? { strategy: "NONE" }
+        : { strategy: "OS_SECRET_HELPER", secret: form.secret },
       enabled: form.enabled,
     };
 
@@ -4007,7 +4247,7 @@ function AddProviderPanel({
         errorCode(reason) === "PROVIDER_KEY_CONFLICT" ? errorMessage(reason) : null,
       );
     } finally {
-      request.auth.secret = "";
+      if (request.auth.strategy === "OS_SECRET_HELPER") request.auth.secret = "";
       setForm((current) => ({ ...current, secret: "" }));
       setSaving(false);
     }
@@ -4019,8 +4259,18 @@ function AddProviderPanel({
       <div className="panel-heading">
         <div>
           <span className="eyebrow">Add Provider</span>
-          <h2>{kind === "deepseek" ? "添加 DeepSeek" : "添加 Custom Responses Provider"}</h2>
-          <p>Credential 将保存到 Windows Credential Manager。</p>
+          <h2>
+            {kind === "codex-native"
+              ? "添加 Codex Native"
+              : kind === "deepseek"
+                ? "添加 DeepSeek"
+                : "添加 Custom Responses Provider"}
+          </h2>
+          <p>
+            {kind === "codex-native"
+              ? "复用当前 Codex 的 ChatGPT 登录，无需 API Key。"
+              : "Credential 将保存到 Windows Credential Manager。"}
+          </p>
         </div>
         <button className="ghost-button" disabled={saving} onClick={cancel}>取消</button>
       </div>
@@ -4033,6 +4283,15 @@ function AddProviderPanel({
         <fieldset className="provider-preset-selector">
           <legend>Provider Preset</legend>
           <div className="preset-grid">
+            <button
+              aria-pressed={kind === "codex-native"}
+              className={`preset-option ${kind === "codex-native" ? "selected" : ""}`}
+              onClick={() => selectKind("codex-native")}
+              type="button"
+            >
+              <ProviderIcon className="preset-icon" name="Codex Native" presetId="codex-native" />
+              <span className="preset-name">Codex Native</span>
+            </button>
             <button
               aria-pressed={kind === "custom"}
               className={`preset-option ${kind === "custom" ? "selected" : ""}`}
@@ -4053,7 +4312,7 @@ function AddProviderPanel({
             </button>
           </div>
           <div className="preset-helper-row">
-            <small>自定义 · 官方预设；仅展示当前可直接保存的 Responses Provider。</small>
+            <small>Codex 原生登录 · 自定义 · 官方预设。</small>
             <button className="reference-link" onClick={() => setReferenceOpen(true)} type="button">
               供应商 Responses API 支持参考
             </button>
@@ -4084,13 +4343,18 @@ function AddProviderPanel({
             aria-invalid={invalidField === "providerKey"}
             maxLength={64}
             onChange={(event) => {
-              setForm({ ...form, providerKey: event.target.value });
-              if (invalidField === "providerKey") {
+              const providerKey = event.target.value;
+              setForm({ ...form, providerKey });
+              if (providerKey.length > 0 && !/^[a-z0-9][a-z0-9_-]*$/.test(providerKey)) {
+                setInvalidField("providerKey");
+                setInvalidFieldMessage(
+                  "Provider Key 不能包含空格；必须以小写字母或数字开头，且只能包含小写字母、数字、-、_。",
+                );
+              } else if (invalidField === "providerKey") {
                 setInvalidField(null);
                 setInvalidFieldMessage(null);
               }
             }}
-            pattern="[a-z0-9][a-z0-9_-]*"
             required
             value={form.providerKey}
           />
@@ -4101,44 +4365,54 @@ function AddProviderPanel({
           </small>
         </label>
 
-        <label className="field full-width">
-          <span>Base URL</span>
-          <input
-            aria-invalid={invalidField === "baseUrl"}
-            inputMode="url"
-            maxLength={2048}
-            onChange={(event) => {
-              setForm({ ...form, baseUrl: event.target.value });
-              if (invalidField === "baseUrl") setInvalidField(null);
-            }}
-            required
-            type="url"
-            value={form.baseUrl}
-          />
-          <small className={invalidField === "baseUrl" ? "field-error" : undefined}>
-            {invalidField === "baseUrl" ? "请输入含域名的 HTTPS URL；HTTP 仅允许 localhost 或回环地址。" : "远程地址必须使用 HTTPS；HTTP 仅允许本机回环地址。"}
-          </small>
-        </label>
+        {kind === "codex-native" ? (
+          <div className="field full-width">
+            <span>Authentication</span>
+            <div className="static-value">Current Codex / ChatGPT session</div>
+            <small>将自动添加 GPT-5.6 Sol、Terra 与 Luna；具体可用性受当前账号限制。</small>
+          </div>
+        ) : (
+          <>
+            <label className="field full-width">
+              <span>Base URL</span>
+              <input
+                aria-invalid={invalidField === "baseUrl"}
+                inputMode="url"
+                maxLength={2048}
+                onChange={(event) => {
+                  setForm({ ...form, baseUrl: event.target.value });
+                  if (invalidField === "baseUrl") setInvalidField(null);
+                }}
+                required
+                type="url"
+                value={form.baseUrl}
+              />
+              <small className={invalidField === "baseUrl" ? "field-error" : undefined}>
+                {invalidField === "baseUrl" ? "请输入含域名的 HTTPS URL；HTTP 仅允许 localhost 或回环地址。" : "远程地址必须使用 HTTPS；HTTP 仅允许本机回环地址。"}
+              </small>
+            </label>
 
-        <label className="field full-width">
-          <span>API Key / Bearer Token</span>
-          <input
-            aria-invalid={invalidField === "auth.secret"}
-            autoComplete="new-password"
-            maxLength={2560}
-            onChange={(event) => {
-              setForm({ ...form, secret: event.target.value });
-              if (invalidField === "auth.secret") setInvalidField(null);
-            }}
-            required
-            spellCheck={false}
-            type="password"
-            value={form.secret}
-          />
-          <small className={invalidField === "auth.secret" ? "field-error" : undefined}>
-            {invalidField === "auth.secret" ? "API Key 不能为空，也不能包含换行。" : "只在本次提交期间存在于表单内存，提交完成后立即清空。"}
-          </small>
-        </label>
+            <label className="field full-width">
+              <span>API Key / Bearer Token</span>
+              <input
+                aria-invalid={invalidField === "auth.secret"}
+                autoComplete="new-password"
+                maxLength={2560}
+                onChange={(event) => {
+                  setForm({ ...form, secret: event.target.value });
+                  if (invalidField === "auth.secret") setInvalidField(null);
+                }}
+                required
+                spellCheck={false}
+                type="password"
+                value={form.secret}
+              />
+              <small className={invalidField === "auth.secret" ? "field-error" : undefined}>
+                {invalidField === "auth.secret" ? "API Key 不能为空，也不能包含换行。" : "只在本次提交期间存在于表单内存，提交完成后立即清空。"}
+              </small>
+            </label>
+          </>
+        )}
 
         <div className="field">
           <span>Protocol</span>
@@ -4161,7 +4435,7 @@ function AddProviderPanel({
           <div className="inline-error full-width" role="alert">
             <strong>Provider 保存失败</strong>
             <span>{error}</span>
-            <small>API Key 已从表单清空，请检查后重新输入。</small>
+            {kind !== "codex-native" && <small>API Key 已从表单清空，请检查后重新输入。</small>}
           </div>
         )}
 

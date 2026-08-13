@@ -428,7 +428,7 @@ fn load_agent(
                     p.name, m.model_id, m.display_name, m.enabled, p.enabled, m.lifecycle,
                     m.compatibility_level, m.context_window, a.role_key, a.orchestration_phase,
                     m.source, m.reasoning_supported, m.default_reasoning, a.reuse_strategy,
-                    a.cache_retention_override_seconds
+                    a.cache_retention_override_seconds, p.provider_key
              FROM agents a
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
              LEFT JOIN models m ON m.id = b.model_id
@@ -467,7 +467,7 @@ fn load_model(
         .query_row(
             "SELECT m.id, m.provider_id, p.name, m.model_id, m.display_name, m.enabled,
                     p.enabled, m.lifecycle, m.compatibility_level, m.context_window,
-                    m.source, m.reasoning_supported, m.default_reasoning
+                    m.source, m.reasoning_supported, m.default_reasoning, p.provider_key
              FROM models m
              JOIN providers p ON p.id = m.provider_id
              WHERE m.id = ?1",
@@ -490,6 +490,7 @@ fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
                 id,
                 provider_id: row.get::<_, Option<String>>(15)?.unwrap_or_default(),
                 provider_name: row.get::<_, Option<String>>(16)?.unwrap_or_default(),
+                provider_key: row.get::<_, Option<String>>(31)?.unwrap_or_default(),
                 model_id: row.get::<_, Option<String>>(17)?.unwrap_or_default(),
                 display_name: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
             },
@@ -546,6 +547,7 @@ fn map_binding_model(row: &rusqlite::Row<'_>) -> rusqlite::Result<BindingModelRe
             id: row.get(0)?,
             provider_id: row.get(1)?,
             provider_name: row.get(2)?,
+            provider_key: row.get(13)?,
             model_id: row.get(3)?,
             display_name: row.get(4)?,
         },
@@ -1325,6 +1327,7 @@ pub(crate) struct AgentModelReference {
     id: String,
     provider_id: String,
     provider_name: String,
+    provider_key: String,
     model_id: String,
     display_name: String,
 }

@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+cas-scheduler = { path = "../crates/cas-scheduler" }
 cas-secret-store = { path = "../crates/cas-secret-store" }
+rusqlite = { version = "0.40.1", features = ["bundled"] }

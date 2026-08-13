@@ -111,12 +111,30 @@ export interface ConfigurationStatusResponse {
 
 export interface ConfigurationApplyResponse {
   transactionId: string;
-  status: "APPLIED" | "NO_CHANGES" | "FAILED_ROLLED_BACK" | "RECOVERY_REQUIRED";
+  status: "APPLIED" | "NO_CHANGES" | "CONFLICT" | "FAILED_ROLLED_BACK" | "RECOVERY_REQUIRED";
   snapshotId: string | null;
   appliedAt: string | null;
   changedResourceCount: number;
   restartRecommended: boolean;
   warnings: DiagnosticIssue[];
+  conflict: ConfigurationConflictResponse | null;
+}
+
+export interface ConfigurationConflictResponse {
+  codexHome: string;
+  desiredStateHash: string;
+  conflictToken: string;
+  canAdopt: boolean;
+  resources: ConfigurationConflictResource[];
+}
+
+export interface ConfigurationConflictResource {
+  code: "RESOURCE_OWNERSHIP_CONFLICT" | "MANAGED_RESOURCE_CONFLICT";
+  resourceType: string;
+  logicalKey: string;
+  path: string;
+  matchesDesired: boolean;
+  replaceable: boolean;
 }
 
 export interface RuntimeModeResponse {
@@ -174,6 +192,21 @@ export function switchRuntimeMode(
   });
 }
 
+export function resolveRuntimeModeConflict(
+  activeAgentIds: string[],
+  strategy: "ADOPT" | "REPLACE",
+  conflict: ConfigurationConflictResponse,
+): Promise<ConfigurationApplyResponse> {
+  return invoke<ConfigurationApplyResponse>("runtime_mode_resolve_conflict", {
+    request: {
+      activeAgentIds,
+      strategy,
+      expectedDesiredStateHash: conflict.desiredStateHash,
+      expectedConflictToken: conflict.conflictToken,
+    },
+  });
+}
+
 export function listProjectExclusions(): Promise<ProjectExclusion[]> {
   return invoke<ProjectExclusion[]>("project_exclusion_list");
 }
@@ -200,7 +233,11 @@ export function restoreSnapshot(snapshotId: string): Promise<SnapshotRestoreResp
 
 export type ProviderProtocol = "RESPONSES";
 export type ProviderStatus = "READY" | "DISABLED";
-export type CredentialStatus = "CONFIGURED" | "MISSING" | "STORE_UNAVAILABLE";
+export type CredentialStatus =
+  | "CONFIGURED"
+  | "MISSING"
+  | "STORE_UNAVAILABLE"
+  | "CODEX_SESSION";
 export type ProviderCacheSupport = "UNKNOWN" | "SUPPORTED" | "UNSUPPORTED";
 export type ProviderCacheRetentionType = "UNKNOWN" | "APPROXIMATE" | "GUARANTEED";
 
@@ -233,7 +270,7 @@ export interface ProviderDetailResponse {
   providerType: "PRESET" | "CUSTOM";
   baseUrl: string;
   protocol: ProviderProtocol;
-  authStrategy: "OS_SECRET_HELPER";
+  authStrategy: "OS_SECRET_HELPER" | "CODEX_SESSION";
   enabled: boolean;
   source: "BUILT_IN" | "USER";
   presetId: string | null;
@@ -251,10 +288,14 @@ export interface ProviderCreateRequest {
   presetId?: string | null;
   baseUrl: string;
   protocol: ProviderProtocol;
-  auth: {
-    strategy: "OS_SECRET_HELPER";
-    secret: string;
-  };
+  auth:
+    | {
+      strategy: "OS_SECRET_HELPER";
+      secret: string;
+    }
+    | {
+      strategy: "NONE";
+    };
   enabled: boolean;
 }
 
@@ -313,6 +354,8 @@ export interface ModelSummary {
   id: string;
   providerId: string;
   providerName: string;
+  providerKey: string;
+  providerPresetId: string | null;
   modelId: string;
   displayName: string;
   enabled: boolean;
@@ -344,7 +387,7 @@ export interface ModelAddRequest {
 
 export interface ModelDetailResponse {
   id: string;
-  provider: { id: string; name: string };
+  provider: { id: string; name: string; providerKey: string; presetId: string | null };
   modelId: string;
   displayName: string;
   enabled: boolean;
@@ -438,6 +481,7 @@ export interface AgentModelReference {
   id: string;
   providerId: string;
   providerName: string;
+  providerKey: string;
   modelId: string;
   displayName: string;
 }
@@ -646,6 +690,20 @@ export interface AgentThreadInstanceResponse {
   closedAt: string | null;
 }
 
+export interface NativeSubagentSyncResponse {
+  capability: "SUPPORTED" | "UNAVAILABLE" | "INCOMPATIBLE";
+  sourcePath: string | null;
+  discoveredCount: number;
+  syncedCount: number;
+  unmappedCount: number;
+  message: string;
+}
+
+export interface AgentThreadInstanceListResponse {
+  items: AgentThreadInstanceResponse[];
+  sync: NativeSubagentSyncResponse;
+}
+
 export interface AgentThreadInstanceRecommendation {
   decision: "REUSE" | "SPAWN";
   reasonCode:
@@ -700,8 +758,8 @@ export function listUsageRecords(
 
 export function listAgentThreadInstances(
   request: { agentId?: string | null; limit?: number } = {},
-): Promise<AgentThreadInstanceResponse[]> {
-  return invoke<AgentThreadInstanceResponse[]>("agent_thread_instance_list", { request });
+): Promise<AgentThreadInstanceListResponse> {
+  return invoke<AgentThreadInstanceListResponse>("agent_thread_instance_list", { request });
 }
 
 export function setAgentThreadInstanceScope(
@@ -716,9 +774,10 @@ export function setAgentThreadInstanceScope(
 export function recommendAgentThreadInstance(
   agentId: string,
   scopeKey: string,
+  parentThreadId: string | null = null,
 ): Promise<AgentThreadInstanceRecommendation> {
   return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_recommend", {
-    request: { agentId, scopeKey },
+    request: { agentId, scopeKey, parentThreadId },
   });
 }
 

@@ -24,9 +24,9 @@ use configuration::{
     ConfigurationApplyPreview, ConfigurationApplyRequest, ConfigurationApplyResponse,
     ConfigurationService, ConfigurationStatus, ConfigurationStatusResponse, DiagnosticsResponse,
     DiagnosticsRunRequest, ProjectExclusionAddRequest, ProjectExclusionDeleteRequest,
-    ProjectExclusionResponse, RuntimeModeResponse, RuntimeModeSwitchRequest,
-    SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse,
-    SnapshotRestoreRequest, SnapshotRestoreResponse,
+    ProjectExclusionResponse, RuntimeModeConflictResolveRequest, RuntimeModeResponse,
+    RuntimeModeSwitchRequest, SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest,
+    SnapshotListResponse, SnapshotRestoreRequest, SnapshotRestoreResponse,
 };
 use model::{
     ModelAddRequest, ModelConnectionTestResponse, ModelDeleteRequest, ModelDetailResponse,
@@ -45,10 +45,10 @@ use runtime_bridge::{
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
-    AgentThreadExecutionRequest, AgentThreadInstanceListRequest,
+    AgentThreadExecutionRequest, AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
     AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
-    AgentThreadInstanceResponse, AgentThreadInstanceScopeRequest, UsageListRequest,
-    UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
+    AgentThreadInstanceResponse, AgentThreadInstanceScopeRequest, NativeSubagentSyncResponse,
+    UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
 };
 
 #[derive(Serialize)]
@@ -324,6 +324,16 @@ fn runtime_mode_switch(
 }
 
 #[tauri::command]
+fn runtime_mode_resolve_conflict(
+    state: tauri::State<'_, ConfigurationService>,
+    request: RuntimeModeConflictResolveRequest,
+) -> Result<ConfigurationApplyResponse, ApiError> {
+    state
+        .resolve_runtime_mode_conflict(request)
+        .map_err(ApiError::from)
+}
+
+#[tauri::command]
 fn project_exclusion_list(
     state: tauri::State<'_, ConfigurationService>,
 ) -> Result<Vec<ProjectExclusionResponse>, ApiError> {
@@ -399,9 +409,22 @@ fn usage_list_records(
 #[tauri::command]
 fn agent_thread_instance_list(
     state: tauri::State<'_, UsageService>,
+    configuration: tauri::State<'_, ConfigurationService>,
     request: AgentThreadInstanceListRequest,
-) -> Result<Vec<AgentThreadInstanceResponse>, ApiError> {
-    state.list_agent_instances(request)
+) -> Result<AgentThreadInstanceListResponse, ApiError> {
+    let sync = match configuration.environment() {
+        Ok(environment) => match environment.codex_home {
+            Some(codex_home) => state.sync_native_subagents(std::path::Path::new(&codex_home))?,
+            None => NativeSubagentSyncResponse::unavailable(
+                "无法定位 CODEX_HOME；尚不能同步 Primary 原生子 Agent。",
+            ),
+        },
+        Err(_) => NativeSubagentSyncResponse::unavailable(
+            "读取 Codex 环境失败；尚不能同步 Primary 原生子 Agent。",
+        ),
+    };
+    let items = state.list_agent_instances(request)?;
+    Ok(AgentThreadInstanceListResponse::new(items, sync))
 }
 
 #[tauri::command]
@@ -542,6 +565,7 @@ pub fn run() {
             configuration_apply,
             runtime_mode_get,
             runtime_mode_switch,
+            runtime_mode_resolve_conflict,
             project_exclusion_list,
             project_exclusion_add,
             project_exclusion_delete,

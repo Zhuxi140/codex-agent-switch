@@ -1,9 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use cas_scheduler::{
+    Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile,
+    normalize_scope_key as canonical_scope_key, recommend as schedule_instance,
+};
+#[cfg(test)]
+use cas_scheduler::{cache_hint, context_pressure_limit, effective_cache_retention};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -64,6 +73,77 @@ impl UsageService {
             .map_err(ApiError::from)
     }
 
+    pub(crate) fn sync_native_subagents(
+        &self,
+        codex_home: &Path,
+    ) -> Result<NativeSubagentSyncResponse, ApiError> {
+        let Some(state_path) = find_codex_state_database(codex_home) else {
+            return Ok(NativeSubagentSyncResponse::unavailable(
+                "未找到 Codex state_*.sqlite；尚不能同步 Primary 原生子 Agent。",
+            ));
+        };
+        let source_path = state_path.to_string_lossy().into_owned();
+        let source = match Connection::open_with_flags(
+            &state_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) {
+            Ok(source) => source,
+            Err(_) => {
+                return Ok(NativeSubagentSyncResponse::unavailable_with_path(
+                    source_path,
+                    "Codex 状态库当前不可读；稍后刷新可重试。",
+                ));
+            }
+        };
+        if !native_state_schema_supported(&source) {
+            return Ok(NativeSubagentSyncResponse::incompatible(
+                source_path,
+                "当前 Codex 状态库结构与 CAS 适配器不兼容；同步已安全停止。",
+            ));
+        }
+        let records = match load_native_subagent_records(&source, codex_home) {
+            Ok(records) => records,
+            Err(_) => {
+                return Ok(NativeSubagentSyncResponse::incompatible(
+                    source_path,
+                    "读取 Codex 原生子 Agent 数据失败；同步已安全停止。",
+                ));
+            }
+        };
+        let discovered_count = records.len();
+        let mut synced_count = 0;
+        let mut repository = self.repository()?;
+        let transaction = repository
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(UsageServiceError::from)?;
+        for record in records {
+            let Some((agent_id, agent_name, context_window)) =
+                resolve_native_agent(&transaction, &record).map_err(UsageServiceError::from)?
+            else {
+                continue;
+            };
+            upsert_native_agent_instance(
+                &transaction,
+                &record,
+                &agent_id,
+                &agent_name,
+                context_window,
+            )
+            .map_err(UsageServiceError::from)?;
+            synced_count += 1;
+        }
+        transaction.commit().map_err(UsageServiceError::from)?;
+        Ok(NativeSubagentSyncResponse {
+            capability: NativeSubagentSyncCapability::Supported,
+            source_path: Some(source_path),
+            discovered_count,
+            synced_count,
+            unmapped_count: discovered_count.saturating_sub(synced_count),
+            message: "已从 Codex 本地状态同步 Primary 原生子 Agent；当前只能可靠取得总 Token，Input / Cached / Output 明细仍以 Runtime Bridge 事件为准。".to_owned(),
+        })
+    }
+
     pub(crate) fn set_agent_instance_scope(
         &self,
         request: AgentThreadInstanceScopeRequest,
@@ -85,9 +165,15 @@ impl UsageService {
     ) -> Result<AgentThreadInstanceRecommendation, ApiError> {
         let agent_id = validate_runtime_key(&request.agent_id, "agentId")?;
         let scope_key = normalize_scope_key(&request.scope_key)?;
+        let parent_thread_id = request
+            .parent_thread_id
+            .as_deref()
+            .map(|value| validate_runtime_key(value, "parentThreadId"))
+            .transpose()?;
         let repository = self.repository()?;
         let profile = repository.scheduling_profile(&agent_id)?;
-        let candidates = repository.scope_candidates(&agent_id, &scope_key)?;
+        let candidates =
+            repository.scope_candidates(&agent_id, &scope_key, parent_thread_id.as_deref())?;
         Ok(recommend_instance(scope_key, candidates, profile))
     }
 
@@ -102,7 +188,7 @@ impl UsageService {
         }
         let repository = self.repository()?;
         let scheduling_profile = repository.scheduling_profile(&agent_id)?;
-        let candidates = repository.scope_candidates(&agent_id, &scope_key)?;
+        let candidates = repository.scope_candidates(&agent_id, &scope_key, None)?;
         let recommendation = recommend_instance(scope_key.clone(), candidates, scheduling_profile);
         if recommendation.decision != request.expected_decision
             || recommendation.candidate_thread_id != request.expected_candidate_thread_id
@@ -145,6 +231,14 @@ impl UsageService {
     ) -> Result<(), UsageServiceError> {
         self.repository()?
             .set_agent_execution_status(thread_id, "RECOVERY_REQUIRED")
+    }
+
+    pub(crate) fn mark_agent_execution_idle_if_known(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), UsageServiceError> {
+        self.repository()?
+            .set_agent_execution_status_if_known(thread_id, "IDLE")
     }
 
     pub(crate) fn upsert_snapshot(
@@ -238,6 +332,72 @@ pub(crate) struct AgentThreadInstanceListRequest {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum NativeSubagentSyncCapability {
+    Supported,
+    Unavailable,
+    Incompatible,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct NativeSubagentSyncResponse {
+    capability: NativeSubagentSyncCapability,
+    source_path: Option<String>,
+    discovered_count: usize,
+    synced_count: usize,
+    unmapped_count: usize,
+    message: String,
+}
+
+impl NativeSubagentSyncResponse {
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::unavailable_with_path(None::<String>, message)
+    }
+
+    fn unavailable_with_path(
+        source_path: impl Into<Option<String>>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            capability: NativeSubagentSyncCapability::Unavailable,
+            source_path: source_path.into(),
+            discovered_count: 0,
+            synced_count: 0,
+            unmapped_count: 0,
+            message: message.into(),
+        }
+    }
+
+    fn incompatible(source_path: String, message: impl Into<String>) -> Self {
+        Self {
+            capability: NativeSubagentSyncCapability::Incompatible,
+            source_path: Some(source_path),
+            discovered_count: 0,
+            synced_count: 0,
+            unmapped_count: 0,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadInstanceListResponse {
+    items: Vec<AgentThreadInstanceResponse>,
+    sync: NativeSubagentSyncResponse,
+}
+
+impl AgentThreadInstanceListResponse {
+    pub(crate) fn new(
+        items: Vec<AgentThreadInstanceResponse>,
+        sync: NativeSubagentSyncResponse,
+    ) -> Self {
+        Self { items, sync }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentThreadInstanceScopeRequest {
@@ -250,6 +410,7 @@ pub(crate) struct AgentThreadInstanceScopeRequest {
 pub(crate) struct AgentThreadInstanceRecommendRequest {
     agent_id: String,
     scope_key: String,
+    parent_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,7 +462,7 @@ pub(crate) struct AgentRuntimeProfile {
     pub(crate) sandbox_policy: String,
     pub(crate) reasoning_policy: String,
     pub(crate) model_slug: String,
-    pub(crate) provider_key: String,
+    pub(crate) model_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -322,33 +483,6 @@ pub(crate) struct AgentThreadInstanceResponse {
     created_at: String,
     last_used_at: String,
     closed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentThreadCandidate {
-    instance: AgentThreadInstanceResponse,
-    age_seconds: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AgentSchedulingProfile {
-    reuse_strategy: String,
-    cache_support: String,
-    cache_retention_type: String,
-    cache_retention_hint_seconds: Option<i64>,
-    agent_cache_retention_override_seconds: Option<i64>,
-}
-
-impl Default for AgentSchedulingProfile {
-    fn default() -> Self {
-        Self {
-            reuse_strategy: "AUTO".to_owned(),
-            cache_support: "UNKNOWN".to_owned(),
-            cache_retention_type: "UNKNOWN".to_owned(),
-            cache_retention_hint_seconds: None,
-            agent_cache_retention_override_seconds: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -758,6 +892,7 @@ impl SqliteUsageRepository {
         &self,
         agent_id: &str,
         scope_key: &str,
+        parent_thread_id: Option<&str>,
     ) -> Result<Vec<AgentThreadCandidate>, UsageRepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
@@ -768,13 +903,23 @@ impl SqliteUsageRepository {
                         0
                     )
              FROM agent_thread_instances
-             WHERE agent_id = ?1 AND scope_key = ?2
+             WHERE agent_id = ?1
+               AND scope_key = ?2
+               AND (?3 IS NULL OR parent_thread_id = ?3)
              ORDER BY last_used_at DESC, codex_thread_id ASC",
         )?;
         statement
-            .query_map(params![agent_id, scope_key], |row| {
+            .query_map(params![agent_id, scope_key, parent_thread_id], |row| {
+                let instance = map_agent_thread_instance(row)?;
                 Ok(AgentThreadCandidate {
-                    instance: map_agent_thread_instance(row)?,
+                    instance_id: instance.id,
+                    thread_id: instance.codex_thread_id,
+                    status: instance.status,
+                    input_tokens: instance.input_tokens,
+                    cached_input_tokens: instance.cached_input_tokens,
+                    output_tokens: instance.output_tokens,
+                    total_tokens: instance.total_tokens,
+                    context_window: instance.context_window,
                     age_seconds: row.get(15)?,
                 })
             })?
@@ -820,7 +965,7 @@ impl SqliteUsageRepository {
         self.connection
             .query_row(
                 "SELECT a.id, a.agent_key, a.name, a.instruction, a.sandbox_policy,
-                        a.reasoning_policy, m.model_id, p.provider_key
+                        a.reasoning_policy, m.model_id, p.provider_key, p.preset_id
                  FROM active_agent_bindings active
                  JOIN agents a ON a.id = active.agent_id AND a.enabled = 1
                  JOIN agent_model_bindings binding
@@ -830,6 +975,8 @@ impl SqliteUsageRepository {
                  WHERE a.id = ?1",
                 [agent_id],
                 |row| {
+                    let provider_key = row.get::<_, String>(7)?;
+                    let preset_id = row.get::<_, Option<String>>(8)?;
                     Ok(AgentRuntimeProfile {
                         agent_id: row.get(0)?,
                         agent_key: row.get(1)?,
@@ -838,7 +985,8 @@ impl SqliteUsageRepository {
                         sandbox_policy: row.get(4)?,
                         reasoning_policy: row.get(5)?,
                         model_slug: row.get(6)?,
-                        provider_key: row.get(7)?,
+                        model_provider: (preset_id.as_deref() != Some("codex-native"))
+                            .then(|| format!("cas_{provider_key}")),
                     })
                 },
             )
@@ -910,6 +1058,285 @@ impl SqliteUsageRepository {
         }
         Ok(())
     }
+
+    fn set_agent_execution_status_if_known(
+        &self,
+        thread_id: &str,
+        status: &str,
+    ) -> Result<(), UsageServiceError> {
+        self.connection.execute(
+            "UPDATE agent_thread_instances
+             SET status = ?2, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE codex_thread_id = ?1",
+            params![thread_id, status],
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct NativeSubagentRecord {
+    thread_id: String,
+    parent_thread_id: String,
+    agent_role: Option<String>,
+    model_provider: String,
+    model_slug: Option<String>,
+    status: &'static str,
+    total_tokens: i64,
+    scope_key: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+fn find_codex_state_database(codex_home: &Path) -> Option<PathBuf> {
+    fs::read_dir(codex_home)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?;
+            let version = name
+                .strip_prefix("state_")?
+                .strip_suffix(".sqlite")?
+                .parse::<u64>()
+                .ok()?;
+            path.is_file().then_some((version, path))
+        })
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, path)| path)
+}
+
+fn native_state_schema_supported(connection: &Connection) -> bool {
+    let required = [
+        (
+            "threads",
+            [
+                "id",
+                "agent_role",
+                "model_provider",
+                "model",
+                "tokens_used",
+                "cwd",
+                "created_at",
+                "updated_at",
+            ]
+            .as_slice(),
+        ),
+        (
+            "thread_spawn_edges",
+            ["parent_thread_id", "child_thread_id", "status"].as_slice(),
+        ),
+    ];
+    required.iter().all(|(table, required_columns)| {
+        table_columns(connection, table).is_ok_and(|columns| {
+            required_columns
+                .iter()
+                .all(|column| columns.contains(*column))
+        })
+    })
+}
+
+fn table_columns(
+    connection: &Connection,
+    table: &str,
+) -> Result<BTreeSet<String>, rusqlite::Error> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    statement
+        .query_map([], |row| row.get(1))?
+        .collect::<Result<BTreeSet<_>, _>>()
+}
+
+fn load_native_subagent_records(
+    connection: &Connection,
+    codex_home: &Path,
+) -> Result<Vec<NativeSubagentRecord>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT child.id, edge.parent_thread_id, child.agent_role,
+                child.model_provider, child.model, child.tokens_used, edge.status,
+                child.cwd,
+                strftime('%Y-%m-%dT%H:%M:%fZ', child.created_at, 'unixepoch'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', child.updated_at, 'unixepoch')
+         FROM thread_spawn_edges edge
+         JOIN threads child ON child.id = edge.child_thread_id
+         ORDER BY child.updated_at DESC",
+    )?;
+    statement
+        .query_map([], |row| {
+            let thread_id = row.get::<_, String>(0)?;
+            let edge_status = row.get::<_, String>(6)?;
+            let running = codex_home
+                .join("thread-writer-locks")
+                .join(format!("{thread_id}.lock"))
+                .is_file();
+            let status = if edge_status.eq_ignore_ascii_case("closed") {
+                "CLOSED"
+            } else if edge_status.eq_ignore_ascii_case("open") && running {
+                "RUNNING"
+            } else if edge_status.eq_ignore_ascii_case("open") {
+                "IDLE"
+            } else {
+                "UNKNOWN"
+            };
+            let cwd = row.get::<_, String>(7)?;
+            Ok(NativeSubagentRecord {
+                thread_id,
+                parent_thread_id: row.get(1)?,
+                agent_role: row.get(2)?,
+                model_provider: row.get(3)?,
+                model_slug: row.get(4)?,
+                status,
+                total_tokens: row.get::<_, i64>(5)?.max(0),
+                scope_key: normalize_native_scope(&cwd),
+                created_at: row.get(8)?,
+                updated_at: row.get(9)?,
+            })
+        })?
+        .collect()
+}
+
+fn normalize_native_scope(cwd: &str) -> Option<String> {
+    let cwd = cwd
+        .strip_prefix(r"\\?\")
+        .or_else(|| cwd.strip_prefix("//?/"))
+        .unwrap_or(cwd);
+    normalize_scope_key(cwd).ok()
+}
+
+fn resolve_native_agent(
+    transaction: &Transaction<'_>,
+    record: &NativeSubagentRecord,
+) -> Result<Option<(String, String, Option<i64>)>, rusqlite::Error> {
+    let mut statement = transaction.prepare(
+        "SELECT a.id, a.name, m.context_window,
+                CASE
+                    WHEN ?2 IS NOT NULL
+                         AND m.model_id = ?2
+                         AND (
+                            ?3 = 'cas_' || p.provider_key
+                            OR (
+                                p.preset_id = 'codex-native'
+                                AND ?3 IN ('openai', 'chatgpt')
+                            )
+                         ) THEN 0
+                    WHEN active.role_key = ?1 THEN 1
+                    WHEN a.agent_key = ?1 THEN 2
+                    ELSE 3
+                END AS match_priority
+         FROM agents a
+         JOIN agent_model_bindings binding
+           ON binding.agent_id = a.id AND binding.enabled = 1
+         JOIN models m ON m.id = binding.model_id AND m.enabled = 1
+         JOIN providers p ON p.id = m.provider_id AND p.enabled = 1
+         LEFT JOIN active_agent_bindings active ON active.agent_id = a.id
+         WHERE a.enabled = 1
+           AND (
+               (?1 IS NOT NULL AND (
+                    active.role_key = ?1
+                    OR a.agent_key = ?1
+                    OR a.role_key = ?1
+               ))
+            OR (
+                ?2 IS NOT NULL
+                AND m.model_id = ?2
+                AND (
+                    ?3 = 'cas_' || p.provider_key
+                    OR (
+                        p.preset_id = 'codex-native'
+                        AND ?3 IN ('openai', 'chatgpt')
+                    )
+                )
+            )
+           )
+         ORDER BY match_priority, a.id
+         LIMIT 2",
+    )?;
+    let matches = statement
+        .query_map(
+            params![
+                record.agent_role.as_deref(),
+                record.model_slug.as_deref(),
+                record.model_provider
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(first) = matches.first() else {
+        return Ok(None);
+    };
+    if matches
+        .get(1)
+        .is_some_and(|second| second.3 == first.3 && second.0 != first.0)
+    {
+        return Ok(None);
+    }
+    Ok(Some((first.0.clone(), first.1.clone(), first.2)))
+}
+
+fn upsert_native_agent_instance(
+    transaction: &Transaction<'_>,
+    record: &NativeSubagentRecord,
+    agent_id: &str,
+    agent_name: &str,
+    context_window: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    transaction.execute(
+        "INSERT INTO agent_thread_instances (
+            id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
+            scope_key, status, input_tokens, cached_input_tokens, output_tokens,
+            total_tokens, context_window, created_at, last_used_at, closed_at
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, ?8, ?9, ?10, ?11,
+            CASE WHEN ?7 = 'CLOSED' THEN ?11 ELSE NULL END
+         )
+         ON CONFLICT(codex_thread_id) DO UPDATE SET
+            agent_id = excluded.agent_id,
+            agent_name_snapshot = excluded.agent_name_snapshot,
+            parent_thread_id = excluded.parent_thread_id,
+            scope_key = COALESCE(agent_thread_instances.scope_key, excluded.scope_key),
+            status = excluded.status,
+            total_tokens = MAX(agent_thread_instances.total_tokens, excluded.total_tokens),
+            context_window = COALESCE(agent_thread_instances.context_window, excluded.context_window),
+            created_at = MIN(agent_thread_instances.created_at, excluded.created_at),
+            last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at),
+            closed_at = excluded.closed_at
+         WHERE agent_thread_instances.agent_id IS NOT excluded.agent_id
+            OR agent_thread_instances.agent_name_snapshot IS NOT excluded.agent_name_snapshot
+            OR agent_thread_instances.parent_thread_id IS NOT excluded.parent_thread_id
+            OR (
+                agent_thread_instances.scope_key IS NULL
+                AND excluded.scope_key IS NOT NULL
+            )
+            OR agent_thread_instances.status IS NOT excluded.status
+            OR excluded.total_tokens > agent_thread_instances.total_tokens
+            OR (
+                agent_thread_instances.context_window IS NULL
+                AND excluded.context_window IS NOT NULL
+            )
+            OR excluded.created_at < agent_thread_instances.created_at
+            OR excluded.last_used_at > agent_thread_instances.last_used_at
+            OR agent_thread_instances.closed_at IS NOT excluded.closed_at",
+        params![
+            format!("native-{}", record.thread_id),
+            agent_id,
+            agent_name,
+            record.thread_id,
+            record.parent_thread_id,
+            record.scope_key.as_deref(),
+            record.status,
+            record.total_tokens,
+            context_window,
+            record.created_at,
+            record.updated_at,
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_usage_attribution(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageAttribution> {
@@ -1249,24 +1676,7 @@ fn validate_runtime_key(value: &str, field: &'static str) -> Result<String, Usag
 }
 
 fn normalize_scope_key(value: &str) -> Result<String, UsageServiceError> {
-    let value = value.trim().replace('\\', "/").to_ascii_lowercase();
-    let valid = !value.is_empty()
-        && value.len() <= 200
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':')
-        })
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && value
-            .bytes()
-            .last()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && !value.contains("//");
-    valid
-        .then_some(value)
-        .ok_or(UsageServiceError::InvalidField("scopeKey"))
+    canonical_scope_key(value).ok_or(UsageServiceError::InvalidField("scopeKey"))
 }
 
 fn recommend_instance(
@@ -1274,155 +1684,24 @@ fn recommend_instance(
     candidates: Vec<AgentThreadCandidate>,
     profile: AgentSchedulingProfile,
 ) -> AgentThreadInstanceRecommendation {
-    if let Some(candidate) = candidates.iter().find(|candidate| {
-        candidate.instance.status == "IDLE"
-            && context_pressure_percent(&candidate.instance).map_or(true, |percent| {
-                percent < context_pressure_limit(&profile, candidate.age_seconds)
-            })
-    }) {
-        return recommendation(
-            "REUSE",
-            "EXACT_SCOPE_IDLE",
-            "存在同一 Agent、Scope 完全一致且符合当前复用偏好的空闲 Thread。",
-            scope_key,
-            Some(candidate),
-            &profile,
-        );
-    }
-    if let Some(candidate) = candidates
-        .iter()
-        .find(|candidate| candidate.instance.status == "IDLE")
-    {
-        let base_limit = base_context_pressure_limit(&profile.reuse_strategy);
-        let limit = context_pressure_limit(&profile, candidate.age_seconds);
-        let pressure = context_pressure_percent(&candidate.instance);
-        let cache_adjusted = limit < base_limit && pressure.is_some_and(|value| value < base_limit);
-        return recommendation(
-            "SPAWN",
-            if cache_adjusted {
-                "CACHE_HINT_PRESSURE"
-            } else {
-                "CONTEXT_PRESSURE"
-            },
-            if cache_adjusted {
-                "Provider 缓存提示已降低复用倾向，当前 Context 压力建议新建 Thread。"
-            } else {
-                "同 Scope 的空闲 Thread 累计输入已达到当前策略阈值，建议新建。"
-            },
-            scope_key,
-            Some(candidate),
-            &profile,
-        );
-    }
-    if let Some(candidate) = candidates.first() {
-        return recommendation(
-            "SPAWN",
-            "NO_HEALTHY_IDLE_THREAD",
-            "同 Scope Thread 当前不可安全复用，建议新建。",
-            scope_key,
-            Some(candidate),
-            &profile,
-        );
-    }
-    recommendation(
-        "SPAWN",
-        "NO_SCOPE_MATCH",
-        "没有同一 Agent 且 Scope 完全一致的 Thread，建议新建。",
-        scope_key,
-        None,
-        &profile,
-    )
-}
-
-fn recommendation(
-    decision: &'static str,
-    reason_code: &'static str,
-    message: &'static str,
-    scope_key: String,
-    candidate: Option<&AgentThreadCandidate>,
-    profile: &AgentSchedulingProfile,
-) -> AgentThreadInstanceRecommendation {
-    let age_seconds = candidate.map(|candidate| candidate.age_seconds);
-    let (cache_retention_hint_seconds, cache_retention_source) = effective_cache_retention(profile);
+    let recommendation = schedule_instance(scope_key, candidates, profile);
     AgentThreadInstanceRecommendation {
-        decision,
-        reason_code,
-        message,
-        scope_key,
-        candidate_instance_id: candidate.map(|candidate| candidate.instance.id.clone()),
-        candidate_thread_id: candidate.map(|candidate| candidate.instance.codex_thread_id.clone()),
-        context_pressure_percent: candidate
-            .and_then(|candidate| context_pressure_percent(&candidate.instance)),
-        context_pressure_limit_percent: context_pressure_limit(
-            profile,
-            age_seconds.unwrap_or_default(),
-        ),
-        reuse_strategy: profile.reuse_strategy.clone(),
-        cache_support: profile.cache_support.clone(),
-        cache_retention_type: profile.cache_retention_type.clone(),
-        cache_retention_hint_seconds,
-        cache_retention_source,
-        cache_hint: cache_hint(profile, age_seconds),
-        candidate_age_seconds: age_seconds,
+        decision: recommendation.decision,
+        reason_code: recommendation.reason_code,
+        message: recommendation.message,
+        scope_key: recommendation.scope_key,
+        candidate_instance_id: recommendation.candidate_instance_id,
+        candidate_thread_id: recommendation.candidate_thread_id,
+        context_pressure_percent: recommendation.context_pressure_percent,
+        context_pressure_limit_percent: recommendation.context_pressure_limit_percent,
+        reuse_strategy: recommendation.reuse_strategy,
+        cache_support: recommendation.cache_support,
+        cache_retention_type: recommendation.cache_retention_type,
+        cache_retention_hint_seconds: recommendation.cache_retention_hint_seconds,
+        cache_retention_source: recommendation.cache_retention_source,
+        cache_hint: recommendation.cache_hint,
+        candidate_age_seconds: recommendation.candidate_age_seconds,
     }
-}
-
-fn base_context_pressure_limit(strategy: &str) -> i64 {
-    match strategy {
-        "HOT" => 90,
-        "COLD" => 60,
-        _ => 80,
-    }
-}
-
-fn context_pressure_limit(profile: &AgentSchedulingProfile, age_seconds: i64) -> i64 {
-    let base = base_context_pressure_limit(&profile.reuse_strategy);
-    if profile.reuse_strategy == "HOT" {
-        return base;
-    }
-    let (retention, _) = effective_cache_retention(profile);
-    let cache_penalty = profile.cache_support == "UNSUPPORTED"
-        || retention.is_some_and(|retention| age_seconds > retention);
-    if cache_penalty { base - 10 } else { base }
-}
-
-fn cache_hint(profile: &AgentSchedulingProfile, age_seconds: Option<i64>) -> &'static str {
-    if profile.cache_support == "UNSUPPORTED" {
-        return "UNSUPPORTED";
-    }
-    match (effective_cache_retention(profile).0, age_seconds) {
-        (Some(retention), Some(age)) if age <= retention => "WITHIN_RETENTION_HINT",
-        (Some(_), Some(_)) => "OUTSIDE_RETENTION_HINT",
-        (None, _) if profile.cache_support == "SUPPORTED" => "SUPPORTED_NO_RETENTION_HINT",
-        _ => "UNKNOWN",
-    }
-}
-
-fn effective_cache_retention(profile: &AgentSchedulingProfile) -> (Option<i64>, &'static str) {
-    if profile.cache_support == "UNSUPPORTED" {
-        return (None, "PROVIDER");
-    }
-    match (
-        profile.agent_cache_retention_override_seconds,
-        profile.cache_retention_hint_seconds,
-    ) {
-        (Some(agent), Some(provider)) if agent <= provider => (Some(agent), "AGENT_OVERRIDE"),
-        (Some(_), Some(provider)) => (Some(provider), "PROVIDER"),
-        (Some(agent), None) => (Some(agent), "AGENT_OVERRIDE"),
-        (None, Some(provider)) => (Some(provider), "PROVIDER"),
-        (None, None) => (None, "NONE"),
-    }
-}
-
-fn context_pressure_percent(instance: &AgentThreadInstanceResponse) -> Option<i64> {
-    instance.context_window.map(|window| {
-        instance
-            .input_tokens
-            .saturating_mul(100)
-            .checked_div(window)
-            .unwrap_or(100)
-            .clamp(0, 100)
-    })
 }
 
 impl From<UsageServiceError> for ApiError {
@@ -1559,6 +1838,110 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_subagent_state_sync_maps_primary_child_and_total_tokens() {
+        let root =
+            std::env::temp_dir().join(format!("cas-native-subagent-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source_path = root.join("state_7.sqlite");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    agent_role TEXT,
+                    model_provider TEXT NOT NULL,
+                    model TEXT,
+                    tokens_used INTEGER NOT NULL,
+                    cwd TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO threads (
+                    id, agent_role, model_provider, model, tokens_used, cwd,
+                    created_at, updated_at
+                 ) VALUES (
+                    'thread-child-native', 'executor', 'cas_deepseek',
+                    'deepseek-v4-flash', 12345, ?1, 1786600000, 1786600300
+                 )",
+                [r"\\?\C:\workspace\project"],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO thread_spawn_edges (
+                    parent_thread_id, child_thread_id, status
+                 ) VALUES ('thread-primary', 'thread-child-native', 'open')",
+                [],
+            )
+            .unwrap();
+        drop(source);
+
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        let sync = service.sync_native_subagents(&root).unwrap();
+        assert_eq!(sync.capability, NativeSubagentSyncCapability::Supported);
+        assert_eq!(sync.discovered_count, 1);
+        assert_eq!(sync.synced_count, 1);
+        assert_eq!(sync.unmapped_count, 0);
+
+        let instances = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap();
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].codex_thread_id, "thread-child-native");
+        assert_eq!(
+            instances[0].parent_thread_id.as_deref(),
+            Some("thread-primary")
+        );
+        assert_eq!(instances[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(instances[0].status, "IDLE");
+        assert_eq!(instances[0].total_tokens, 12345);
+        assert_eq!(instances[0].context_window, Some(1_000_000));
+        assert_eq!(
+            instances[0].scope_key.as_deref(),
+            Some("c:/workspace/project")
+        );
+        let second_sync = service.sync_native_subagents(&root).unwrap();
+        assert_eq!(second_sync.synced_count, 1);
+        assert_eq!(
+            service
+                .list_agent_instances(AgentThreadInstanceListRequest::default())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_subagent_sync_stops_on_unknown_state_schema() {
+        let root = std::env::temp_dir().join(format!("cas-native-schema-sync-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = Connection::open(root.join("state_99.sqlite")).unwrap();
+        source
+            .execute("CREATE TABLE threads (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        drop(source);
+
+        let service = UsageService::in_memory();
+        let sync = service.sync_native_subagents(&root).unwrap();
+        assert_eq!(sync.capability, NativeSubagentSyncCapability::Incompatible);
+        assert_eq!(sync.synced_count, 0);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cumulative_snapshots_are_idempotent_and_ignore_rollbacks() {
         let service = UsageService::in_memory();
 
@@ -1634,6 +2017,7 @@ mod tests {
             .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
                 agent_id: "agent-1".to_owned(),
                 scope_key: "order/refund".to_owned(),
+                parent_thread_id: None,
             })
             .unwrap();
         assert_eq!(reuse.decision, "REUSE");
@@ -1641,10 +2025,21 @@ mod tests {
         assert_eq!(reuse.reuse_strategy, "AUTO");
         assert_eq!(reuse.context_pressure_limit_percent, 80);
 
+        let other_primary = service
+            .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                scope_key: "order/refund".to_owned(),
+                parent_thread_id: Some("thread-root-other".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(other_primary.decision, "SPAWN");
+        assert_eq!(other_primary.reason_code, "NO_SCOPE_MATCH");
+
         let spawn = service
             .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
                 agent_id: "agent-1".to_owned(),
                 scope_key: "auth/oauth2".to_owned(),
+                parent_thread_id: None,
             })
             .unwrap();
         assert_eq!(spawn.decision, "SPAWN");
@@ -1693,6 +2088,7 @@ mod tests {
             .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
                 agent_id: "agent-1".to_owned(),
                 scope_key: "order/refund".to_owned(),
+                parent_thread_id: None,
             })
             .unwrap();
         assert_eq!(decision.decision, "SPAWN");
@@ -1770,6 +2166,67 @@ mod tests {
             service.upsert_snapshot(conflicting),
             Err(UsageServiceError::ThreadIdentityConflict)
         ));
+    }
+
+    fn seed_agent(service: &UsageService) {
+        let repository = service.repository().unwrap();
+        let timestamp = "2026-08-11T10:00:00Z";
+        repository
+            .connection
+            .execute(
+                "INSERT INTO providers (
+                    id, provider_key, name, provider_type, base_url, protocol, auth_type,
+                    enabled, source, created_at, updated_at
+                 ) VALUES (
+                    'provider-deepseek', 'deepseek', 'DeepSeek', 'PRESET',
+                    'https://api.deepseek.com/', 'RESPONSES', 'BEARER_TOKEN',
+                    1, 'BUILT_IN', ?1, ?1
+                 )",
+                [timestamp],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO models (
+                    id, provider_id, model_id, display_name, enabled, source,
+                    lifecycle, compatibility_level, compatibility_source, context_window,
+                    created_at, updated_at
+                 ) VALUES (
+                    'model-deepseek-v4-flash', 'provider-deepseek', 'deepseek-v4-flash',
+                    'DeepSeek V4 Flash', 1, 'PRESET', 'ACTIVE', 'NATIVE',
+                    'CAS_BUILT_IN', 1000000, ?1, ?1
+                 )",
+                [timestamp],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, role_key,
+                    orchestration_phase, created_at, updated_at
+                 ) VALUES (
+                    'agent-1', 'executor', 'Executor', '执行任务', '执行任务。',
+                    'PRESET', 1, 'WORKSPACE_WRITE', 'HIGH', 'CAS', 1,
+                    'executor', 'EXECUTION', ?1, ?1
+                 )",
+                [timestamp],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO agent_model_bindings (
+                    id, agent_id, model_id, enabled, priority, source, created_at, updated_at
+                 ) VALUES (
+                    'binding-1', 'agent-1', 'model-deepseek-v4-flash',
+                    1, 0, 'CAS', ?1, ?1
+                 )",
+                [timestamp],
+            )
+            .unwrap();
     }
 
     fn snapshot(total_tokens: i64, status: &str) -> UsageSnapshot {

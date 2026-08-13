@@ -174,7 +174,7 @@ pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
                 dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
                 ..Default::default()
             };
-            let mut found = false;
+            let mut process_start_times = Vec::new();
             let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
             while has_entry {
                 if is_codex_process_name(&entry.szExeFile) {
@@ -192,20 +192,16 @@ pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
                             &mut kernel,
                             &mut user,
                         ) != 0
-                            && filetime_to_unix_ms(created) < last_applied_at_ms
                         {
-                            found = true;
+                            process_start_times.push(filetime_to_unix_ms(created));
                         }
                         CloseHandle(process);
                     }
                 }
-                if found {
-                    break;
-                }
                 has_entry = Process32NextW(snapshot, &mut entry) != 0;
             }
             CloseHandle(snapshot);
-            found
+            restart_required_for_process_start_times(last_applied_at_ms, process_start_times)
         }
     }
     #[cfg(not(windows))]
@@ -213,6 +209,20 @@ pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
         let _ = last_applied_at_ms;
         false
     }
+}
+
+fn restart_required_for_process_start_times(
+    last_applied_at_ms: i64,
+    process_start_times: impl IntoIterator<Item = i64>,
+) -> bool {
+    let mut found_process = false;
+    for process_start_time in process_start_times {
+        found_process = true;
+        if process_start_time >= last_applied_at_ms {
+            return false;
+        }
+    }
+    found_process
 }
 
 pub(crate) fn detect_runtime_permission_overrides() -> Result<Vec<RuntimePermissionOverride>, String>
@@ -567,6 +577,29 @@ mod tests {
     fn compares_multi_agent_baseline() {
         assert!(parse_client_version("0.144.0").unwrap() >= MINIMUM_MULTI_AGENT_VERSION);
         assert!(parse_client_version("0.143.9").unwrap() < MINIMUM_MULTI_AGENT_VERSION);
+    }
+
+    #[test]
+    fn restart_is_not_required_without_codex_processes() {
+        assert!(!restart_required_for_process_start_times(
+            100,
+            std::iter::empty(),
+        ));
+    }
+
+    #[test]
+    fn restart_is_required_when_all_codex_processes_precede_sync() {
+        assert!(restart_required_for_process_start_times(100, [99]));
+    }
+
+    #[test]
+    fn restart_is_not_required_when_a_codex_process_started_after_sync() {
+        assert!(!restart_required_for_process_start_times(100, [101]));
+    }
+
+    #[test]
+    fn restart_is_not_required_when_old_and_new_codex_processes_coexist() {
+        assert!(!restart_required_for_process_start_times(100, [99, 101]));
     }
 
     #[test]

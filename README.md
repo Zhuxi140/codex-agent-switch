@@ -1,268 +1,73 @@
-# Codex Agent Switch（CAS）
-
-### 让旗舰模型负责思考，让高性价比模型负责执行
+# Codex Agent Switch (CAS)
 
 <p align="center">
-  <a href="https://img.shields.io/badge/版本-0.2.0-blue"><img src="https://img.shields.io/badge/版本-0.2.0-blue" alt="版本 0.2.0"></a>
+  <a href="https://img.shields.io/badge/版本-0.3.0-blue"><img src="https://img.shields.io/badge/版本-0.3.0-blue" alt="版本 0.3.0"></a>
   <a href="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6" alt="平台 Windows 10/11"></a>
   <a href="https://img.shields.io/badge/License-MIT-yellow"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License MIT"></a>
   <a href="https://github.com/Zhuxi140/codex-agent-switch/actions"><img src="https://img.shields.io/github/actions/workflow/status/Zhuxi140/codex-agent-switch/ci.yml?label=CI" alt="CI"></a>
-  <a href="https://img.shields.io/badge/Codex%20CLI-%E2%89%A5%200.144.0-green"><img src="https://img.shields.io/badge/Codex%20CLI-%E2%89%A5%200.144.0-green" alt="Codex CLI ≥ 0.144.0"></a>
 </p>
 
-<p align="center">
-  <strong>
-    🧠 <a href="#核心理念">核心理念</a> ·
-    🚀 <a href="#快速开始">快速开始</a> ·
-    📋 <a href="#核心功能">核心功能</a> ·
-    ⚙️ <a href="#工作原理">工作原理</a> ·
-    🔒 <a href="#安全模型">安全模型</a> ·
-    🗺️ <a href="#roadmap-与当前进度">Roadmap</a>
-  </strong>
-</p>
+CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
-一个 Tauri 2 桌面工具：在 GUI 中管理 Codex 多 Agent 的 Provider / Model / 绑定、编排、调度与 Token 监控——**不手改 Codex 配置**。
+## v0.3.0 快速开始
 
-> **Codex Agent Switch (CAS)** is a Tauri desktop app for the Codex CLI ecosystem. It manages Provider / Model / Agent bindings, orchestrates sub-agents by role, and monitors token usage through the official `codex app-server` interface — no hand-edited TOML. The philosophy: a flagship model plans and reviews, budget models execute and test, for a better outcome at a better price.
+1. 从 GitHub Release 下载 `Codex Agent Switch_0.3.0_x64-setup.exe` 并运行安装。
+2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
+3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
+4. 在 Models 与 Agents 页面绑定模型，并在运行模式中启用编排配置；Preview 后 Apply。
+5. 在用量页面同步原生子 Agent Thread，查看状态和 Token 统计。
 
-<div style="border: 2px solid #d93025; border-left: 6px solid #d93025; background: #fdf0ef; border-radius: 8px; padding: 12px 16px; margin: 16px 0 24px;">
+安装包当前未进行代码签名；Windows SmartScreen 可能显示警告，请按组织安全策略核验 Release 的 SHA-256。
 
-<strong>⚠️ 当前并不推荐安装使用。</strong><br><br>
+## 多 Agent 编排
 
-v0.2.0 是第一个可用的发布版本：大部分核心功能已实现，但仍有<strong>诸多 Bug 与不完善之处</strong>，且<strong>尚未完全通过测试</strong>。<br><br>
+CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等 Role/Phase。编排模式下每种 Role 只能启用一个 Agent，避免职责和模型绑定发生歧义。Primary 负责读取、规划、审查和收束；所有实现命令与文件写入必须委派给 Execution Agent。
 
-第二个发布版本正在打磨中，将更加完善与优秀。欢迎尝鲜体验，但请知悉当前状态并谨慎使用。
+失败策略可选：
 
-</div>
+- **Strict Stop**：缺少对应 Agent、委派失败或结果不可验证时立即停止并报告，不静默接管。
+- **Primary Fallback**：明确提示后允许 Primary 接管失败任务，并保留回退原因。
 
----
+项目可被排除在 CAS 编排之外；项目级配置与全局配置冲突时，CAS 会检测冲突并要求查看后中止或显式重新 Apply，而不会覆盖外部修改。
 
-## 核心理念
+## 调度与 Thread 复用
 
-我们不追求打造一支「全面、专业、强大」的子 Agent 团队。我们相信，效果与成本的最优解来自**脑力与体力的分工**：
+每次独立任务在委派前由 `cas-helper schedule <agent-key>` 预检，输出唯一的 `CAS1|SPAWN|...` 或 `CAS1|REUSE|...` 决策。`SPAWN` 创建新原生子 Agent Thread；`REUSE` 将完整任务交给既有 Thread。
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  主 Agent（旗舰高智商模型，如 ChatGPT 5.6 Sol）                │
-│  ── 编排 · 规划 · 审查 · 收束                                 │
-│  「想清楚怎么做，并判断做得对不对」                             │
-└────────────────────────────────┬────────────────────────────┘
-                                 │ 委派（Discovery → Execution → Verification → Review）
-            ┌────────────────────┴────────────────────┐
-            │              子 Agent 团队               │
-            │  轻量 · 可定制 · 按需启用                  │
-            │  ── 执行 · 测试 · 探索 · 细节审查          │
-            │  每个角色独立绑定高性价比模型               │
-            │  「把活干完，把量跑满」                    │
-            └─────────────────────────────────────────┘
-```
+复用是一个客观判定：**同一 Agent、同一 Primary、Exact Scope、IDLE 状态且上下文健康**。调度器还结合 Agent 的 `AUTO` / `HOT` / `COLD` 策略、Provider 的缓存能力和缓存保留提示，避免复用上下文压力过高或已超出缓存窗口的 Thread。
 
-**价值主张：**
+成功的子 Agent Thread 会保留并同步为 `IDLE`，不得自动调用 `close_agent`；仅在用户明确要求、Agent 被停用或移除、Thread 异常不可用，或 CAS 判定不再可复用时才允许关闭。
 
-- **轻量、可定制**：子 Agent 是薄薄一层「角色 + 职责 + 模型绑定」，不用堆砌全能 Agent，按需创建、随时调整
-- **主脑做精，手脚做量**：把编排、规划、审查交给旗舰模型（贵，但决定成败）；把执行、测试、探索交给高性价比模型（便宜，但量大管饱）
-- **编排、调度、缓存三位一体**：多 Agent 按阶段自动委派；Thread 复用决策（Reuse / Spawn）避免重复烧钱；Provider 缓存能力建模为后续调度留底
-- **结果**：以更合理的价格，实现更好的效果
+## Provider、Model 与用量
 
-一句话：**用旗舰模型的判断力，配上高性价比模型的执行力。**
+- **Codex Native**：可将当前 Codex 登录中的原生 Provider/Model 绑定为子 Agent，包括 gpt-5.6 Terra 等可用模型。
+- **第三方 Provider**：支持 Responses API Provider、模型发现和能力校验；凭据不写入 Codex 配置文件。
+- **原生 Thread 同步**：同步子 Agent Thread 及其生命周期状态，便于确认运行、完成和空闲状态。
+- **Token 监控**：采集输入、缓存输入、输出、推理输出与总 Token；CAS 只统计 Token，不计算或展示费用，也不保存 Prompt、Response 正文或 API Key。
+- **重启提示**：配置同步后，只要检测到新的 Codex 实例，红色重启提示即可自动清除。
 
----
+## 配置与安全
 
-## 效率对比（待实测）
+配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。
 
-> 以下数据均为**占位，尚未完成真实基准测试**。测试计划：对同一任务，分别用「纯旗舰模型单 Agent」与「CAS 主脑 + 高性价比子 Agent 团队」各跑若干轮，取平均值回填下表。
+## 开发验证
 
-| 指标 | 不用 CAS（纯旗舰单 Agent） | 用 CAS（主脑 + 子 Agent 团队） |
-|---|---|---|
-| 任务总 Token 消耗 | 待测试 | 待测试 |
-| 总费用（价格） | 待测试 | 待测试 |
-| 单任务耗时 | 待测试 | 待测试 |
-| 产出 / 投入比 | 基准 1.0 | 待测试 |
-| 性价比 | 基准 1.0 | 待测试 |
-
-预期方向（待实测验证）：子 Agent 承担的大批量执行消耗由高性价比模型吃掉，总费用显著下降；主 Agent 专注规划与审查，产出质量不降反升。
-
----
-
-## 推荐方案
-
-「旗舰主脑 + 高性价比子 Agent」的现成组合，在 CAS 中一键落地（运行模式 → 编排化 Subagent → 为各角色绑定模型）：
-
-| 方案 | 主 Agent（规划 / 编排 / 审查） | 子 Agent（执行 / 测试 / 探索） | 适用场景 |
-|---|---|---|---|
-| 方案一 | ChatGPT 5.6 Sol | DeepSeek V4 Flash（正式版） | 日常开发主力，性价比优先 |
-| 方案二 | ChatGPT 5.6 Sol | DeepSeek V4 Pro（即将上线） | 需要更强子 Agent 执行质量 |
-| 方案三 | ChatGPT 5.6 Sol | ChatGPT 5.6 Terra / Luan | 同一模型生态内搭配，切换无缝 |
-
-子 Agent 内部仍可分级：Executor / Explorer 用高性价比模型跑量，Reviewer 可上调一档换更强模型——所有角色绑定都可在 GUI 中随时调整。
-
----
-
-## 为什么需要它
-
-Codex 支持多 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但配置全部手写 TOML，常见痛点：
-
-| 痛点 | CAS 的解法 |
-|---|---|
-| 手写 `config.toml` 和 `agents/*.toml`，容易出错 | 表单化管理，Apply 前有 Preview |
-| Agent 和模型绑定过死，换模型要改多个文件 | Agent 与 Model 解耦，绑定关系在 GUI 中维护 |
-| 整套 Agent Team 无法整体切换 | 运行模式一键切换（编排化 Subagent） |
-| 难以判断配置是否真的可用 | 内置 Diagnostics、Provider 连通性测试、模型能力校验 |
-| 手工改配置可能破坏已有内容 | 全量备份 + Snapshot + Apply 后校验 + 失败自动回滚 |
-| 看不出子 Agent 花了多少 Token、复用还是重建 | Token 监控 + 子 Agent 实例追踪 + Reuse 决策预览 |
-
----
-
-## 快速开始
-
-1. **安装**：运行发布产物中的 `Codex Agent Switch_0.2.0_x64-setup.exe`，按向导安装（默认当前用户，无需管理员权限）
-2. **环境检测**：首次启动后进入设置页，确认 Codex 可执行文件与 `CODEX_HOME` 已正确解析（Store 版需将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`）
-3. **创建 Provider**：Provider 管理页添加服务商，填入 API Key（明文只进 Windows 凭据管理器，不落盘）
-4. **绑定 Agent**：在 Agents 页为各角色选择模型，用「运行模式」一键切换 Default ↔ 编排化 Subagent
-5. **应用配置**：Preview → Apply，确认变更清单后应用；出问题可随时从 Snapshot 恢复
-
-想观察效果：用量监控页开启 Token 监控，运行一次 Codex 任务，即可看到各子 Agent Thread 的 Token 消耗与 Reuse 决策。
-
----
-
-## 核心功能
-
-### 配置管理（V0.1 P0，已发布）
-
-| 模块 | 能力 |
-|---|---|
-| **Provider 管理** | 创建 / 编辑 / 禁用 / 删除；官方 Preset；API Key 走 `cas-helper` 凭据链，不落盘到 Codex 配置；连通性测试 |
-| **Model 管理** | 随 Provider 自动发现或手动添加；`responses` / `chat` wire API；能力校验；启用/禁用 |
-| **Agent 管理** | 内置模板（Executor / Explorer / Reviewer / Tester）与自定义 Agent；模型绑定；Role Key + Phase 编排元数据 |
-| **配置应用** | Preview → Apply 两段式；Apply 后回读校验；失败自动回滚；冲突检测；Snapshot 列表 / 详情 / 恢复 |
-| **诊断服务** | 只读检查 Codex 环境、配置可读可写性、Agent 就绪度 |
-
-### 多 Agent 编排（阶段一~四，已发布）
-
-- **运行模式**：Default（Codex 全权）↔ 编排化 Subagent（按 Role 启用多个 CAS 管理子 Agent）；切换自动建 Snapshot、失败回滚；项目排除
-- **Strict Stop 编排**：Primary 只读，Discovery → Execution → Verification → Review 分阶段职责；Executor 缺失或委派失败即停止并报告，严禁静默兜底
-- **Primary Fallback**：设置页可选失败策略；子 Agent 委派失败后 Primary 先显式警告用户，再接管同一任务，结果须记录回退原因；附运行时权限覆盖检测与配套 Diagnostics
-
-### 用量与调度（0.2.0，已发布）
-
-- **Token 用量监控**：CAS 托管启动 `codex app-server`，实时采集 `thread/tokenUsage/updated` 事件，自动归因到子 Agent 与 Model；状态 `LIVE / FINAL / PARTIAL / UNKNOWN` 全程可见
-- **子 Agent 实例**：Agent Definition 与 Thread 实例分离，Scope 标记、实例列表、状态追踪
-- **Reuse 决策**：提交任务前预览「复用既有 Thread / 新建 Thread」决策；显式托管执行（REUSE 走 `thread/resume`，SPAWN 走 `thread/start`）
-- **缓存信息模型**：Provider Cache Profile（`retentionType`: UNKNOWN / APPROXIMATE / GUARANTEED）与 Agent `reuse_strategy`（AUTO / HOT / COLD）已入数据层，为调度评分预留
-
-> **注意**：托管执行会产生真实模型调用与费用，执行前 UI 有显式确认。、
-
----
-
-## 工作原理
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  React + TypeScript 前端（Vite）                              │
-│  Overview / 用量监控 / Agents / Providers / Models / 诊断…   │
-│  └─ 通过 @tauri-apps/api 调用 IPC command                    │
-├─────────────────────────────────────────────────────────────┤
-│  Tauri 2 主进程（Rust，crate: codex-agent-switch）            │
-│  ├─ Provider / Model / Agent / Configuration 服务层          │
-│  ├─ UsageService（Token 幂等入库、调度画像、Reuse 决策）        │
-│  ├─ RuntimeBridgeService（托管 codex app-server 子进程）      │
-│  ├─ SQLite 持久化（cas.db，rusqlite bundled）                │
-│  └─ 写 Codex 配置时调用 cas-helper（同目录 exe）              │
-├─────────────────────────────────────────────────────────────┤
-│  cas-helper（Rust，独立 crate）                               │
-│  │  只做一件事：凭据存取（Windows 凭据管理器）                 │
-│  │  协议：命令 + JSON，退出码 0/2/3/4/5/6                     │
-│  └─ 被 Codex 以 auth.command 方式调用，返回 API Key           │
-└─────────────────────────────────────────────────────────────┘
-
-监控开启时（可选）：
-  主进程 ──spawn──► codex app-server（--listen stdio://，JSON-RPC）
-                        ├─ thread/start · thread/resume · turn/start（托管执行）
-                        └─ thread/tokenUsage/updated 事件回流 → UsageService 幂等入库
+```powershell
+cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
+cargo test --manifest-path src-tauri/Cargo.toml
+npm.cmd run build
+git diff --check
+npm.cmd run bundle:windows
 ```
 
-**核心链路**：CAS 维护 Agent ↔ Model 绑定 → Apply 时把 Provider（含 `auth.command` 指向绝对路径的 `cas-helper`）写入 Codex `config.toml`，把 Agent 写入 `agents/*.toml` → Codex 运行子 Agent 时通过 `cas-helper` 取凭据。
+`bundle:windows` 会生成 NSIS x64 安装包，并携带 `cas-helper.exe`。
 
-`cas-helper` 必须与主程序同目录，路径在运行时以 `current_exe()` 推断，兼容 debug / release / 安装目录三种部署形态。
+## 系统要求
 
-### 配置应用机制
-
-1. **Preview**：编译期望状态 → 变更清单 + blocker（Agent 未就绪、冲突、helper 不可用等）
-2. **Apply**：语义指纹检测外部改动 → 写入前备份 → 写入后回读 + hash 校验 → 失败按 Journal 回滚
-3. **冲突处理**只有两条路：查看 + 中止，或显式重新 Apply（携带新快照）
-4. **Snapshot**：每次成功应用生成，可列出 / 查看 / 恢复
-
-配置状态机：`Applied → PendingChanges → Drift → Conflict → RecoveryRequired`（启动检测到未完成事务时进入恢复引导）。
-
----
-
-## 安全模型
-
-- **凭据不落盘**：`config.toml` 的 `auth.command` 指向 `cas-helper token <uuid>`，文件中只有 UUID，永无 API Key 明文；明文只存 Windows 凭据管理器
-- **forbid-list**：检测配置中已知明文密钥模式；外部明文仅作诊断提示，不阻塞无关 Apply
-- **最小权限**：`cas-helper` 只做凭据存取，无网络能力，不做配置写入
-- **互斥与事务**：OS 文件锁（`LockFileEx`）为权威锁源；Apply 事务化，失败自动回滚
-- **监控隐私**：Token 监控只保存计数 / Thread 标识符 / Agent 与模型快照 / 时间戳，**不保存任何 Prompt、Response、正文与 Key**；采集失败 Fail Open（不中断 Codex 工作）；可随时停止监控并清除历史
-- **数据位置**：`cas.db` 位于系统 `app_local_data_dir`，不写入 Codex 目录
-
----
-
-## 环境要求与构建发布
-
-### 环境要求
-
-- **Windows 10/11**（当前目标平台）
-- **Rust**（2024 edition）+ **Node.js ≥ 22**
-- **Codex CLI ≥ 0.144.0**：Store 版需将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`（WindowsApps 无执行别名）
-- 其余（WebView2 Runtime）Windows 11 自带；全部 Rust 依赖离线可构建
-
-### 构建与发布
-
-| 目的 | 命令 |
-|---|---|
-| 前端构建验证 | `npm.cmd run build` |
-| Rust 测试 | `cargo test --manifest-path src-tauri/Cargo.toml` |
-| 生成 Windows 安装包 | `npm.cmd run bundle:windows` |
-| App Server POC 自测 | `npm.cmd run poc:app-server:self-test` |
-
-安装包会同时携带 `cas-helper.exe`，无需单独复制凭据助手。
-
----
-
-## Roadmap 与当前进度
-
-### 三路线状态总览
-
-| 版本 | 编排 | Token 监控 | 调度 / 缓存 |
-|---|---|---|---|
-| **0.2.0（当前）** | 阶段一~四（Strict Stop + Primary Fallback）✅ | Phase 0~2（POC → 可靠采集 → UI）✅ | 数据模型 + Reuse/Spawn 决策 + 托管执行 ✅ |
-| **P1** | 回退记录数据层、真实 Codex E2E 实跑 | — | 运行时评分、缓存时间实验、AUTO/HOT/COLD 策略深化 |
-| **P2** | 编排深度演进 | — | Cost-aware Scheduling、Thread Pool、自动退休/重建 |
-
-### 编排（路线一）
-
-- 阶段一~四已完成：Agent 角色元数据（`role_key` + `orchestration_phase`）、多 Agent 绑定与运行模式、Strict Stop 自动编排、Primary Fallback（失败策略设置与风险提示、权限恢复与配套 Diagnostics；真实 Codex E2E 测试框架已内置，`runtime_bridge.rs` 中按环境变量启用）
-- **剩余（P1）**：系统级回退记录（当前仅指令约束要求模型记录回退原因，尚无独立数据表）、真实 Codex E2E 实跑（自动创建、等待、结果收束、失败关闭全链路）
-- 编排规则基线：`Default` 保留原生行为；`Orchestrated` 同一 Role Key 只启用一个 Agent；Phase 使用四个稳定枚举；Role Key 可扩展；Primary 负责规划/调度/审查/收束，执行 Agent 负责写入
-
-### Token 使用监控（路线二）
-
-- **Phase 0 POC** ✅ 生命周期管理、父子 Thread 映射、Usage 事件采集（参考 `scripts/cas-app-server-poc.mjs`）
-- **Phase 1 可靠采集** ✅ 幂等 Upsert、会话恢复、异常状态、Repository 与 IPC 测试
-- **Phase 2 UI** ✅ 监控开关、Agent 汇总、时间范围、`LIVE / FINAL / PARTIAL / UNKNOWN` 状态说明
-- **Phase 3 费用估算（可选，未开工）**：Model Pricing、价格快照、币种与缓存计费
-
-### Subagent 生命周期与缓存感知调度（路线三）
-
-- **已落地**：Agent Definition 与 Thread 实例分离（迁移 0013）、Provider Cache Profile 与 `reuse_strategy` 数据模型（0014/0015）、Reuse/Spawn 决策与托管执行
-- **待执行**：Proof 3（Thread Continuity vs Prompt Prefix Cache 对照）、缓存时间实验（立即 / 1h / 6h / 24h）、HOT/WARM/COLD Runtime State、Cost-aware Scheduling、Thread Pool
-- 设计底线：Thread 复用与 Provider Cache 是两个不同的生命周期；Provider Cache **不得作为正确性依赖**
-
-### 明确不做（当前阶段）
-
-Token 定价预测、复杂调度算法、关键词路由引擎、可视化编排器、多个写 Agent 并行改同一工作区、Provider 专用调度、自动修改项目级 `AGENTS.md`。
-
----
+- Windows 10/11
+- Node.js 22+
+- Rust（2024 edition）
+- Codex CLI 0.144.0+
 
 ## License
 

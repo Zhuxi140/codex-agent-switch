@@ -382,6 +382,14 @@ impl ConfigurationService {
         let response = self.apply_without_locks(ConfigurationApplyRequest::default())?;
         match response.status {
             ApplyStatus::Applied | ApplyStatus::NoChanges => Ok(()),
+            ApplyStatus::Conflict => Err(ConfigurationError::ApplyBlocked(
+                response
+                    .conflict
+                    .as_ref()
+                    .and_then(|conflict| conflict.resources.first())
+                    .map(|resource| resource.code.clone())
+                    .unwrap_or_else(|| "RESOURCE_OWNERSHIP_CONFLICT".to_owned()),
+            )),
             ApplyStatus::FailedRolledBack => Err(ConfigurationError::ApplyBlocked(
                 "PROJECT_EXCLUSION_SYNC_FAILED".to_owned(),
             )),
@@ -404,9 +412,31 @@ impl ConfigurationService {
         &self,
         request: RuntimeModeSwitchRequest,
     ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
+        self.switch_runtime_mode_inner(request.active_agent_ids, None)
+    }
+
+    pub(crate) fn resolve_runtime_mode_conflict(
+        &self,
+        request: RuntimeModeConflictResolveRequest,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
+        self.switch_runtime_mode_inner(
+            request.active_agent_ids,
+            Some(ConflictResolutionAttempt {
+                strategy: request.strategy,
+                expected_desired_state_hash: request.expected_desired_state_hash,
+                expected_conflict_token: request.expected_conflict_token,
+            }),
+        )
+    }
+
+    fn switch_runtime_mode_inner(
+        &self,
+        active_agent_ids: Vec<String>,
+        resolution: Option<ConflictResolutionAttempt>,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
         let mut requested_ids = Vec::new();
         let mut seen_ids = HashSet::new();
-        for value in request.active_agent_ids {
+        for value in active_agent_ids {
             let value = value.trim();
             Uuid::parse_str(value).map_err(|_| ConfigurationError::ActiveAgentNotFound)?;
             if seen_ids.insert(value.to_owned()) {
@@ -481,7 +511,11 @@ impl ConfigurationService {
         )?;
         drop(connection);
 
-        let result = self.apply_without_locks(ConfigurationApplyRequest::default());
+        let result = if let Some(resolution) = resolution {
+            self.resolve_conflict_without_locks(resolution)
+        } else {
+            self.apply_without_locks(ConfigurationApplyRequest::default())
+        };
         let succeeded = matches!(
             result.as_ref().map(|response| response.status),
             Ok(ApplyStatus::Applied | ApplyStatus::NoChanges)
@@ -498,6 +532,64 @@ impl ConfigurationService {
             set_orchestration_baseline_json(&open_database(&self.database_path)?, None)?;
         }
         result
+    }
+
+    fn resolve_conflict_without_locks(
+        &self,
+        resolution: ConflictResolutionAttempt,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
+        self.upgrade_orchestration_baseline_if_needed()?;
+        let preview = self.compile_preview()?;
+        if preview.desired_hash != resolution.expected_desired_state_hash {
+            return Err(ConfigurationError::DesiredStateChanged);
+        }
+        let current_conflict = configuration_conflict_response(&preview);
+        if preview.conflicts.is_empty() {
+            return self.apply_without_locks(ConfigurationApplyRequest {
+                expected_desired_state_hash: Some(preview.desired_hash),
+            });
+        }
+        if current_conflict.conflict_token != resolution.expected_conflict_token {
+            return Ok(ConfigurationApplyResponse::conflict(&preview));
+        }
+        if let Some(blocker) = preview
+            .blockers
+            .iter()
+            .find(|issue| !is_resource_conflict_code(&issue.code))
+        {
+            return Err(ConfigurationError::ApplyBlocked(blocker.code.clone()));
+        }
+        match resolution.strategy {
+            ConflictResolutionStrategy::Adopt => {
+                if !current_conflict.can_adopt {
+                    return Err(ConfigurationError::ApplyBlocked(
+                        "CONFLICT_ADOPTION_UNSAFE".to_owned(),
+                    ));
+                }
+                validate_projection(&preview)?;
+                adopt_existing_projection(&self.database_path, &preview)?;
+                self.apply_without_locks(ConfigurationApplyRequest {
+                    expected_desired_state_hash: Some(preview.desired_hash),
+                })
+            }
+            ConflictResolutionStrategy::Replace => {
+                if preview
+                    .conflicts
+                    .iter()
+                    .any(|resource| !resource.replaceable)
+                {
+                    return Err(ConfigurationError::ApplyBlocked(
+                        "CONFLICT_REPLACEMENT_UNSAFE".to_owned(),
+                    ));
+                }
+                if preview.changes.is_empty() {
+                    validate_projection(&preview)?;
+                    adopt_existing_projection(&self.database_path, &preview)?;
+                    return Ok(ConfigurationApplyResponse::no_changes(preview.warnings));
+                }
+                self.apply_preview(preview, true)
+            }
+        }
     }
 
     pub(crate) fn apply(
@@ -526,10 +618,23 @@ impl ConfigurationService {
         {
             return Err(ConfigurationError::DesiredStateChanged);
         }
-        if !preview.blockers.is_empty() {
-            return Err(ConfigurationError::ApplyBlocked(
-                preview.blockers[0].code.clone(),
-            ));
+        self.apply_preview(preview, false)
+    }
+
+    fn apply_preview(
+        &self,
+        preview: CompiledPreview,
+        allow_conflicts: bool,
+    ) -> Result<ConfigurationApplyResponse, ConfigurationError> {
+        if let Some(blocker) = preview
+            .blockers
+            .iter()
+            .find(|issue| !is_resource_conflict_code(&issue.code))
+        {
+            return Err(ConfigurationError::ApplyBlocked(blocker.code.clone()));
+        }
+        if !allow_conflicts && !preview.conflicts.is_empty() {
+            return Ok(ConfigurationApplyResponse::conflict(&preview));
         }
         if preview.changes.is_empty() {
             return Ok(ConfigurationApplyResponse::no_changes(preview.warnings));
@@ -570,6 +675,7 @@ impl ConfigurationService {
             changed_resource_count: preview.changes.len(),
             restart_recommended: true,
             warnings: preview.warnings,
+            conflict: None,
         })
     }
 
@@ -854,6 +960,7 @@ impl ConfigurationService {
         }
 
         let mut changes = Vec::new();
+        let mut conflicts = Vec::new();
         let mut final_config = existing_config.clone();
         let desired_keys = desired
             .iter()
@@ -865,13 +972,15 @@ impl ConfigurationService {
             let current = current_semantic(resource, &existing_config)?;
             let managed_resource =
                 managed.get(&(resource.resource_type.clone(), resource.logical_key.clone()));
-            detect_conflict(
+            if let Some(conflict) = detect_conflict(
                 resource,
                 current.as_deref(),
                 managed_resource,
                 &mut blockers,
                 &mut warnings,
-            );
+            ) {
+                conflicts.push(conflict);
+            }
             if current.as_deref() != Some(resource.semantic.as_str()) {
                 changes.push(ConfigurationChange {
                     operation: if current.is_some() {
@@ -937,6 +1046,17 @@ impl ConfigurationService {
                         "MANAGED_RESOURCE_CONFLICT",
                         format!("{} 已在 CAS 外部被修改。", resource.logical_key),
                     ));
+                    conflicts.push(ConfigurationConflictResource {
+                        code: "MANAGED_RESOURCE_CONFLICT".to_owned(),
+                        resource_type: resource.resource_type.clone(),
+                        logical_key: resource.logical_key.clone(),
+                        path: managed_resource_path(resource, &codex_home)
+                            .to_string_lossy()
+                            .into_owned(),
+                        matches_desired: false,
+                        replaceable: managed_resource_replaceable(resource),
+                        current_hash: hash_text(current),
+                    });
                 }
             } else {
                 warnings.push(DiagnosticIssue::warning(
@@ -982,6 +1102,7 @@ impl ConfigurationService {
             changes,
             blockers,
             warnings,
+            conflicts,
         })
     }
 
@@ -1065,6 +1186,7 @@ impl ConfigurationService {
                 changed_resource_count,
                 restart_recommended: false,
                 warnings,
+                conflict: None,
             });
         }
         update_apply_status(
@@ -1081,6 +1203,7 @@ impl ConfigurationService {
             changed_resource_count,
             restart_recommended: false,
             warnings,
+            conflict: None,
         })
     }
 
@@ -1339,6 +1462,28 @@ pub(crate) struct RuntimeModeSwitchRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeModeConflictResolveRequest {
+    active_agent_ids: Vec<String>,
+    strategy: ConflictResolutionStrategy,
+    expected_desired_state_hash: String,
+    expected_conflict_token: String,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum ConflictResolutionStrategy {
+    Adopt,
+    Replace,
+}
+
+struct ConflictResolutionAttempt {
+    strategy: ConflictResolutionStrategy,
+    expected_desired_state_hash: String,
+    expected_conflict_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectExclusionAddRequest {
     project_path: String,
 }
@@ -1375,6 +1520,7 @@ pub(crate) struct ConfigurationApplyResponse {
     changed_resource_count: usize,
     restart_recommended: bool,
     warnings: Vec<DiagnosticIssue>,
+    conflict: Option<ConfigurationConflictResponse>,
 }
 
 impl ConfigurationApplyResponse {
@@ -1387,6 +1533,20 @@ impl ConfigurationApplyResponse {
             changed_resource_count: 0,
             restart_recommended: false,
             warnings,
+            conflict: None,
+        }
+    }
+
+    fn conflict(preview: &CompiledPreview) -> Self {
+        Self {
+            transaction_id: Uuid::new_v4().to_string(),
+            status: ApplyStatus::Conflict,
+            snapshot_id: None,
+            applied_at: None,
+            changed_resource_count: 0,
+            restart_recommended: false,
+            warnings: preview.warnings.clone(),
+            conflict: Some(configuration_conflict_response(preview)),
         }
     }
 }
@@ -1396,8 +1556,32 @@ impl ConfigurationApplyResponse {
 enum ApplyStatus {
     Applied,
     NoChanges,
+    Conflict,
     FailedRolledBack,
     RecoveryRequired,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigurationConflictResponse {
+    codex_home: String,
+    desired_state_hash: String,
+    conflict_token: String,
+    can_adopt: bool,
+    resources: Vec<ConfigurationConflictResource>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigurationConflictResource {
+    code: String,
+    resource_type: String,
+    logical_key: String,
+    path: String,
+    matches_desired: bool,
+    replaceable: bool,
+    #[serde(skip)]
+    current_hash: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -1479,6 +1663,7 @@ struct CompiledPreview {
     changes: Vec<ConfigurationChange>,
     blockers: Vec<DiagnosticIssue>,
     warnings: Vec<DiagnosticIssue>,
+    conflicts: Vec<ConfigurationConflictResource>,
 }
 
 struct DesiredResource {
@@ -1653,9 +1838,12 @@ impl ConfigurationError {
                 "项目级 Codex 配置已在 CAS 外部修改，未自动覆盖或恢复。"
             }
             Self::ApplyBlocked(code) => match code.as_str() {
-                "RESOURCE_OWNERSHIP_CONFLICT" | "MANAGED_RESOURCE_CONFLICT" => {
-                    "磁盘中的 CAS 目标资源已存在或被外部修改，配置同步已中止。"
+                "RESOURCE_OWNERSHIP_CONFLICT" => {
+                    "当前 CODEX_HOME 已存在尚未登记所有权的配置资源，配置同步已暂停。"
                 }
+                "MANAGED_RESOURCE_CONFLICT" => "CAS 管理的配置已被外部修改，配置同步已暂停。",
+                "CONFLICT_ADOPTION_UNSAFE" => "现有配置与 CAS 期望配置不一致，无法安全接管。",
+                "CONFLICT_REPLACEMENT_UNSAFE" => "冲突包含无法由 CAS 安全替换的资源。",
                 "AGENT_REASONING_UNSUPPORTED" => {
                     "Agent 的 Reasoning 无法解析为所选 Model 支持的强度。"
                 }
@@ -1796,7 +1984,7 @@ fn load_desired_resources(
                     a.reasoning_policy, a.managed, b.id, m.id, m.model_id, m.enabled,
                     m.compatibility_level, p.id, p.provider_key, p.name, p.base_url,
                     p.enabled, c.id, a.role_key, a.orchestration_phase,
-                    m.default_reasoning, m.reasoning_supported
+                    m.default_reasoning, m.reasoning_supported, p.preset_id
              FROM agents a
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
              LEFT JOIN models m ON m.id = b.model_id
@@ -1830,6 +2018,7 @@ fn load_desired_resources(
                         model_reasoning_supported: row
                             .get::<_, Option<i64>>(21)?
                             .map(|value| value != 0),
+                        provider_preset_id: row.get(22)?,
                         effective_reasoning_effort: None,
                     })
                 },
@@ -1930,7 +2119,9 @@ fn load_desired_resources(
             ));
         }
         agent.effective_reasoning_effort = Some(reasoning_effort);
-        if agent.credential_id.is_none() {
+        if agent.provider_preset_id.as_deref() != Some("codex-native")
+            && agent.credential_id.is_none()
+        {
             blockers.push(DiagnosticIssue::error(
                 "PROVIDER_CREDENTIAL_MISSING",
                 format!(
@@ -1969,7 +2160,8 @@ fn load_desired_resources(
         let provider_key = agent.provider_key.as_ref().expect("validated provider");
         let provider_name = agent.provider_name.as_ref().expect("validated provider");
         let codex_provider_id = format!("cas_{provider_key}");
-        if projected_providers.insert(provider_entity_id.clone()) {
+        let native_provider = agent.provider_preset_id.as_deref() == Some("codex-native");
+        if !native_provider && projected_providers.insert(provider_entity_id.clone()) {
             let provider_projection = OwnedProviderProjection {
                 provider_id: codex_provider_id.clone(),
                 display_name: provider_name.clone(),
@@ -2016,7 +2208,7 @@ fn load_desired_resources(
             agent_key: &agent.agent_key,
             description: &agent.description,
             model_id: agent.model_id.as_deref().expect("validated model"),
-            provider_id: &codex_provider_id,
+            provider_id: (!native_provider).then_some(codex_provider_id.as_str()),
             reasoning_effort,
             sandbox_mode,
             developer_instructions: &agent.instruction,
@@ -2050,7 +2242,8 @@ fn load_desired_resources(
                     .map_err(ConfigurationError::from)
             })?;
         let exclusions = load_project_exclusions(connection)?;
-        let instructions = render_orchestration_instructions(&agents, &exclusions, failure_policy);
+        let instructions =
+            render_orchestration_instructions(&agents, &exclusions, failure_policy, helper_path);
         let rendered = upsert_orchestration_projection("", &instructions, &baseline)?;
         let semantic = orchestration_projection_semantic(&rendered)?
             .ok_or(ConfigurationError::InvalidSnapshot)?;
@@ -2142,6 +2335,7 @@ struct ActiveAgentProjectionRow {
     phase: Option<String>,
     model_default_reasoning: Option<String>,
     model_reasoning_supported: Option<bool>,
+    provider_preset_id: Option<String>,
     effective_reasoning_effort: Option<String>,
 }
 
@@ -2241,6 +2435,7 @@ fn render_orchestration_instructions(
     agents: &[ActiveAgentProjectionRow],
     exclusions: &[ProjectExclusionResponse],
     failure_policy: OrchestrationFailurePolicy,
+    helper_path: &Path,
 ) -> String {
     let active_agents = agents
         .iter()
@@ -2282,6 +2477,7 @@ fn render_orchestration_instructions(
             "7. 若缺少所需 phase 的 Agent，或子 Agent 启动失败、超时、断流、执行失败、返回不可验证结果，必须先显式警告用户，说明失败阶段、Agent、错误与接管风险，然后 Primary 可以接管同一任务。最终结果必须记录回退原因、Primary 接管的改动与验证；严禁静默 fallback。",
         ),
     };
+    let scheduling_command = format!("\"{}\" schedule <agent-key>", helper_path.to_string_lossy());
     format!(
         "你是 Primary 编排 Agent，负责理解需求、制定计划、审查结果与最终收束。\n\n\
 当前失败策略：{failure_policy_label}。\n\n\
@@ -2301,10 +2497,12 @@ fn render_orchestration_instructions(
 {write_rule}\n\
 3. 读取、分析、规划和最终审查由 Primary 负责；需要专项探索、验证或审查时，优先委派给对应 phase 的已启用子 Agent。\n\
 4. 创建子 Agent 时必须使用 `fork_turns=\"none\"`，不得继承父会话历史；必须在 prompt 中写全任务范围、约束、工作目录与验收标准。必须使用 `agent_type=<name>` 选择上方清单中的 CAS 自定义 Agent；不得在创建时显式覆盖 `model` 或 `reasoning_effort`，这些配置只由该 Agent 的 TOML 决定。\n\
-5. 同一具体任务只创建一次对应子 Agent；后续补充使用原线程，不得因等待或超时重复创建。\n\
+5. 同一具体任务只创建一次对应子 Agent；后续补充使用原线程，不得因等待或超时重复创建。子 Agent 成功完成后必须保留其线程，严禁调用 `close_agent`；完成后由 CAS 生命周期同步识别为 IDLE，后续独立任务必须先执行 schedule 决定 REUSE 或 SPAWN。仅在用户明确要求、Agent 被停用或移除、线程异常不可用，或 CAS 判定不再可复用时允许关闭。\n\
 6. 写入任务必须串行；互不依赖的只读任务可以并行。必须等待子 Agent 完成并审查其结果后再回复用户。\n\
 {failure_rule}\n\
-8. 用户明确要求仅分析或仅给方案时，不得执行写入，也不得擅自扩大任务范围。"
+8. 用户明确要求仅分析或仅给方案时，不得执行写入，也不得擅自扩大任务范围。\n\
+9. 对新的独立任务首次委派前，必须先运行一次只读预检：`{scheduling_command}`，将 `<agent-key>` 替换为上方 Agent 的 name 值。helper 自动读取 CAS 数据库、当前工作目录和 `CODEX_THREAD_ID`；所有固定判断均由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
+10. 只接受该命令输出中唯一一行 `CAS1|<REUSE或SPAWN>|<thread-id或->|<reason>`；零行或多行匹配均视为失败，Shell 宿主自身的诊断行不参与解析。`REUSE` 时必须使用 `followup_task` 将完整任务发给第三段 Thread，不得重复创建；`SPAWN` 时才按第 4 条创建。命令失败、REUSE 缺少 Thread 或目标不可达时，按当前失败策略处理并显式报告，不得静默改走另一条路径。"
     )
 }
 
@@ -2730,18 +2928,36 @@ fn is_config_fragment(resource_type: &str) -> bool {
     )
 }
 
+fn is_resource_conflict_code(code: &str) -> bool {
+    matches!(
+        code,
+        "RESOURCE_OWNERSHIP_CONFLICT" | "MANAGED_RESOURCE_CONFLICT"
+    )
+}
+
 fn detect_conflict(
     resource: &DesiredResource,
     current: Option<&str>,
     managed: Option<&ManagedResource>,
     blockers: &mut Vec<DiagnosticIssue>,
     warnings: &mut Vec<DiagnosticIssue>,
-) {
+) -> Option<ConfigurationConflictResource> {
     match (managed, current) {
-        (None, Some(_)) => blockers.push(DiagnosticIssue::error(
-            "RESOURCE_OWNERSHIP_CONFLICT",
-            format!("{} 已存在，但尚未归 CAS 管理。", resource.logical_key),
-        )),
+        (None, Some(current)) => {
+            blockers.push(DiagnosticIssue::error(
+                "RESOURCE_OWNERSHIP_CONFLICT",
+                format!("{} 已存在，但尚未归 CAS 管理。", resource.logical_key),
+            ));
+            return Some(ConfigurationConflictResource {
+                code: "RESOURCE_OWNERSHIP_CONFLICT".to_owned(),
+                resource_type: resource.resource_type.clone(),
+                logical_key: resource.logical_key.clone(),
+                path: resource.target_path.to_string_lossy().into_owned(),
+                matches_desired: current == resource.semantic,
+                replaceable: desired_resource_replaceable(resource),
+                current_hash: hash_text(current),
+            });
+        }
         (Some(managed), Some(current))
             if managed.semantic_hash.as_deref() != Some(hash_text(current).as_str()) =>
         {
@@ -2749,6 +2965,15 @@ fn detect_conflict(
                 "MANAGED_RESOURCE_CONFLICT",
                 format!("{} 已在 CAS 外部被修改。", resource.logical_key),
             ));
+            return Some(ConfigurationConflictResource {
+                code: "MANAGED_RESOURCE_CONFLICT".to_owned(),
+                resource_type: resource.resource_type.clone(),
+                logical_key: resource.logical_key.clone(),
+                path: resource.target_path.to_string_lossy().into_owned(),
+                matches_desired: current == resource.semantic,
+                replaceable: desired_resource_replaceable(resource),
+                current_hash: hash_text(current),
+            });
         }
         (Some(_), None) => warnings.push(DiagnosticIssue::warning(
             "MANAGED_RESOURCE_DRIFT",
@@ -2759,6 +2984,104 @@ fn detect_conflict(
         )),
         _ => {}
     }
+    None
+}
+
+fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
+    is_config_fragment(&resource.resource_type)
+        || resource.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE
+        || (resource.resource_type == AGENT_RESOURCE
+            && resource.relative_path.starts_with("agents/cas-")
+            && resource.relative_path.ends_with(".toml"))
+        || (resource.resource_type == MODEL_CATALOG_RESOURCE
+            && resource.relative_path.starts_with("cas/model-catalogs/")
+            && resource.relative_path.ends_with(".json"))
+}
+
+fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
+    matches!(
+        resource.resource_type.as_str(),
+        PROVIDER_RESOURCE
+            | SESSION_CATALOG_RESOURCE
+            | ORCHESTRATION_RESOURCE
+            | GLOBAL_INSTRUCTIONS_RESOURCE
+            | AGENT_RESOURCE
+            | MODEL_CATALOG_RESOURCE
+    )
+}
+
+fn managed_resource_path(resource: &ManagedResource, codex_home: &Path) -> PathBuf {
+    managed_relative_path(resource)
+        .map(|relative| codex_home.join(relative))
+        .unwrap_or_else(|| codex_home.to_owned())
+}
+
+fn configuration_conflict_response(preview: &CompiledPreview) -> ConfigurationConflictResponse {
+    let conflict_token = hash_bytes(
+        preview
+            .conflicts
+            .iter()
+            .flat_map(|resource| {
+                [
+                    resource.code.as_bytes(),
+                    b"\0",
+                    resource.resource_type.as_bytes(),
+                    b"\0",
+                    resource.logical_key.as_bytes(),
+                    b"\0",
+                    resource.current_hash.as_bytes(),
+                    b"\n",
+                ]
+                .concat()
+            })
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    let can_adopt = preview.changes.is_empty()
+        && !preview.conflicts.is_empty()
+        && preview.conflicts.iter().all(|resource| {
+            resource.code == "RESOURCE_OWNERSHIP_CONFLICT" && resource.matches_desired
+        });
+    ConfigurationConflictResponse {
+        codex_home: preview.codex_home.to_string_lossy().into_owned(),
+        desired_state_hash: preview.desired_hash.clone(),
+        conflict_token,
+        can_adopt,
+        resources: preview.conflicts.clone(),
+    }
+}
+
+fn adopt_existing_projection(
+    database_path: &Path,
+    preview: &CompiledPreview,
+) -> Result<(), ConfigurationError> {
+    let mut connection = open_database(database_path)?;
+    let timestamp = now(&connection)?;
+    let config_content = read_optional_utf8(&preview.codex_home.join(CONFIG_RELATIVE_PATH))?;
+    let config_hash = hash_bytes(config_content.as_bytes());
+    let transaction = connection.transaction()?;
+    for resource in &preview.desired {
+        let content_hash = if is_config_fragment(&resource.resource_type) {
+            config_hash.clone()
+        } else {
+            hash_bytes(&fs::read(&resource.target_path)?)
+        };
+        upsert_managed_resource(
+            &transaction,
+            resource,
+            &hash_text(&resource.semantic),
+            &content_hash,
+            &timestamp,
+        )?;
+    }
+    transaction.execute(
+        "UPDATE configuration_state
+         SET last_applied_desired_hash = ?1, last_applied_at = ?2
+         WHERE id = 1",
+        params![preview.desired_hash, timestamp],
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 fn validate_projection(preview: &CompiledPreview) -> Result<(), ConfigurationError> {
@@ -3288,7 +3611,7 @@ fn diagnose_providers(
     include_network_checks: bool,
 ) -> Result<DiagnosticSection, ConfigurationError> {
     let mut statement = connection.prepare(
-        "SELECT p.name, c.id
+        "SELECT p.name, c.id, p.preset_id
          FROM providers p
          LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
          WHERE p.enabled = 1
@@ -3296,7 +3619,11 @@ fn diagnose_providers(
     )?;
     let providers = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let mut issues = Vec::new();
@@ -3306,7 +3633,14 @@ fn diagnose_providers(
             "当前没有已启用 Provider。",
         ));
     }
-    for (name, credential_id) in providers {
+    for (name, credential_id, preset_id) in providers {
+        if preset_id.as_deref() == Some("codex-native") {
+            issues.push(DiagnosticIssue::info(
+                "PROVIDER_CODEX_SESSION",
+                format!("Provider {name} 复用当前 Codex 的 ChatGPT 登录会话。"),
+            ));
+            continue;
+        }
         let issue = match credential_id
             .as_deref()
             .map(CredentialId::from_str)
@@ -4311,6 +4645,51 @@ mod tests {
     }
 
     #[test]
+    fn codex_native_agent_omits_provider_projection_and_credential() {
+        let context = TestContext::new();
+        let connection = open_database(&context.database).unwrap();
+        connection
+            .execute(
+                "UPDATE providers
+                 SET provider_key = 'codex-native', name = 'Codex Native (ChatGPT)',
+                     base_url = 'https://api.openai.com/v1/', preset_id = 'codex-native'
+                 WHERE provider_key = 'deepseek'",
+                [],
+            )
+            .unwrap();
+        connection.execute("DELETE FROM credentials", []).unwrap();
+        connection
+            .execute(
+                "UPDATE models
+                 SET model_id = 'gpt-5.6-luna', display_name = 'GPT-5.6 Luna',
+                     context_window = 1050000, default_reasoning = 'medium'
+                 WHERE model_id = 'deepseek-v4-flash'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let preview = context.service.preview_apply().unwrap();
+        assert!(preview.blockers.is_empty());
+        context
+            .service
+            .apply(ConfigurationApplyRequest {
+                expected_desired_state_hash: Some(preview.desired_state_hash),
+            })
+            .unwrap();
+
+        let config = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
+        let config = config.parse::<DocumentMut>().unwrap();
+        assert!(config.get("model_providers").is_none());
+        let agent = fs::read_to_string(context.codex_home.join("agents/cas-executor.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(agent["model"].as_str(), Some("gpt-5.6-luna"));
+        assert!(agent.get("model_provider").is_none());
+    }
+
+    #[test]
     fn legacy_orchestration_projection_upgrades_without_conflict_and_restores_v2_baseline() {
         let context = TestContext::new();
         fs::write(
@@ -4424,6 +4803,223 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "MANAGED_RESOURCE_CONFLICT")
         );
+    }
+
+    #[test]
+    fn matching_unmanaged_projection_can_be_adopted_without_rewrite() {
+        let context = TestContext::new();
+        let executor_id = activate_runtime(&context);
+        open_database(&context.database)
+            .unwrap()
+            .execute("DELETE FROM managed_resources", [])
+            .unwrap();
+        let config_before =
+            fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
+
+        let conflict = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![executor_id.clone()],
+            })
+            .unwrap()
+            .conflict
+            .unwrap();
+        assert!(conflict.can_adopt);
+        let resolved = context
+            .service
+            .resolve_runtime_mode_conflict(RuntimeModeConflictResolveRequest {
+                active_agent_ids: vec![executor_id],
+                strategy: ConflictResolutionStrategy::Adopt,
+                expected_desired_state_hash: conflict.desired_state_hash,
+                expected_conflict_token: conflict.conflict_token,
+            })
+            .unwrap();
+
+        assert!(matches!(resolved.status, ApplyStatus::NoChanges));
+        assert_eq!(
+            fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap(),
+            config_before
+        );
+        assert_eq!(managed_resource_count(&context.database), 7);
+    }
+
+    #[test]
+    fn mismatched_unmanaged_projection_requires_replace_and_preserves_user_config() {
+        let context = TestContext::new();
+        let executor_id = activate_runtime(&context);
+        open_database(&context.database)
+            .unwrap()
+            .execute("DELETE FROM managed_resources", [])
+            .unwrap();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        let mut config = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        config["model_providers"]["cas_deepseek"]["base_url"] =
+            value("https://external.example.com/");
+        config["mcp_servers"]["keep"]["command"] = value("keep-me");
+        fs::write(&config_path, config.to_string()).unwrap();
+        let instructions_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+        let instructions = fs::read_to_string(&instructions_path).unwrap();
+        fs::write(
+            &instructions_path,
+            format!("{instructions}\n用户自己的全局说明\n"),
+        )
+        .unwrap();
+
+        let conflict = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![executor_id.clone()],
+            })
+            .unwrap()
+            .conflict
+            .unwrap();
+        assert!(!conflict.can_adopt);
+        let adopt_error = context
+            .service
+            .resolve_runtime_mode_conflict(RuntimeModeConflictResolveRequest {
+                active_agent_ids: vec![executor_id.clone()],
+                strategy: ConflictResolutionStrategy::Adopt,
+                expected_desired_state_hash: conflict.desired_state_hash.clone(),
+                expected_conflict_token: conflict.conflict_token.clone(),
+            })
+            .err()
+            .unwrap();
+        assert!(matches!(
+            adopt_error,
+            ConfigurationError::ApplyBlocked(code) if code == "CONFLICT_ADOPTION_UNSAFE"
+        ));
+
+        let replaced = context
+            .service
+            .resolve_runtime_mode_conflict(RuntimeModeConflictResolveRequest {
+                active_agent_ids: vec![executor_id],
+                strategy: ConflictResolutionStrategy::Replace,
+                expected_desired_state_hash: conflict.desired_state_hash,
+                expected_conflict_token: conflict.conflict_token,
+            })
+            .unwrap();
+        assert!(matches!(replaced.status, ApplyStatus::Applied));
+        assert!(replaced.snapshot_id.is_some());
+        let config = fs::read_to_string(config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            config["model_providers"]["cas_deepseek"]["base_url"].as_str(),
+            Some("https://api.deepseek.com/")
+        );
+        assert_eq!(
+            config["mcp_servers"]["keep"]["command"].as_str(),
+            Some("keep-me")
+        );
+        assert!(
+            fs::read_to_string(instructions_path)
+                .unwrap()
+                .contains("用户自己的全局说明")
+        );
+        assert_eq!(managed_resource_count(&context.database), 7);
+    }
+
+    #[test]
+    fn managed_external_change_can_be_backed_up_and_replaced() {
+        let context = TestContext::new();
+        let executor_id = activate_runtime(&context);
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        let mut config = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        config["model_providers"]["cas_deepseek"]["base_url"] =
+            value("https://external.example.com/");
+        fs::write(&config_path, config.to_string()).unwrap();
+
+        let conflict = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![executor_id.clone()],
+            })
+            .unwrap()
+            .conflict
+            .unwrap();
+        assert!(
+            conflict
+                .resources
+                .iter()
+                .any(|resource| resource.code == "MANAGED_RESOURCE_CONFLICT")
+        );
+        let replaced = context
+            .service
+            .resolve_runtime_mode_conflict(RuntimeModeConflictResolveRequest {
+                active_agent_ids: vec![executor_id],
+                strategy: ConflictResolutionStrategy::Replace,
+                expected_desired_state_hash: conflict.desired_state_hash,
+                expected_conflict_token: conflict.conflict_token,
+            })
+            .unwrap();
+        assert!(matches!(replaced.status, ApplyStatus::Applied));
+        let restored = fs::read_to_string(config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            restored["model_providers"]["cas_deepseek"]["base_url"].as_str(),
+            Some("https://api.deepseek.com/")
+        );
+    }
+
+    #[test]
+    fn conflict_changed_after_confirmation_is_returned_without_overwrite() {
+        let context = TestContext::new();
+        let executor_id = activate_runtime(&context);
+        open_database(&context.database)
+            .unwrap()
+            .execute("DELETE FROM managed_resources", [])
+            .unwrap();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        let mut config = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        config["model_providers"]["cas_deepseek"]["base_url"] = value("https://first.example.com/");
+        fs::write(&config_path, config.to_string()).unwrap();
+        let conflict = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![executor_id.clone()],
+            })
+            .unwrap()
+            .conflict
+            .unwrap();
+
+        let mut changed = fs::read_to_string(&config_path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        changed["model_providers"]["cas_deepseek"]["base_url"] =
+            value("https://second.example.com/");
+        fs::write(&config_path, changed.to_string()).unwrap();
+        let refreshed = context
+            .service
+            .resolve_runtime_mode_conflict(RuntimeModeConflictResolveRequest {
+                active_agent_ids: vec![executor_id],
+                strategy: ConflictResolutionStrategy::Replace,
+                expected_desired_state_hash: conflict.desired_state_hash,
+                expected_conflict_token: conflict.conflict_token.clone(),
+            })
+            .unwrap()
+            .conflict
+            .unwrap();
+
+        assert_ne!(refreshed.conflict_token, conflict.conflict_token);
+        assert!(
+            fs::read_to_string(config_path)
+                .unwrap()
+                .contains("https://second.example.com/")
+        );
+        assert_eq!(managed_resource_count(&context.database), 0);
     }
 
     #[test]
@@ -4827,6 +5423,13 @@ mod tests {
         assert!(active_global.contains("必须使用 `agent_type=<name>`"));
         assert!(active_global.contains("必须使用 `fork_turns=\"none\"`"));
         assert!(active_global.contains("不得在创建时显式覆盖 `model` 或 `reasoning_effort`"));
+        assert!(active_global.contains("严禁调用 `close_agent`"));
+        assert!(active_global.contains("成功完成后必须保留其线程"));
+        assert!(active_global.contains("CAS 生命周期同步识别为 IDLE"));
+        assert!(active_global.contains("CAS1|<REUSE或SPAWN>"));
+        assert!(active_global.contains("CODEX_THREAD_ID"));
+        assert!(active_global.contains("Primary 不得自行读取 Thread、Token 或 Cache"));
+        assert!(active_global.contains("cas-helper.exe\" schedule <agent-key>"));
         assert!(active_global.contains(ORCHESTRATION_RUNTIME_CONTRACT));
         assert!(active_global.contains("父任务必须使用 Auto 或 Workspace"));
         assert!(!active_global.contains("显式传入 model"));
@@ -5317,8 +5920,39 @@ mod tests {
         assert_eq!(disk.code(), "APPLY_CONFLICT");
         assert_eq!(
             disk.user_message(),
-            "磁盘中的 CAS 目标资源已存在或被外部修改，配置同步已中止。"
+            "当前 CODEX_HOME 已存在尚未登记所有权的配置资源，配置同步已暂停。"
         );
+    }
+
+    fn executor_id(database_path: &Path) -> String {
+        open_database(database_path)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM agents WHERE agent_key = 'executor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn activate_runtime(context: &TestContext) -> String {
+        let agent_id = executor_id(&context.database);
+        context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![agent_id.clone()],
+            })
+            .unwrap();
+        agent_id
+    }
+
+    fn managed_resource_count(database_path: &Path) -> i64 {
+        open_database(database_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM managed_resources", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
 
     fn seed_desired_state(database_path: &Path) {

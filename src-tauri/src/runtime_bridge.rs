@@ -277,12 +277,14 @@ impl RuntimeBridgeService {
         if response_thread_id != thread_id {
             return Err(RuntimeBridgeError::UnexpectedThreadResponse);
         }
-        self.bind_managed_session(
+        let session = self.bind_managed_session(
             response_thread_id,
             session_id,
             ManagedSessionOrigin::Resumed,
             cwd,
-        )
+        )?;
+        self.usage.mark_agent_execution_idle_if_known(&thread_id)?;
+        Ok(session)
     }
 
     fn managed_turn_start_inner(
@@ -1517,10 +1519,9 @@ fn validate_turn_input(input: &str) -> Result<String, RuntimeBridgeError> {
 }
 
 fn agent_thread_params(profile: &AgentRuntimeProfile, cwd: &str) -> Value {
-    json!({
+    let mut params = json!({
         "cwd": cwd,
         "model": profile.model_slug,
-        "modelProvider": profile.provider_key,
         "developerInstructions": profile.instruction,
         "sandbox": match profile.sandbox_policy.as_str() {
             "READ_ONLY" => Some("read-only"),
@@ -1528,7 +1529,17 @@ fn agent_thread_params(profile: &AgentRuntimeProfile, cwd: &str) -> Value {
             "DANGER_FULL_ACCESS" => Some("danger-full-access"),
             _ => None,
         },
-    })
+    });
+    if let Some(model_provider) = &profile.model_provider {
+        params
+            .as_object_mut()
+            .expect("agent thread params are an object")
+            .insert(
+                "modelProvider".to_owned(),
+                Value::String(model_provider.clone()),
+            );
+    }
+    params
 }
 
 fn reasoning_effort(profile: &AgentRuntimeProfile) -> Option<&'static str> {
@@ -2094,7 +2105,7 @@ mod tests {
             sandbox_policy: "WORKSPACE_WRITE".to_owned(),
             reasoning_policy: "HIGH".to_owned(),
             model_slug: "deepseek-v4-flash".to_owned(),
-            provider_key: "cas_deepseek".to_owned(),
+            model_provider: Some("cas_deepseek".to_owned()),
         };
 
         assert_eq!(
@@ -2108,6 +2119,24 @@ mod tests {
             })
         );
         assert_eq!(reasoning_effort(&profile), Some("high"));
+    }
+
+    #[test]
+    fn native_agent_profile_omits_model_provider_override() {
+        let profile = AgentRuntimeProfile {
+            agent_id: "agent-native".to_owned(),
+            agent_key: "native-executor".to_owned(),
+            agent_name: "Native Executor".to_owned(),
+            instruction: "执行任务。".to_owned(),
+            sandbox_policy: "WORKSPACE_WRITE".to_owned(),
+            reasoning_policy: "HIGH".to_owned(),
+            model_slug: "gpt-5.6-luna".to_owned(),
+            model_provider: None,
+        };
+
+        let params = agent_thread_params(&profile, "C:\\workspace\\project");
+        assert_eq!(params.get("model"), Some(&json!("gpt-5.6-luna")));
+        assert!(params.get("modelProvider").is_none());
     }
 
     #[test]

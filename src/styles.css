@@ -973,6 +973,120 @@ code,
   backdrop-filter: blur(6px);
 }
 
+.configuration-conflict-dialog {
+  width: min(760px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  color: hsl(var(--foreground));
+  background: transparent;
+  box-shadow: 0 24px 80px hsl(var(--shadow) / 0.42);
+}
+
+.configuration-conflict-dialog::backdrop {
+  background: hsl(var(--background) / 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.configuration-conflict-card {
+  display: grid;
+  max-height: calc(100vh - 32px);
+  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  gap: 14px;
+  padding: 20px;
+  overflow: hidden;
+  background: hsl(var(--card-strong));
+}
+
+.configuration-conflict-card header,
+.configuration-conflict-card footer {
+  margin: 0;
+}
+
+.configuration-conflict-card header p {
+  max-width: 64ch;
+  margin-top: 4px;
+}
+
+.conflict-home {
+  display: grid;
+  gap: 5px;
+  padding: 10px 12px;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: 10px;
+  background: hsl(var(--muted) / 0.28);
+}
+
+.conflict-home span {
+  color: hsl(var(--muted-foreground));
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.conflict-home code,
+.configuration-conflict-list code {
+  overflow: hidden;
+  color: hsl(var(--foreground));
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.configuration-conflict-list {
+  display: grid;
+  min-height: 0;
+  gap: 8px;
+  overflow-y: auto;
+}
+
+.configuration-conflict-list article {
+  display: grid;
+  gap: 5px;
+  padding: 12px;
+  border: 1px solid hsl(var(--border) / 0.8);
+  border-radius: 10px;
+  background: hsl(var(--card));
+}
+
+.configuration-conflict-list article > div,
+.configuration-conflict-card footer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.configuration-conflict-list article > div {
+  justify-content: space-between;
+}
+
+.configuration-conflict-list small,
+.configuration-conflict-list p {
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+}
+
+.configuration-conflict-list p {
+  margin: 0;
+}
+
+.conflict-kind {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: hsl(var(--warning));
+  background: hsl(var(--warning) / 0.12);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.configuration-conflict-card footer {
+  justify-content: flex-end;
+  padding-top: 14px;
+  border-top: 1px solid hsl(var(--border) / 0.7);
+}
+
 .agent-config-card {
   display: grid;
   max-height: calc(100vh - 32px);
@@ -1364,8 +1478,27 @@ code,
   background: hsl(var(--primary) / 0.045);
 }
 
+.model-table tbody tr.model-disabled {
+  background: hsl(var(--muted) / 0.34);
+  opacity: 0.58;
+}
+
+.model-table tbody tr.model-disabled:hover {
+  background: hsl(var(--muted) / 0.48);
+  opacity: 0.72;
+}
+
 .model-table tbody tr:last-child td {
   border-bottom: 0;
+}
+
+.model-table td:first-child code,
+.model-table td:first-child small {
+  display: block;
+}
+
+.model-table td:first-child small {
+  margin-top: 3px;
 }
 
 .model-table td:nth-child(2) {
@@ -1541,6 +1674,7 @@ code,
 .agent-reuse-preview input,
 .agent-reuse-preview textarea,
 .agent-instance-scope input {
+  flex: 1 1 auto;
   width: 100%;
   min-width: 0;
   min-height: 34px;
@@ -2734,6 +2868,7 @@ code,
   }
 
   .agent-config-card footer,
+  .configuration-conflict-card footer,
   .agent-usage-heading {
     align-items: stretch;
     flex-wrap: wrap;
