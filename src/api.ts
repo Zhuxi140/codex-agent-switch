@@ -678,13 +678,15 @@ export interface AgentThreadInstanceResponse {
   agentNameSnapshot: string | null;
   codexThreadId: string;
   parentThreadId: string | null;
-  scopeKey: string | null;
+  workspaceScopeKey: string | null;
   status: AgentThreadInstanceStatus;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  currentContextTokens: number | null;
   contextWindow: number | null;
+  runtimeFingerprint: string | null;
   createdAt: string;
   lastUsedAt: string;
   closedAt: string | null;
@@ -707,13 +709,16 @@ export interface AgentThreadInstanceListResponse {
 export interface AgentThreadInstanceRecommendation {
   decision: "REUSE" | "SPAWN";
   reasonCode:
-    | "EXACT_SCOPE_IDLE"
+    | "EXACT_WORKSPACE_SCOPE_IDLE"
     | "CONTEXT_PRESSURE"
+    | "CONTEXT_UNKNOWN"
+    | "RUNTIME_FINGERPRINT_MISMATCH"
+    | "RUNTIME_FINGERPRINT_UNKNOWN"
     | "CACHE_HINT_PRESSURE"
     | "NO_HEALTHY_IDLE_THREAD"
-    | "NO_SCOPE_MATCH";
+    | "NO_WORKSPACE_SCOPE_MATCH";
   message: string;
-  scopeKey: string;
+  workspaceScopeKey: string;
   candidateInstanceId: string | null;
   candidateThreadId: string | null;
   contextPressurePercent: number | null;
@@ -738,7 +743,7 @@ export interface AgentThreadExecutionResponse {
   reasonCode: AgentThreadInstanceRecommendation["reasonCode"];
   agentId: string;
   agentName: string;
-  scopeKey: string;
+  workspaceScopeKey: string;
   threadId: string;
   turnId: string;
   status: ManagedSessionStatus;
@@ -762,28 +767,28 @@ export function listAgentThreadInstances(
   return invoke<AgentThreadInstanceListResponse>("agent_thread_instance_list", { request });
 }
 
-export function setAgentThreadInstanceScope(
+export function setAgentThreadInstanceWorkspaceScope(
   threadId: string,
-  scopeKey: string | null,
+  workspaceScopeKey: string | null,
 ): Promise<AgentThreadInstanceResponse> {
-  return invoke<AgentThreadInstanceResponse>("agent_thread_instance_set_scope", {
-    request: { threadId, scopeKey },
+  return invoke<AgentThreadInstanceResponse>("agent_thread_instance_set_workspace_scope", {
+    request: { threadId, workspaceScopeKey },
   });
 }
 
 export function recommendAgentThreadInstance(
   agentId: string,
-  scopeKey: string,
+  workspaceScopeKey: string,
   parentThreadId: string | null = null,
 ): Promise<AgentThreadInstanceRecommendation> {
   return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_recommend", {
-    request: { agentId, scopeKey, parentThreadId },
+    request: { agentId, workspaceScopeKey, parentThreadId },
   });
 }
 
 export function executeAgentThread(request: {
   agentId: string;
-  scopeKey: string;
+  workspaceScopeKey: string;
   cwd: string;
   input: string;
   expectedDecision: "REUSE" | "SPAWN";

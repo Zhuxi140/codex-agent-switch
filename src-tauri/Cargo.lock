@@ -437,14 +437,25 @@ dependencies = [
 name = "cas-helper"
 version = "0.1.0"
 dependencies = [
+ "cas-native-lifecycle",
  "cas-scheduler",
  "cas-secret-store",
  "rusqlite",
 ]
 
 [[package]]
+name = "cas-native-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "cas-scheduler"
 version = "0.1.0"
+dependencies = [
+ "sha2",
+]
 
 [[package]]
 name = "cas-secret-store"
@@ -538,8 +549,9 @@ dependencies = [
 
 [[package]]
 name = "codex-agent-switch"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "cas-native-lifecycle",
  "cas-scheduler",
  "cas-secret-store",
  "reqwest",

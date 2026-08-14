@@ -36,7 +36,7 @@ import {
   setModelEnabled,
   startUsageMonitor,
   stopUsageMonitor,
-  setAgentThreadInstanceScope,
+  setAgentThreadInstanceWorkspaceScope,
   testModelConnection,
   switchRuntimeMode,
   updateSettings,
@@ -613,7 +613,7 @@ function OverviewPage({
                 ) : (
                   selectedAgents.map((agent) => (
                     <span key={agent.id}>
-                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
+                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}（{agent.agentKey}）
                     </span>
                   ))
                 )}
@@ -962,7 +962,7 @@ function AgentConfigurationDialog({
                   <option value="">不启用</option>
                   {candidates.map((agent) => (
                     <option key={agent.id} value={agent.id}>
-                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
+                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}（{agent.agentKey}）
                       {" · "}{availabilityLabel(agent.availability)}
                     </option>
                   ))}
@@ -1708,7 +1708,7 @@ function AgentThreadInstancesPanel() {
       setScopeDrafts((current) => Object.fromEntries(
         loaded.items.map((instance) => [
           instance.id,
-          current[instance.id] ?? instance.scopeKey ?? "",
+          current[instance.id] ?? instance.workspaceScopeKey ?? "",
         ]),
       ));
     } catch (reason: unknown) {
@@ -1724,16 +1724,19 @@ function AgentThreadInstancesPanel() {
     return () => window.clearInterval(timer);
   }, [load]);
 
-  async function saveScope(instance: AgentThreadInstanceResponse) {
+  async function saveWorkspaceScope(instance: AgentThreadInstanceResponse) {
     setSavingScope(instance.id);
     setError(null);
     try {
-      const updated = await setAgentThreadInstanceScope(
+      const updated = await setAgentThreadInstanceWorkspaceScope(
         instance.codexThreadId,
         scopeDrafts[instance.id]?.trim() || null,
       );
       setInstances((current) => current.map((item) => item.id === updated.id ? updated : item));
-      setScopeDrafts((current) => ({ ...current, [updated.id]: updated.scopeKey ?? "" }));
+      setScopeDrafts((current) => ({
+        ...current,
+        [updated.id]: updated.workspaceScopeKey ?? "",
+      }));
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
@@ -1744,7 +1747,7 @@ function AgentThreadInstancesPanel() {
   async function checkRecommendation(instance: AgentThreadInstanceResponse) {
     const scope = scopeDrafts[instance.id]?.trim();
     if (!instance.agentId || !scope) {
-      setError("请先填写并保存 Scope，再评估 Primary 调度约束。");
+      setError("请先填写并保存 Workspace Scope，再评估 Primary 调度约束。");
       return;
     }
     setCheckingRecommendation(instance.id);
@@ -1769,7 +1772,7 @@ function AgentThreadInstancesPanel() {
         <div>
           <span className="eyebrow">Subagent Threads</span>
           <h2 id="agent-instance-title">子 Agent 实例</h2>
-          <p>查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Scope。</p>
+          <p>查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Workspace Scope。</p>
         </div>
         <div className="runtime-monitor-actions">
           {nativeSync && (
@@ -1824,6 +1827,7 @@ function AgentThreadInstancesPanel() {
               </div>
               <dl>
                 <UsageRecordMetric label="Total" value={instance.totalTokens} />
+                <UsageRecordMetric label="Context" value={instance.currentContextTokens} />
                 <UsageRecordMetric
                   label="Cached"
                   value={hasDetailedInstanceUsage(instance) ? instance.cachedInputTokens : null}
@@ -1839,7 +1843,7 @@ function AgentThreadInstancesPanel() {
               </dl>
               <div className="agent-instance-scope">
                 <input
-                  aria-label={`${instance.agentNameSnapshot ?? "Agent"} Scope`}
+                  aria-label={`${instance.agentNameSnapshot ?? "Agent"} Workspace Scope`}
                   onChange={(event) => {
                     setScopeDrafts((current) => ({
                       ...current,
@@ -1851,16 +1855,16 @@ function AgentThreadInstancesPanel() {
                       return next;
                     });
                   }}
-                  placeholder="Scope，例如 order/refund"
+                  placeholder="Workspace Scope，例如 c:/workspace/project"
                   value={scopeDrafts[instance.id] ?? ""}
                 />
                 <button
                   className="ghost-button"
                   disabled={savingScope === instance.id}
-                  onClick={() => void saveScope(instance)}
+                  onClick={() => void saveWorkspaceScope(instance)}
                   type="button"
                 >
-                  {savingScope === instance.id ? "保存中…" : "保存 Scope"}
+                  {savingScope === instance.id ? "保存中…" : "保存 Workspace Scope"}
                 </button>
                 <button
                   className="ghost-button"
@@ -1964,7 +1968,7 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
             <option value="">全部记录（含 Primary）</option>
             {agents.map((agent) => (
               <option key={agent.id} value={agent.id}>
-                {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
+                {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}（{agent.agentKey}）
               </option>
             ))}
           </select>
@@ -2828,7 +2832,7 @@ function ReuseStrategyField({
         <option value="HOT">偏热</option>
         <option value="COLD">偏冷</option>
       </select>
-      <small>这是调度偏好；Scope、运行状态与 Context 健康仍优先。</small>
+      <small>这是调度偏好；Workspace Scope、运行状态与 Context 健康仍优先。</small>
     </label>
   );
 }
@@ -3265,7 +3269,12 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
       if (result.status === "SUCCESS") {
         setSuccess(`${model.displayName} 测试成功${latency}：${result.message}`);
       } else {
-        setActionError(`${model.displayName} · ${modelTestStatusLabel(result.status)}${latency}：${result.message}`);
+        const attribution = result.status === "PROTOCOL_ERROR"
+          ? "可能原因：Model ID 不存在或拼写错误、Provider Base URL 错误、API Key 无效。"
+          : "";
+        setActionError(
+          `${model.displayName} · ${modelTestStatusLabel(result.status)}${latency}：${result.message}${attribution ? ` ${attribution}` : ""}`,
+        );
       }
       await load();
     } catch (reason: unknown) {
@@ -3797,7 +3806,7 @@ function compatibilityLabel(value: ModelSummary["compatibility"]): string {
 function compatibilityDescription(value: ModelSummary["compatibility"]): string {
   const descriptions = {
     NATIVE: "有较强证据确认该模型针对 Codex 或其所需行为完成原生适配。",
-    COMPATIBLE: "CAS 已通过 Responses API 与 Function Calling 工具闭环验证，当前可用于 Codex Agent；这不表示 Codex 官方原生适配。",
+    COMPATIBLE: "CAS已验证Responses API 和 Function Calling 工具闭环，可用于Codex Agent。（但请根据Codex中实际提示为准）",
     GATEWAY_REQUIRED: "当前不能直接用于 Codex，需要协议转换网关。",
     UNSUPPORTED: "存在明确的不兼容问题，不能用于 Codex Agent。",
     UNKNOWN: "CAS 暂无足够证据判断该模型是否兼容 Codex Agent。",
@@ -3824,7 +3833,7 @@ function verificationDescription(value: ModelSummary["lastTestStatus"]): string 
     AUTH_FAILED: "Provider 拒绝了当前 Credential。",
     MODEL_NOT_FOUND: "Provider 不识别当前 Model ID。",
     RATE_LIMITED: "Provider 在最近一次测试时触发了限流。",
-    PROTOCOL_ERROR: "Endpoint 未返回有效 Responses 响应，或未完成 Function Calling 工具闭环。",
+    PROTOCOL_ERROR: "Endpoint 返回异常（非 2xx 或响应无法解析），请检查 Model ID、Provider Base URL 与 API Key。",
     UNREACHABLE: "最近一次测试无法连接 Provider，或请求超时。",
     SERVER_ERROR: "Provider 在最近一次测试时返回服务端错误。",
   } as const;

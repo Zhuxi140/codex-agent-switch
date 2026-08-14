@@ -47,8 +47,9 @@ use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
     AgentThreadExecutionRequest, AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
     AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
-    AgentThreadInstanceResponse, AgentThreadInstanceScopeRequest, NativeSubagentSyncResponse,
-    UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
+    AgentThreadInstanceResponse, AgentThreadInstanceWorkspaceScopeRequest,
+    NativeSubagentSyncResponse, UsageListRequest, UsageQueryRequest, UsageRecordResponse,
+    UsageService, UsageSummaryResponse,
 };
 
 #[derive(Serialize)]
@@ -428,11 +429,11 @@ fn agent_thread_instance_list(
 }
 
 #[tauri::command]
-fn agent_thread_instance_set_scope(
+fn agent_thread_instance_set_workspace_scope(
     state: tauri::State<'_, UsageService>,
-    request: AgentThreadInstanceScopeRequest,
+    request: AgentThreadInstanceWorkspaceScopeRequest,
 ) -> Result<AgentThreadInstanceResponse, ApiError> {
-    state.set_agent_instance_scope(request)
+    state.set_agent_instance_workspace_scope(request)
 }
 
 #[tauri::command]
@@ -576,7 +577,7 @@ pub fn run() {
             usage_get_summary,
             usage_list_records,
             agent_thread_instance_list,
-            agent_thread_instance_set_scope,
+            agent_thread_instance_set_workspace_scope,
             agent_thread_instance_recommend,
             agent_thread_instance_execute,
             usage_monitor_start,

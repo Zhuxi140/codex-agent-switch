@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 15;
+const LATEST_SCHEMA_VERSION: i64 = 18;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -73,6 +73,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         15,
         "agent_cache_retention_override",
         include_str!("../migrations/0015_agent_cache_retention_override.sql"),
+    ),
+    (
+        16,
+        "codex_native_effective_context",
+        include_str!("../migrations/0016_codex_native_effective_context.sql"),
+    ),
+    (
+        17,
+        "agent_thread_current_context",
+        include_str!("../migrations/0017_agent_thread_current_context.sql"),
+    ),
+    (
+        18,
+        "agent_thread_runtime_fingerprint",
+        include_str!("../migrations/0018_agent_thread_runtime_fingerprint.sql"),
     ),
 ];
 
@@ -193,7 +208,7 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO schema_migrations (version, name, applied_at)
-                VALUES (16, 'future', '2026-01-01T00:00:00Z')",
+                VALUES (19, 'future', '2026-01-01T00:00:00Z')",
                 [],
             )
             .unwrap();
@@ -269,5 +284,71 @@ mod tests {
                 .unwrap();
             assert_eq!(capabilities, vec!["CODEX_MULTI_AGENT"]);
         }
+    }
+
+    #[test]
+    fn migration_uses_codex_effective_context_for_existing_native_threads() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..15]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO providers (
+                    id, provider_key, name, provider_type, base_url, protocol,
+                    auth_type, source, preset_id, created_at, updated_at
+                 ) VALUES (
+                    'provider-native', 'codex-native', 'Codex Native', 'PRESET',
+                    'https://api.openai.com/v1/', 'RESPONSES', 'BEARER_TOKEN',
+                    'BUILT_IN', 'codex-native', '2026-01-01', '2026-01-01'
+                 );
+                 INSERT INTO models (
+                    id, provider_id, model_id, display_name, source,
+                    context_window, created_at, updated_at
+                 ) VALUES (
+                    'model-terra', 'provider-native', 'gpt-5.6-terra', 'GPT-5.6 Terra',
+                    'PRESET', 1050000, '2026-01-01', '2026-01-01'
+                 );
+                 INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type,
+                    sandbox_policy, reasoning_policy, source, created_at, updated_at
+                 ) VALUES (
+                    'agent-terra', 'executor', 'Executor', 'description', 'instruction',
+                    'CUSTOM', 'WORKSPACE_WRITE', 'HIGH', 'CAS', '2026-01-01', '2026-01-01'
+                 );
+                 INSERT INTO agent_model_bindings (
+                    id, agent_id, model_id, source, created_at, updated_at
+                 ) VALUES (
+                    'binding-terra', 'agent-terra', 'model-terra',
+                    'CAS', '2026-01-01', '2026-01-01'
+                 );
+                 INSERT INTO agent_thread_instances (
+                    id, agent_id, codex_thread_id, status, total_tokens,
+                    context_window, created_at, last_used_at
+                 ) VALUES (
+                    'instance-terra', 'agent-terra', 'thread-terra', 'IDLE', 100,
+                    1050000, '2026-01-01', '2026-01-01'
+                 );",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+
+        let model_context: i64 = connection
+            .query_row(
+                "SELECT context_window FROM models WHERE id = 'model-terra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let thread_context: i64 = connection
+            .query_row(
+                "SELECT context_window
+                 FROM agent_thread_instances
+                 WHERE id = 'instance-terra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(model_context, 258_400);
+        assert_eq!(thread_context, 258_400);
     }
 }

@@ -2469,15 +2469,19 @@ fn render_orchestration_instructions(
         OrchestrationFailurePolicy::StrictStop => (
             "Strict Stop",
             "2. 任何会修改文件、执行实现命令或改变外部状态的工作，都必须委派给 phase=EXECUTION 的已启用子 Agent；Primary 自己不得执行。",
-            "7. 若缺少所需 phase 的 Agent，或子 Agent 启动失败、超时、断流、执行失败、返回不可验证结果，立即停止并明确报告失败阶段、Agent、错误与可恢复建议。严禁 Primary 自行接管写入，严禁静默 fallback。",
+            "7. 若缺少所需 phase 的 Agent，或按第 5 条续接、替换后仍无法获得可用子 Agent，或 replacement 启动失败、连续替换没有产生可验证进展、最终结果不可验证，立即停止并明确报告失败阶段、Agent、错误与可恢复建议。严禁 Primary 自行接管写入，严禁静默 fallback。",
         ),
         OrchestrationFailurePolicy::PrimaryFallback => (
             "Primary Fallback",
             "2. 任何会修改文件、执行实现命令或改变外部状态的工作，都必须先委派给 phase=EXECUTION 的已启用子 Agent；仅在第 7 条定义的委派失败后，Primary 才可以接管，不得提前直接执行。",
-            "7. 若缺少所需 phase 的 Agent，或子 Agent 启动失败、超时、断流、执行失败、返回不可验证结果，必须先显式警告用户，说明失败阶段、Agent、错误与接管风险，然后 Primary 可以接管同一任务。最终结果必须记录回退原因、Primary 接管的改动与验证；严禁静默 fallback。",
+            "7. 若缺少所需 phase 的 Agent，或按第 5 条续接、替换后仍无法获得可用子 Agent，或 replacement 启动失败、连续替换没有产生可验证进展、最终结果不可验证，必须先显式警告用户，说明失败阶段、Agent、错误与接管风险，然后 Primary 可以接管同一任务。最终结果必须记录回退原因、Primary 接管的改动与验证；严禁静默 fallback。",
         ),
     };
     let scheduling_command = format!("\"{}\" schedule <agent-key>", helper_path.to_string_lossy());
+    let bind_command = format!(
+        "\"{}\" bind <agent-key> <child-thread-id>",
+        helper_path.to_string_lossy()
+    );
     format!(
         "你是 Primary 编排 Agent，负责理解需求、制定计划、审查结果与最终收束。\n\n\
 当前失败策略：{failure_policy_label}。\n\n\
@@ -2497,12 +2501,12 @@ fn render_orchestration_instructions(
 {write_rule}\n\
 3. 读取、分析、规划和最终审查由 Primary 负责；需要专项探索、验证或审查时，优先委派给对应 phase 的已启用子 Agent。\n\
 4. 创建子 Agent 时必须使用 `fork_turns=\"none\"`，不得继承父会话历史；必须在 prompt 中写全任务范围、约束、工作目录与验收标准。必须使用 `agent_type=<name>` 选择上方清单中的 CAS 自定义 Agent；不得在创建时显式覆盖 `model` 或 `reasoning_effort`，这些配置只由该 Agent 的 TOML 决定。\n\
-5. 同一具体任务只创建一次对应子 Agent；后续补充使用原线程，不得因等待或超时重复创建。子 Agent 成功完成后必须保留其线程，严禁调用 `close_agent`；完成后由 CAS 生命周期同步识别为 IDLE，后续独立任务必须先执行 schedule 决定 REUSE 或 SPAWN。仅在用户明确要求、Agent 被停用或移除、线程异常不可用，或 CAS 判定不再可复用时允许关闭。\n\
+5. 同一具体任务同一时刻只允许一个对应子 Agent。原线程仍在 pending/running，或可通过 `followup_task` 继续时，必须复用原线程；单次等待超时只表示尚未返回，不得据此重复创建。若已确认原线程处于 completed/failed/closed、目标不可达、上下文耗尽或其他无法续接的终止状态，且任务仍有未完成项，可以创建同 `agent_type` 的 replacement Thread；创建前必须确认旧线程不再运行并显式说明替换原因，replacement prompt 必须完整携带原任务、已完成改动、当前验证或失败状态、剩余工作与全部约束。replacement 属于同一任务续作，不执行第 9 条的新独立任务预检；每次 replacement 仍适用本条，不设置“只创建一次”的固定上限，但连续替换没有可验证进展时必须按第 7 条停止。子 Agent 成功完成后必须保留其线程，严禁调用 `close_agent`；完成后由 CAS 生命周期同步识别为 IDLE，后续独立任务必须先执行 schedule 决定 REUSE 或 SPAWN。仅在用户明确要求、Agent 被停用或移除、线程异常不可用，或 CAS 判定不再可复用时允许关闭。\n\
 6. 写入任务必须串行；互不依赖的只读任务可以并行。必须等待子 Agent 完成并审查其结果后再回复用户。\n\
 {failure_rule}\n\
 8. 用户明确要求仅分析或仅给方案时，不得执行写入，也不得擅自扩大任务范围。\n\
-9. 对新的独立任务首次委派前，必须先运行一次只读预检：`{scheduling_command}`，将 `<agent-key>` 替换为上方 Agent 的 name 值。helper 自动读取 CAS 数据库、当前工作目录和 `CODEX_THREAD_ID`；所有固定判断均由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
-10. 只接受该命令输出中唯一一行 `CAS1|<REUSE或SPAWN>|<thread-id或->|<reason>`；零行或多行匹配均视为失败，Shell 宿主自身的诊断行不参与解析。`REUSE` 时必须使用 `followup_task` 将完整任务发给第三段 Thread，不得重复创建；`SPAWN` 时才按第 4 条创建。命令失败、REUSE 缺少 Thread 或目标不可达时，按当前失败策略处理并显式报告，不得静默改走另一条路径。"
+9. 对新的独立任务首次委派前，必须先运行一次只读预检：`{scheduling_command}`，将 `<agent-key>` 替换为上方 Agent 的 name 值。helper 自动读取 CAS 数据库、当前工作目录和 `CODEX_THREAD_ID`；当前工作目录规范化后仅是 Workspace Scope，不是 Task Scope，CAS 不对同一工作区内的逻辑任务作匹配或猜测。所有固定判断均由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
+10. 只接受该命令输出中唯一一行 `CAS1|<REUSE或SPAWN>|<thread-id或->|<reason>`；零行或多行匹配均视为失败，Shell 宿主自身的诊断行不参与解析。`REUSE` 时必须使用 `followup_task` 将完整任务发给第三段 Thread，不得并发创建；`SPAWN` 时才按第 4 条创建。`spawn_agent` 成功返回 child Thread ID 后，必须立刻执行 `{bind_command}`；只有 bind 成功，该次 SPAWN 才算完成。bind 失败按当前失败策略停止，不得把该 Thread 当作可复用候选；REUSE 不执行 bind。命令失败时按当前失败策略处理；REUSE 缺少 Thread、目标不可达或返回无法续接时，先按第 5 条确认旧线程终止并创建 replacement，replacement 也失败时再按当前失败策略处理。所有路径都必须显式报告，不得静默改走另一条路径。"
     )
 }
 
@@ -5430,6 +5434,9 @@ mod tests {
         assert!(active_global.contains("CODEX_THREAD_ID"));
         assert!(active_global.contains("Primary 不得自行读取 Thread、Token 或 Cache"));
         assert!(active_global.contains("cas-helper.exe\" schedule <agent-key>"));
+        assert!(active_global.contains("cas-helper.exe\" bind <agent-key> <child-thread-id>"));
+        assert!(active_global.contains("bind 成功"));
+        assert!(active_global.contains("Workspace Scope，不是 Task Scope"));
         assert!(active_global.contains(ORCHESTRATION_RUNTIME_CONTRACT));
         assert!(active_global.contains("父任务必须使用 Auto 或 Workspace"));
         assert!(!active_global.contains("显式传入 model"));
@@ -5478,6 +5485,12 @@ mod tests {
         let strict = fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert!(strict.contains("当前失败策略：Strict Stop"));
         assert!(strict.contains("严禁 Primary 自行接管写入"));
+        assert!(strict.contains("同一具体任务同一时刻只允许一个对应子 Agent"));
+        assert!(strict.contains("单次等待超时只表示尚未返回"));
+        assert!(strict.contains("上下文耗尽"));
+        assert!(strict.contains("replacement Thread"));
+        assert!(strict.contains("不设置“只创建一次”的固定上限"));
+        assert!(strict.contains("REUSE 缺少 Thread、目标不可达或返回无法续接时"));
 
         open_database(&context.database)
             .unwrap()
@@ -5508,6 +5521,7 @@ mod tests {
         assert!(fallback.contains("当前失败策略：Primary Fallback"));
         assert!(fallback.contains("Primary 可以接管同一任务"));
         assert!(fallback.contains("最终结果必须记录回退原因"));
+        assert!(fallback.contains("按第 5 条续接、替换后仍无法获得可用子 Agent"));
         assert_eq!(
             context.service.runtime_mode().unwrap().active_bindings[0].agent_id,
             executor_id

@@ -577,11 +577,7 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         return if classified.status == ModelConnectionTestStatus::ModelNotFound {
             classified
         } else {
-            ModelConnectionTestResponse::protocol_error_with_message(
-                latency_ms,
-                request_id,
-                "Endpoint 基础请求未返回有效的 Responses API 响应。",
-            )
+            ModelConnectionTestResponse::protocol_error_with_status(status, latency_ms, request_id)
         };
     }
 
@@ -844,7 +840,11 @@ fn classify_probe_response(
     if model_missing {
         ModelConnectionTestResponse::model_not_found(latency_ms, provider_request_id)
     } else {
-        ModelConnectionTestResponse::protocol_error(latency_ms, provider_request_id)
+        ModelConnectionTestResponse::protocol_error_with_status(
+            status,
+            latency_ms,
+            provider_request_id,
+        )
     }
 }
 
@@ -1205,6 +1205,21 @@ impl ModelConnectionTestResponse {
             message,
             Some(false),
             None,
+        )
+    }
+
+    fn protocol_error_with_status(
+        status: StatusCode,
+        latency_ms: Option<u64>,
+        provider_request_id: Option<String>,
+    ) -> Self {
+        Self::protocol_error_with_message(
+            latency_ms,
+            provider_request_id,
+            format!(
+                "Endpoint 返回 HTTP {}，未能识别为 Model ID、凭据或限流类错误。请检查 Model ID 拼写、Provider Base URL 与 API Key。",
+                status.as_u16()
+            ),
         )
     }
 
@@ -1801,6 +1816,11 @@ mod tests {
                 .iter()
                 .all(|model| model.compatibility_level == "NATIVE")
         );
+        assert!(
+            native_models
+                .iter()
+                .all(|model| model.context_window == Some(258_400))
+        );
     }
 
     #[test]
@@ -2166,5 +2186,18 @@ mod tests {
 
         let auth = classify_probe_response(StatusCode::UNAUTHORIZED, b"{}", Some(12), None);
         assert_eq!(auth.status, ModelConnectionTestStatus::AuthFailed);
+
+        let unrecognized = classify_probe_response(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"unexpected provider response"}}"#,
+            Some(12),
+            None,
+        );
+        assert_eq!(
+            unrecognized.status,
+            ModelConnectionTestStatus::ProtocolError
+        );
+        assert!(unrecognized.message.contains("HTTP 400"));
+        assert!(unrecognized.message.contains("Model ID"));
     }
 }

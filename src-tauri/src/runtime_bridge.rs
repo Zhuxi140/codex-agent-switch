@@ -407,8 +407,11 @@ impl RuntimeBridgeService {
             _ => return Err(RuntimeBridgeError::UnexpectedThreadResponse),
         };
         self.bind_managed_session(thread_id.clone(), session_id, origin, Some(cwd.clone()))?;
-        self.usage
-            .register_agent_execution_thread(&plan.profile, &thread_id, &plan.scope_key)?;
+        self.usage.register_agent_execution_thread(
+            &plan.profile,
+            &thread_id,
+            &plan.workspace_scope_key,
+        )?;
         let turn = self.managed_turn_start_inner(ManagedTurnStartRequest {
             thread_id: thread_id.clone(),
             input,
@@ -430,7 +433,7 @@ impl RuntimeBridgeService {
             reason_code: plan.recommendation.reason_code,
             agent_id: plan.profile.agent_id,
             agent_name: plan.profile.agent_name,
-            scope_key: plan.scope_key,
+            workspace_scope_key: plan.workspace_scope_key,
             thread_id,
             turn_id: turn.turn_id,
             status: turn.status,
@@ -1039,7 +1042,7 @@ pub(crate) struct AgentThreadExecutionResponse {
     reason_code: &'static str,
     agent_id: String,
     agent_name: String,
-    scope_key: String,
+    workspace_scope_key: String,
     thread_id: String,
     turn_id: String,
     status: ManagedSessionStatus,
@@ -1278,6 +1281,7 @@ struct TokenUsageSnapshot {
     output_tokens: i64,
     reasoning_output_tokens: i64,
     total_tokens: i64,
+    current_context_tokens: Option<i64>,
     model_context_window: Option<i64>,
     partial: bool,
 }
@@ -1361,6 +1365,10 @@ fn parse_token_breakdown(
     let model_context_window =
         integer_alias(envelope, &["modelContextWindow", "model_context_window"])
             .filter(|value| *value > 0);
+    let current_context_tokens =
+        find_object(envelope, &["lastTokenUsage", "last_token_usage", "last"])
+            .and_then(|usage| integer_alias(usage, &["totalTokens", "total_tokens"]))
+            .filter(|value| *value >= 0);
     let partial = input.is_none()
         || cached.is_none()
         || output.is_none()
@@ -1385,6 +1393,7 @@ fn parse_token_breakdown(
             output_tokens,
             reasoning_output_tokens: reasoning.unwrap_or(0),
             total_tokens,
+            current_context_tokens,
             model_context_window,
             partial,
         },
@@ -1833,6 +1842,7 @@ fn usage_snapshot(
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
         total_tokens: usage.total_tokens,
+        current_context_tokens: usage.current_context_tokens,
         model_context_window: usage.model_context_window,
         usage_status: status.to_owned(),
         source: "CODEX_APP_SERVER".to_owned(),
@@ -2106,6 +2116,7 @@ mod tests {
             reasoning_policy: "HIGH".to_owned(),
             model_slug: "deepseek-v4-flash".to_owned(),
             model_provider: Some("cas_deepseek".to_owned()),
+            runtime_fingerprint: "test".to_owned(),
         };
 
         assert_eq!(
@@ -2132,6 +2143,7 @@ mod tests {
             reasoning_policy: "HIGH".to_owned(),
             model_slug: "gpt-5.6-luna".to_owned(),
             model_provider: None,
+            runtime_fingerprint: "test".to_owned(),
         };
 
         let params = agent_thread_params(&profile, "C:\\workspace\\project");
@@ -2231,6 +2243,7 @@ mod tests {
         };
         assert_eq!(profile, ProtocolProfile::UsageModern);
         assert_eq!(usage.total_tokens, 120);
+        assert_eq!(usage.current_context_tokens, None);
         assert_eq!(usage.cache_write_input_tokens, 4);
         assert!(!usage.partial);
     }
@@ -2249,6 +2262,9 @@ mod tests {
                             "output_tokens": 5,
                             "total_tokens": 35
                         },
+                        "last_token_usage": {
+                            "total_tokens": 12
+                        },
                         "model_context_window": 200000
                     }
                 }
@@ -2261,8 +2277,39 @@ mod tests {
         };
         assert_eq!(profile, ProtocolProfile::UsageLegacy);
         assert_eq!(usage.total_tokens, 35);
+        assert_eq!(usage.current_context_tokens, Some(12));
         assert_eq!(usage.reasoning_output_tokens, 0);
         assert!(usage.partial);
+    }
+
+    #[test]
+    fn keeps_cumulative_and_current_context_usage_separate() {
+        let event = parse_bridge_event(&json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1",
+                "tokenUsage": {
+                    "totalTokenUsage": {
+                        "inputTokens": 1_667_247,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 1,
+                        "reasoningOutputTokens": 0,
+                        "totalTokens": 1_667_248
+                    },
+                    "lastTokenUsage": {"totalTokens": 50_000},
+                    "modelContextWindow": 258_400,
+                    "future": true
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        let BridgeEvent::Usage { usage, .. } = event else {
+            panic!("expected usage event");
+        };
+        assert_eq!(usage.total_tokens, 1_667_248);
+        assert_eq!(usage.current_context_tokens, Some(50_000));
+        assert_eq!(usage.model_context_window, Some(258_400));
     }
 
     #[test]
@@ -2351,6 +2398,7 @@ mod tests {
                     output_tokens: 20,
                     reasoning_output_tokens: 5,
                     total_tokens: 120,
+                    current_context_tokens: Some(100),
                     model_context_window: Some(1_000_000),
                     partial: false,
                 },
