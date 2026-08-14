@@ -1,5 +1,7 @@
 # Codex Agent Switch (CAS)
 
+### 让旗舰模型负责思考，让高性价比模型负责执行
+
 <p align="center">
   <a href="https://img.shields.io/badge/版本-0.4.0-blue"><img src="https://img.shields.io/badge/版本-0.4.0-blue" alt="版本 0.4.0"></a>
   <a href="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6" alt="平台 Windows 10/11"></a>
@@ -12,19 +14,64 @@ CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provide
 > [!WARNING]
 > **v0.4.0 当前仍不推荐作为稳定生产工具安装使用。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
+## 核心理念
+
+我们不追求打造一支「全面、专业、强大」的万能 Agent 团队。我们相信，效果与成本的最优解来自**脑力与体力的分工**：
+
+| 主脑 Primary | 手脚子 Agent |
+| --- | --- |
+| 旗舰高智商模型（如 GPT-5.6 Sol） | 轻量 · 可定制 · 按需启用 |
+| 编排 · 规划 · 审查 · 收束 | 执行 · 测试 · 探索 · 细节审查 |
+| 「想清楚怎么做，并判断做得对不对」 | 每个角色独立绑定高性价比模型 |
+| | 「把活干完，把量跑满」 |
+
+**价值主张：**
+
+- **轻量、可定制**：子 Agent 是一层「角色 + 职责 + 模型绑定」，按需创建、随时调换，不堆砌全能 Agent。
+- **主脑做精、手脚做量**：把编排、规划、审查交给旗舰模型（贵，但决定成败）；把执行、测试、探索交给高性价比模型（便宜，但量大管饱）。
+- **编排、调度、复用三位一体**：多 Agent 按阶段自动委派；Thread 复用（REUSE / SPAWN）按运行时指纹、Workspace Scope 与当前上下文健康度客观判定，避免重复烧钱。
+- **结果**：以更合理的价格，实现更好的效果。
+
+一句话：**用旗舰模型的判断力，配上高性价比模型的执行力。**
+
+## 为什么需要它
+
+Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`），但配置全部手写 TOML，常见痛点：
+
+| 痛点 | CAS 的解法 |
+| --- | --- |
+| 手写 `config.toml` 与 `agents/*.toml`，容易出错 | 表单化管理，Apply 前有 Preview |
+| Agent 和模型绑定过死，换模型要改多个文件 | Agent 与 Model 解耦，绑定关系在 GUI 中维护 |
+| 整套 Agent Team 无法整体切换 | 运行模式一键切换（Default ↔ 编排子 Agent） |
+| 难以判断配置是否真的可用 | Diagnostics、Provider 连通性测试、模型能力校验与兼容状态 |
+| 手工改配置可能破坏已有内容 | 快照 + 回读校验 + 失败自动回滚 + 冲突检测 |
+| 看不出子 Agent 花了多少 Token、复用还是重建 | Token 监控 + 子 Agent 实例追踪 + REUSE / SPAWN 决策 |
+
+## 推荐方案
+
+「旗舰主脑 + 高性价比子 Agent」的现成组合，在 CAS 中一键落地（运行模式 → 编排子 Agent → 为各角色绑定模型）：
+
+| 方案 | 主脑（规划 / 编排 / 审查） | 子 Agent（执行 / 测试 / 探索） | 适用场景 |
+| --- | --- | --- | --- |
+| 方案一 | GPT-5.6 Sol（Codex Native） | DeepSeek V4 Flash | 日常开发主力，性价比优先 |
+| 方案二 | GPT-5.6 Sol（Codex Native） | DeepSeek V4 Pro（如已开放） | 需要更强子 Agent 执行质量 |
+| 方案三 | GPT-5.6 Sol（Codex Native） | GPT-5.6 Terra / GPT-5.6 Luna | 同一模型生态内搭配，切换无感 |
+
+子 Agent 内部仍可分级：Executor / Explorer 用高性价比模型跑量，Reviewer 可上调一档换更强模型——所有角色绑定都可在 GUI 中随时调整。
+
 ## v0.4.0 快速开始
 
 1. 从 GitHub Release 下载 `Codex.Agent.Switch_0.4.0_x64-setup.exe` 并运行安装。
 2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
 3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
 4. 在 Models 与 Agents 页面绑定模型，并在运行模式中启用编排配置；Preview 后 Apply。
-5. 在用量页面同步原生子 Agent Thread，查看状态和 Token 统计。
+5. 在用量页面查看原生子 Agent Thread 的生命周期（基于 rollout 事实）、当前上下文与 Token 统计。
 
 安装包当前未进行代码签名；Windows SmartScreen 可能显示警告，请按组织安全策略核验 Release 的 SHA-256。
 
 ## 测试状态与客观数据
 
-以下结果对应 v0.3.0 发布前的实际验证，可用仓库中的验证命令复查。
+以下结果对应 v0.4.0 发布前的实际验证，可用仓库中的验证命令复查。
 
 ### v0.4.0 发布验证
 
@@ -104,6 +151,13 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 ## 配置与安全
 
 配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。
+
+## Roadmap（按可发布门槛排序）
+
+- **并发正确性**：正式 Primary 路径引入可过期的原子 Claim/Reservation，消除双重 REUSE 与重复 SPAWN。
+- **配置与版本防线**：禁止停用活动 Agent 造成双重事实源；Codex 兼容性由最低版本判断升级为能力级探测，无法证明能力时 Fail Closed。
+- **证据与回归**：UI 展示状态来源、数据新鲜度、父子 Thread 与真实决策日志；补齐真实 Primary 委派 → 复用 → 上下文决策的端到端回归。
+- **显式 Task Scope**：在 Workspace Scope 之上，由 Primary 显式传入稳定模块/任务键，不做 AI 模糊分类。
 
 ## 开发验证
 
