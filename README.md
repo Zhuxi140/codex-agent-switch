@@ -152,6 +152,8 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。
 
+编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段与全局 `AGENTS.md`，并删除 `agents/cas-*.toml` 等 CAS 托管资源（不触碰用户自有内容）；关闭应用时自动执行同一清理路径。
+
 ## Roadmap（按可发布门槛排序）
 
 - **并发正确性**：正式 Primary 路径引入可过期的原子 Claim/Reservation，消除双重 REUSE 与重复 SPAWN。

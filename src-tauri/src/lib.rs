@@ -598,6 +598,18 @@ pub fn run() {
             usage_managed_session_resume,
             usage_managed_turn_start
         ])
-        .run(tauri::generate_context!())
-        .expect("failed to run Codex Agent Switch");
+        .build(tauri::generate_context!())
+        .expect("failed to build Codex Agent Switch")
+        .run(|app, event| {
+            // 关闭应用时清理 .codex 下的编排投影：与「切回 Default」走同一恢复路径
+            // （按 baseline 还原 config.toml 片段与 AGENTS.md、删除 agents/cas-*.toml
+            // 等托管资源），保证磁盘与 CAS 状态一致。
+            if let tauri::RunEvent::ExitRequested { .. } = event
+                && let Some(configuration) = app.try_state::<ConfigurationService>()
+                && let Err(error) =
+                    configuration.switch_runtime_mode(RuntimeModeSwitchRequest::default())
+            {
+                eprintln!("退出清理编排投影失败：{error}");
+            }
+        });
 }
