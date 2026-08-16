@@ -691,6 +691,7 @@ export interface AgentThreadInstanceResponse {
   lastUsedAt: string;
   lastModelUsageAt: string | null;
   lastObservedAt: string | null;
+  taskScopeKey: string | null;
   closedAt: string | null;
 }
 
@@ -786,6 +787,7 @@ export interface ScheduleDecisionResponse {
   cacheHint: string;
   candidateAgeSeconds: number | null;
   claimed: boolean;
+  taskScopeKey: string | null;
 }
 
 export function listAgentScheduleDecisions(
@@ -807,9 +809,10 @@ export function recommendAgentThreadInstance(
   agentId: string,
   workspaceScopeKey: string,
   parentThreadId: string | null = null,
+  taskScopeKey: string | null = null,
 ): Promise<AgentThreadInstanceRecommendation> {
   return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_recommend", {
-    request: { agentId, workspaceScopeKey, parentThreadId },
+    request: { agentId, workspaceScopeKey, parentThreadId, taskScopeKey },
   });
 }
 
@@ -820,6 +823,7 @@ export function executeAgentThread(request: {
   input: string;
   expectedDecision: "REUSE" | "SPAWN";
   expectedCandidateThreadId: string | null;
+  taskScopeKey?: string | null;
 }): Promise<AgentThreadExecutionResponse> {
   return invoke<AgentThreadExecutionResponse>("agent_thread_instance_execute", { request });
 }

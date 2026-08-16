@@ -2477,9 +2477,12 @@ fn render_orchestration_instructions(
             "7. 若缺少所需 phase 的 Agent，或按第 5 条续接、替换后仍无法获得可用子 Agent，或 replacement 启动失败、连续替换没有产生可验证进展、最终结果不可验证，必须先显式警告用户，说明失败阶段、Agent、错误与接管风险，然后 Primary 可以接管同一任务。最终结果必须记录回退原因、Primary 接管的改动与验证；严禁静默 fallback。",
         ),
     };
-    let scheduling_command = format!("\"{}\" schedule <agent-key>", helper_path.to_string_lossy());
+    let scheduling_command = format!(
+        "\"{}\" schedule <agent-key> [task-key]",
+        helper_path.to_string_lossy()
+    );
     let bind_command = format!(
-        "\"{}\" bind <agent-key> <child-thread-id>",
+        "\"{}\" bind <agent-key> <child-thread-id> [task-key]",
         helper_path.to_string_lossy()
     );
     format!(
@@ -2505,8 +2508,8 @@ fn render_orchestration_instructions(
 6. 写入任务必须串行；互不依赖的只读任务可以并行。必须等待子 Agent 完成并审查其结果后再回复用户。\n\
 {failure_rule}\n\
 8. 用户明确要求仅分析或仅给方案时，不得执行写入，也不得擅自扩大任务范围。\n\
-9. 对新的独立任务首次委派前，必须先运行一次只读预检：`{scheduling_command}`，将 `<agent-key>` 替换为上方 Agent 的 name 值。helper 自动读取 CAS 数据库、当前工作目录和 `CODEX_THREAD_ID`；当前工作目录规范化后仅是 Workspace Scope，不是 Task Scope，CAS 不对同一工作区内的逻辑任务作匹配或猜测。所有固定判断均由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
-10. 只接受该命令输出中唯一一行 `CAS1|<REUSE或SPAWN>|<thread-id或->|<reason>`；零行或多行匹配均视为失败，Shell 宿主自身的诊断行不参与解析。`REUSE` 时必须使用 `followup_task` 将完整任务发给第三段 Thread，不得并发创建；`SPAWN` 时才按第 4 条创建。`spawn_agent` 成功返回 child Thread ID 后，必须立刻执行 `{bind_command}`；只有 bind 成功，该次 SPAWN 才算完成。bind 失败按当前失败策略停止，不得把该 Thread 当作可复用候选；REUSE 不执行 bind。命令失败时按当前失败策略处理；REUSE 缺少 Thread、目标不可达或返回无法续接时，先按第 5 条确认旧线程终止并创建 replacement，replacement 也失败时再按当前失败策略处理。所有路径都必须显式报告，不得静默改走另一条路径。"
+9. 对新的独立任务首次委派前，必须先运行一次只读预检：`{scheduling_command}`，将 `<agent-key>` 替换为上方 Agent 的 name 值。helper 自动读取 CAS 数据库、当前工作目录和 `CODEX_THREAD_ID`；当前工作目录规范化后是 Workspace Scope。若任务属于一个稳定、可复述的模块或任务（例如 `auth-oauth2`、`order-refund`），必须从任务描述中提取该稳定键作为可选的 `<task-key>` 传入；只有 `task-key` 完全一致的空闲 Thread 才会被复用，未传 `task-key` 的预检不会复用任何绑定了任务键的 Thread。不得用模糊分类或猜测历史来编造任务键；无法确定稳定键时不传。所有固定判断均由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
+10. 只接受该命令输出中唯一一行 `CAS1|<REUSE或SPAWN>|<thread-id或->|<reason>`；零行或多行匹配均视为失败，Shell 宿主自身的诊断行不参与解析。`REUSE` 时必须使用 `followup_task` 将完整任务发给第三段 Thread，不得并发创建；`SPAWN` 时才按第 4 条创建。`spawn_agent` 成功返回 child Thread ID 后，必须立刻执行 `{bind_command}`，`[task-key]` 与本次预检传入值保持一致；只有 bind 成功，该次 SPAWN 才算完成。bind 失败按当前失败策略停止，不得把该 Thread 当作可复用候选；REUSE 不执行 bind。命令失败时按当前失败策略处理；REUSE 缺少 Thread、目标不可达或返回无法续接时，先按第 5 条确认旧线程终止并创建 replacement，replacement 也失败时再按当前失败策略处理。所有路径都必须显式报告，不得静默改走另一条路径。"
     )
 }
 
@@ -5433,10 +5436,14 @@ mod tests {
         assert!(active_global.contains("CAS1|<REUSE或SPAWN>"));
         assert!(active_global.contains("CODEX_THREAD_ID"));
         assert!(active_global.contains("Primary 不得自行读取 Thread、Token 或 Cache"));
-        assert!(active_global.contains("cas-helper.exe\" schedule <agent-key>"));
-        assert!(active_global.contains("cas-helper.exe\" bind <agent-key> <child-thread-id>"));
+        assert!(active_global.contains("cas-helper.exe\" schedule <agent-key> [task-key]"));
+        assert!(
+            active_global
+                .contains("cas-helper.exe\" bind <agent-key> <child-thread-id> [task-key]")
+        );
         assert!(active_global.contains("bind 成功"));
-        assert!(active_global.contains("Workspace Scope，不是 Task Scope"));
+        assert!(active_global.contains("task-key"));
+        assert!(active_global.contains("不得用模糊分类或猜测历史来编造任务键"));
         assert!(active_global.contains(ORCHESTRATION_RUNTIME_CONTRACT));
         assert!(active_global.contains("父任务必须使用 Auto 或 Workspace"));
         assert!(!active_global.contains("显式传入 model"));

@@ -1679,6 +1679,7 @@ function ScheduleDecisionsPanel() {
                   ? ` · Primary ${shortThreadId(decision.parentThreadId)}`
                   : ""}
                 {decision.claimed ? " · 已锁定" : ""}
+                {decision.taskScopeKey ? ` · Task ${decision.taskScopeKey}` : ""}
                 {" · "}Cache {decision.cacheHint}
               </span>
             </article>
@@ -1924,6 +1925,11 @@ function AgentThreadInstancesPanel() {
                 {instance.parentThreadId && (
                   <code title={instance.parentThreadId}>
                     {`Primary ${shortThreadId(instance.parentThreadId)}`}
+                  </code>
+                )}
+                {instance.taskScopeKey && (
+                  <code title={`Task Scope：${instance.taskScopeKey}`}>
+                    {`Task ${instance.taskScopeKey}`}
                   </code>
                 )}
                 <small

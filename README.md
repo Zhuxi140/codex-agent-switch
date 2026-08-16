@@ -132,6 +132,8 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 复用是一个客观判定：**同一 Agent（含运行时指纹）、同一 Primary、Exact Workspace Scope、IDLE 状态且上下文健康**。
 
+- **显式 Task Scope**：`cas-helper schedule <agent-key> [task-key]` 支持由 Primary 从任务描述提取的稳定任务键（如 `auth-oauth2`）。只有 `task-key` 完全一致的空闲 Thread 才会被复用；未传任务键的预检不会复用任何绑定了任务键的 Thread（fail-closed），CAS 不做任何模糊分类或历史猜测。`bind` 同样接受并固化任务键，既有键不被覆盖。
+
 - **运行时指纹**：每个 Agent 配置生成稳定 `runtime_fingerprint`（纳入 Provider 身份、Base URL、模型、指令、推理与沙箱策略、能力集合），配置变更后旧 Thread 立即失配并 `SPAWN`，不会复用旧配置的线程。
 - **Workspace Scope**：当前工作目录的规范化值（UNIX/UNC 统一归一），不是逻辑任务或模块匹配；执行入口会拒绝 Scope 与实际 `cwd` 不一致的请求。同一工作区内的不同任务不会被 CAS 自动区分。
 - **上下文健康以当前上下文为准**：仅使用 `current_context_tokens`（来自 App Server `lastTokenUsage` 或 rollout 尾部解析），累计 `totalTokenUsage`/`tokens_used` 只用于用量统计；当前上下文或运行时窗口未知时 fail closed 为 `CONTEXT_UNKNOWN` 并 `SPAWN`，不会把「无法证明健康」当作健康。
@@ -156,10 +158,9 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 ## Roadmap（按可发布门槛排序）
 
-- **并发正确性**：正式 Primary 路径引入可过期的原子 Claim/Reservation，消除双重 REUSE 与重复 SPAWN。
+- **并发正确性**：SPAWN 幂等去重——在显式 Task Key 基础上补齐「同任务重复预检返回既有结果」的回写与重试语义。
 - **配置与版本防线**：禁止停用活动 Agent 造成双重事实源；Codex 兼容性由最低版本判断升级为能力级探测，无法证明能力时 Fail Closed。
 - **证据与回归**：UI 展示状态来源、数据新鲜度、父子 Thread 与真实决策日志；补齐真实 Primary 委派 → 复用 → 上下文决策的端到端回归。
-- **显式 Task Scope**：在 Workspace Scope 之上，由 Primary 显式传入稳定模块/任务键，不做 AI 模糊分类。
 
 ## 开发验证
 

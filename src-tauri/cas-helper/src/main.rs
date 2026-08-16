@@ -30,6 +30,7 @@ fn main() -> ExitCode {
             database_path,
             agent_key,
             scope_key,
+            task_scope_key,
         }) => {
             let database_path = database_path.or_else(default_database_path);
             let scope_key = scope_key.or_else(|| {
@@ -39,7 +40,7 @@ fn main() -> ExitCode {
             });
             match (database_path, scope_key) {
                 (Some(database_path), Some(scope_key)) => {
-                    schedule(database_path, &agent_key, &scope_key)
+                    schedule(database_path, &agent_key, &scope_key, task_scope_key.as_deref())
                 }
                 _ => {
                     eprintln!("CAS scheduling environment unavailable.");
@@ -50,6 +51,7 @@ fn main() -> ExitCode {
         Ok(Command::Bind {
             agent_key,
             child_thread_id,
+            task_scope_key,
         }) => {
             let database_path = default_database_path();
             let scope_key = env::current_dir()
@@ -65,6 +67,7 @@ fn main() -> ExitCode {
                     &child_thread_id,
                     &scope_key,
                     &parent_thread_id,
+                    task_scope_key.as_deref(),
                 ),
                 _ => {
                     eprintln!("CAS bind environment unavailable.");
@@ -76,8 +79,8 @@ fn main() -> ExitCode {
             eprintln!(
                 "Usage:\n  cas-helper token <credential-id>\n  \
                  cas-helper schedule <agent-key>\n  \
-                 cas-helper schedule <database-path> <agent-key> <workspace-scope>\n  \
-                 cas-helper bind <agent-key> <child-thread-id>"
+                 cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
+                 cas-helper bind <agent-key> <child-thread-id> [task-key]"
             );
             ExitCode::from(EXIT_INVALID_ARGUMENTS)
         }
@@ -90,11 +93,21 @@ enum Command {
         database_path: Option<PathBuf>,
         agent_key: String,
         scope_key: Option<String>,
+        task_scope_key: Option<String>,
     },
     Bind {
         agent_key: String,
         child_thread_id: String,
+        task_scope_key: Option<String>,
     },
+}
+
+fn valid_task_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 200
+        && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
@@ -114,16 +127,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         let first = args.next().ok_or(())?;
         let second = args.next();
         if second.is_none() {
+            if args.next().is_some() {
+                return Err(());
+            }
             return Ok(Command::Schedule {
                 database_path: None,
                 agent_key: valid_argument(first)?,
                 scope_key: None,
+                task_scope_key: None,
             });
         }
         let database_path = PathBuf::from(first);
         let agent_key = valid_argument(second.expect("checked above"))?;
         let scope_key =
             normalize_workspace_scope_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
+        let task_scope_key = match args.next() {
+            Some(value) => Some(
+                valid_task_key(&valid_argument(value)?).ok_or(())?,
+            ),
+            None => None,
+        };
         if args.next().is_some() || database_path.as_os_str().is_empty() {
             return Err(());
         }
@@ -131,18 +154,26 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             database_path: Some(database_path),
             agent_key,
             scope_key: Some(scope_key),
+            task_scope_key,
         });
     }
     if command == OsStr::new("bind") {
         let agent_key = valid_argument(args.next().ok_or(())?)?;
         let child_thread_id =
             valid_runtime_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
+        let task_scope_key = match args.next() {
+            Some(value) => Some(
+                valid_task_key(&valid_argument(value)?).ok_or(())?,
+            ),
+            None => None,
+        };
         if args.next().is_some() {
             return Err(());
         }
         return Ok(Command::Bind {
             agent_key,
             child_thread_id,
+            task_scope_key,
         });
     }
     Err(())
@@ -210,7 +241,12 @@ fn deliver(id: CredentialId) -> ExitCode {
     }
 }
 
-fn schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCode {
+fn schedule(
+    database_path: PathBuf,
+    agent_key: &str,
+    scope_key: &str,
+    task_scope_key: Option<&str>,
+) -> ExitCode {
     let parent_thread_id = match env::var("CODEX_THREAD_ID")
         .ok()
         .and_then(|value| valid_runtime_key(&value))
@@ -253,6 +289,7 @@ fn schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCod
         agent_key,
         scope_key,
         &parent_thread_id,
+        task_scope_key,
     ) {
         Ok(Some(recommendation)) => match protocol_line(&recommendation) {
             Some(line) => {
@@ -281,6 +318,7 @@ fn bind(
     child_thread_id: &str,
     scope_key: &str,
     parent_thread_id: &str,
+    task_scope_key: Option<&str>,
 ) -> ExitCode {
     let mut connection = match Connection::open_with_flags(
         database_path,
@@ -315,6 +353,7 @@ fn bind(
         child_thread_id,
         scope_key,
         parent_thread_id,
+        task_scope_key,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => {
@@ -384,6 +423,7 @@ fn load_recommendation(
     agent_key: &str,
     scope_key: &str,
     parent_thread_id: &str,
+    task_scope_key: Option<&str>,
 ) -> Result<Option<Recommendation>, ScheduleError> {
     let Some(active) = load_active_agent_profile(connection, agent_key)? else {
         return Ok(None);
@@ -391,7 +431,12 @@ fn load_recommendation(
     // F-11：候选读取与 REUSE 租约写入必须在同一 Immediate 事务内，
     // 否则两个并发 helper 预检可以同时选中同一个 IDLE Thread（双重 REUSE）。
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let mut statement = transaction.prepare(
+    // 显式 Task Scope：同键才可复用；无键任务不得复用绑定了任务键的 Thread（fail-closed）。
+    let (task_condition, task_parameter) = match task_scope_key {
+        Some(key) => ("AND task_scope_key = ?4", Some(key.to_owned())),
+        None => ("AND task_scope_key IS NULL", None),
+    };
+    let mut statement = transaction.prepare(&format!(
         "SELECT id, codex_thread_id, status, input_tokens, cached_input_tokens,
                 output_tokens, total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                 CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
@@ -399,13 +444,19 @@ fn load_recommendation(
                           AND julianday(claimed_until) > julianday('now')
                      THEN 1 ELSE 0 END
          FROM agent_thread_instances
-         WHERE agent_id = ?1 AND scope_key = ?2 AND parent_thread_id = ?3
+         WHERE agent_id = ?1 AND scope_key = ?2 AND parent_thread_id = ?3 {task_condition}
          ORDER BY last_used_at DESC, codex_thread_id ASC",
-    )?;
+    ))?;
+    let mut bound_parameters = vec![
+        active.agent_id.clone(),
+        scope_key.to_owned(),
+        parent_thread_id.to_owned(),
+    ];
+    if let Some(task_parameter) = task_parameter {
+        bound_parameters.push(task_parameter);
+    }
     let candidates = statement
-        .query_map(
-            params![active.agent_id, scope_key, parent_thread_id],
-            |row| {
+        .query_map(rusqlite::params_from_iter(bound_parameters), |row| {
                 Ok(Candidate {
                     instance_id: row.get(0)?,
                     thread_id: row.get(1)?,
@@ -481,12 +532,12 @@ fn load_recommendation(
             id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
             parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
             context_pressure_percent, context_pressure_limit_percent, cache_hint,
-            candidate_age_seconds, claimed
+            candidate_age_seconds, claimed, task_scope_key
          ) VALUES (
             lower(hex(randomblob(16))),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             'HELPER', ?1, (SELECT name FROM agents WHERE id = ?1), ?2,
-            ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+            ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
          )",
         params![
             active.agent_id,
@@ -502,6 +553,7 @@ fn load_recommendation(
             recommendation.candidate_age_seconds,
             i64::from(recommendation.decision == "REUSE"
                 || recommendation.reason_code == "THREAD_CLAIMED"),
+            task_scope_key,
         ],
     )?;
     transaction.commit()?;
@@ -692,6 +744,7 @@ fn bind_native_thread(
     child_thread_id: &str,
     scope_key: &str,
     parent_thread_id: &str,
+    task_scope_key: Option<&str>,
 ) -> Result<(), ScheduleError> {
     let Some(active) = load_active_agent_profile(connection, agent_key)? else {
         return Err(ScheduleError::BindRejected);
@@ -774,12 +827,13 @@ fn bind_native_thread(
             id, agent_id, codex_thread_id, parent_thread_id, scope_key, status,
             input_tokens, cached_input_tokens, output_tokens, total_tokens,
             current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at,
-            last_observed_at
+            last_observed_at, task_scope_key
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, 'UNKNOWN', 0, 0, 0, 0, NULL, NULL, ?6,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            ?7
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = COALESCE(agent_thread_instances.agent_id, excluded.agent_id),
@@ -792,7 +846,8 @@ fn bind_native_thread(
                 agent_thread_instances.runtime_fingerprint,
                 excluded.runtime_fingerprint
             ),
-            last_observed_at = excluded.last_observed_at",
+            last_observed_at = excluded.last_observed_at,
+            task_scope_key = COALESCE(agent_thread_instances.task_scope_key, excluded.task_scope_key)",
         params![
             format!("native-{child_thread_id}"),
             active.agent_id,
@@ -800,6 +855,7 @@ fn bind_native_thread(
             parent_thread_id,
             scope_key,
             fingerprint,
+            task_scope_key,
         ],
     )?;
     transaction.commit()?;
@@ -1095,6 +1151,7 @@ mod tests {
             database_path,
             agent_key,
             scope_key,
+            task_scope_key,
         }) = parse_args(args)
         else {
             panic!("short schedule command should parse");
@@ -1102,6 +1159,7 @@ mod tests {
         assert_eq!(database_path, None);
         assert_eq!(agent_key, "executor");
         assert_eq!(scope_key, None);
+        assert_eq!(task_scope_key, None);
     }
 
     #[test]
@@ -1116,7 +1174,8 @@ mod tests {
             parse_args(valid),
             Ok(Command::Bind {
                 agent_key,
-                child_thread_id
+                child_thread_id,
+                task_scope_key: None
             }) if agent_key == "executor" && child_thread_id == "thread-child"
         ));
         assert!(
@@ -1282,7 +1341,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 20, 0, 5, 25, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 25, NULL, NULL, NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 25, NULL, NULL, NULL, NULL,
+                    NULL
                  )",
                 [],
             )
@@ -1294,6 +1354,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1306,6 +1367,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-other",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1328,6 +1390,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1352,6 +1415,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1370,7 +1434,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'RUNNING', 5, 0, 0, 5, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, NULL, NULL, NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, NULL, NULL, NULL, NULL,
+                    NULL
                  )",
                 [],
             )
@@ -1389,6 +1454,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1407,7 +1473,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
+                    NULL
                  )",
                 [&runtime_fingerprint(
                     &connection,
@@ -1433,6 +1500,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1456,6 +1524,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1468,6 +1537,7 @@ mod tests {
             "thread-native",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap();
         bind_native_thread(
@@ -1477,6 +1547,7 @@ mod tests {
             "thread-native",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1496,6 +1567,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1515,6 +1587,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1579,6 +1652,7 @@ mod tests {
                     thread_id,
                     scope_key,
                     parent_thread_id,
+                    None,
                 )
                 .is_err()
             );
@@ -1604,7 +1678,7 @@ mod tests {
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'UNKNOWN', 0, 0, 0, 0, NULL,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, 'old-fingerprint',
-                    NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL
                  )",
                 [],
             )
@@ -1617,6 +1691,7 @@ mod tests {
                 "thread-native",
                 "c:/workspace/project",
                 "thread-root",
+                None,
             )
             .is_err()
         );
@@ -1760,7 +1835,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
+                    NULL
                  )",
                 [&fingerprint],
             )
@@ -1772,6 +1848,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1795,6 +1872,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1827,7 +1905,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
+                    NULL
                  )",
                 [&fingerprint],
             )
@@ -1839,6 +1918,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1868,6 +1948,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1889,10 +1970,124 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
         assert_eq!(third.decision, "REUSE");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn task_scope_key_gates_reuse_and_bind_persists_it() {
+        let mut connection = scheduling_connection();
+        let home = native_state_home();
+        let fingerprint = runtime_fingerprint(
+            &connection,
+            "agent-1",
+            "model-1",
+            "deepseek",
+            None,
+            "https://api.deepseek.example/v1",
+            "RESPONSES",
+            None,
+            "deepseek-v4",
+            "HIGH",
+            "WORKSPACE_WRITE",
+            "",
+        )
+        .unwrap();
+        for (instance, thread, task) in [
+            ("instance-a", "thread-a", None),
+            ("instance-b", "thread-b", Some("auth-oauth2")),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO agent_thread_instances VALUES (
+                        ?1, 'agent-1', ?2, 'thread-root',
+                        'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
+                        '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?3,
+                        NULL, NULL, NULL, ?4
+                     )",
+                    params![instance, thread, fingerprint, task],
+                )
+                .unwrap();
+        }
+
+        // 同键任务复用同键 Thread。
+        let same_task = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            Some("auth-oauth2"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(same_task.decision, "REUSE");
+        assert_eq!(same_task.candidate_thread_id.as_deref(), Some("thread-b"));
+
+        // 无键任务不得复用绑定了任务键的 Thread（fail-closed）。
+        let no_key = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(no_key.decision, "REUSE");
+        assert_eq!(no_key.candidate_thread_id.as_deref(), Some("thread-a"));
+
+        // 异键任务不匹配任何候选。
+        let other_task = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            Some("payments"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(other_task.decision, "SPAWN");
+        assert_eq!(other_task.reason_code, "NO_WORKSPACE_SCOPE_MATCH");
+        assert_eq!(other_task.candidate_thread_id, None);
+
+        // bind 固化任务键，既有键不被后续 bind 覆盖。
+        insert_native_child(&home, "thread-native", "thread-root", 10, "open");
+        bind_native_thread(
+            &mut connection,
+            &home,
+            "executor",
+            "thread-native",
+            "c:/workspace/project",
+            "thread-root",
+            Some("auth-oauth2"),
+        )
+        .unwrap();
+        bind_native_thread(
+            &mut connection,
+            &home,
+            "executor",
+            "thread-native",
+            "c:/workspace/project",
+            "thread-root",
+            Some("payments"),
+        )
+        .unwrap();
+        let bound_key = connection
+            .query_row(
+                "SELECT task_scope_key FROM agent_thread_instances
+                 WHERE codex_thread_id = 'thread-native'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(bound_key.as_deref(), Some("auth-oauth2"));
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -1913,6 +2108,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1932,7 +2128,7 @@ mod tests {
                     'c:/workspace/project', 'IDLE', 10, 0, 0, 10, 100,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'),
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'), NULL, NULL,
-                    NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL
                  )",
                 [],
             )
@@ -1945,6 +2141,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -1999,6 +2196,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2024,6 +2222,7 @@ mod tests {
             "executor",
             "c:/workspace/project",
             "thread-root",
+            None,
         );
 
         assert!(matches!(
@@ -2121,7 +2320,8 @@ mod tests {
                     runtime_fingerprint TEXT,
                     last_model_usage_at TEXT,
                     last_observed_at TEXT,
-                    claimed_until TEXT
+                    claimed_until TEXT,
+                    task_scope_key TEXT
                  );
                  CREATE TABLE agent_schedule_decisions (
                     id TEXT PRIMARY KEY,
@@ -2139,7 +2339,8 @@ mod tests {
                     context_pressure_limit_percent INTEGER,
                     cache_hint TEXT NOT NULL,
                     candidate_age_seconds INTEGER,
-                    claimed INTEGER NOT NULL DEFAULT 0
+                    claimed INTEGER NOT NULL DEFAULT 0,
+                    task_scope_key TEXT
                  );
                  INSERT INTO agents (
                     id, agent_key, role_key, enabled, reuse_strategy, cache_retention_override_seconds

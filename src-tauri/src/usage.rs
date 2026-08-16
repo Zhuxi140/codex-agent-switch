@@ -168,10 +168,19 @@ impl UsageService {
             .as_deref()
             .map(|value| validate_runtime_key(value, "parentThreadId"))
             .transpose()?;
+        let task_scope_key = request
+            .task_scope_key
+            .as_deref()
+            .map(validate_task_scope_key)
+            .transpose()?;
         let repository = self.repository()?;
         let profile = repository.scheduling_profile(&agent_id)?;
-        let candidates =
-            repository.scope_candidates(&agent_id, &scope_key, parent_thread_id.as_deref())?;
+        let candidates = repository.scope_candidates(
+            &agent_id,
+            &scope_key,
+            parent_thread_id.as_deref(),
+            task_scope_key.as_deref(),
+        )?;
         let recommendation = recommend_instance(scope_key.clone(), candidates, profile.clone());
         repository.record_schedule_decision(
             "DESKTOP_PREVIEW",
@@ -181,6 +190,7 @@ impl UsageService {
             &recommendation,
             profile.runtime_fingerprint.as_deref(),
             recommendation.reason_code == "THREAD_CLAIMED",
+            task_scope_key.as_deref(),
         )?;
         Ok(recommendation)
     }
@@ -200,6 +210,11 @@ impl UsageService {
     ) -> Result<AgentThreadExecutionPlan, ApiError> {
         let agent_id = validate_runtime_key(&request.agent_id, "agentId")?;
         let scope_key = normalize_workspace_scope_key(&request.workspace_scope_key)?;
+        let task_scope_key = request
+            .task_scope_key
+            .as_deref()
+            .map(validate_task_scope_key)
+            .transpose()?;
         let cwd_scope = canonical_workspace_scope_key(&request.cwd)
             .ok_or(UsageServiceError::InvalidField("cwd"))?;
         if cwd_scope != scope_key {
@@ -210,7 +225,8 @@ impl UsageService {
         }
         let mut repository = self.repository()?;
         let scheduling_profile = repository.scheduling_profile(&agent_id)?;
-        let candidates = repository.scope_candidates(&agent_id, &scope_key, None)?;
+        let candidates =
+            repository.scope_candidates(&agent_id, &scope_key, None, task_scope_key.as_deref())?;
         let recommendation =
             recommend_instance(scope_key.clone(), candidates, scheduling_profile.clone());
         if recommendation.decision != request.expected_decision
@@ -236,6 +252,7 @@ impl UsageService {
             &recommendation,
             scheduling_profile.runtime_fingerprint.as_deref(),
             recommendation.reason_code == "THREAD_CLAIMED",
+            task_scope_key.as_deref(),
         )?;
         let profile = repository
             .agent_runtime_profile(&agent_id)?
@@ -453,6 +470,7 @@ pub(crate) struct AgentThreadInstanceRecommendRequest {
     agent_id: String,
     workspace_scope_key: String,
     parent_thread_id: Option<String>,
+    task_scope_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -464,6 +482,7 @@ pub(crate) struct AgentThreadExecutionRequest {
     input: String,
     expected_decision: String,
     expected_candidate_thread_id: Option<String>,
+    task_scope_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -505,6 +524,7 @@ pub(crate) struct ScheduleDecisionResponse {
     pub(crate) cache_hint: String,
     pub(crate) candidate_age_seconds: Option<i64>,
     pub(crate) claimed: bool,
+    pub(crate) task_scope_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -556,6 +576,7 @@ pub(crate) struct AgentThreadInstanceResponse {
     last_used_at: String,
     last_model_usage_at: Option<String>,
     last_observed_at: Option<String>,
+    task_scope_key: Option<String>,
     closed_at: Option<String>,
 }
 
@@ -934,7 +955,7 @@ impl SqliteUsageRepository {
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at
+                    last_model_usage_at, last_observed_at, task_scope_key
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
              ORDER BY last_used_at DESC, codex_thread_id ASC
@@ -966,7 +987,7 @@ impl SqliteUsageRepository {
                 "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at
+                    last_model_usage_at, last_observed_at, task_scope_key
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -980,12 +1001,18 @@ impl SqliteUsageRepository {
         agent_id: &str,
         scope_key: &str,
         parent_thread_id: Option<&str>,
+        task_scope_key: Option<&str>,
     ) -> Result<Vec<AgentThreadCandidate>, UsageRepositoryError> {
-        let mut statement = self.connection.prepare(
+        // 显式 Task Scope：同键才可复用；无键任务不得复用绑定了任务键的 Thread（fail-closed）。
+        let (task_condition, task_parameter) = match task_scope_key {
+            Some(key) => ("AND task_scope_key = ?4", Some(key.to_owned())),
+            None => ("AND task_scope_key IS NULL", None),
+        };
+        let mut statement = self.connection.prepare(&format!(
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at,
+                    last_model_usage_at, last_observed_at, task_scope_key,
                     CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                     CASE WHEN claimed_until IS NOT NULL
                               AND julianday(claimed_until) > julianday('now')
@@ -994,10 +1021,19 @@ impl SqliteUsageRepository {
              WHERE agent_id = ?1
                AND scope_key = ?2
                AND (?3 IS NULL OR parent_thread_id = ?3)
+               {task_condition}
              ORDER BY last_used_at DESC, codex_thread_id ASC",
-        )?;
+        ))?;
+        let mut bound_parameters = vec![
+            Some(agent_id.to_owned()),
+            Some(scope_key.to_owned()),
+            parent_thread_id.map(str::to_owned),
+        ];
+        if let Some(task_parameter) = task_parameter {
+            bound_parameters.push(Some(task_parameter));
+        }
         statement
-            .query_map(params![agent_id, scope_key, parent_thread_id], |row| {
+            .query_map(rusqlite::params_from_iter(bound_parameters), |row| {
                 let instance = map_agent_thread_instance(row)?;
                 Ok(AgentThreadCandidate {
                     instance_id: instance.id,
@@ -1010,8 +1046,8 @@ impl SqliteUsageRepository {
                     current_context_tokens: instance.current_context_tokens,
                     context_window: instance.context_window,
                     runtime_fingerprint: instance.runtime_fingerprint,
-                    age_seconds: row.get(19)?,
-                    claimed: row.get(20)?,
+                    age_seconds: row.get(20)?,
+                    claimed: row.get(21)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1369,19 +1405,20 @@ impl SqliteUsageRepository {
         recommendation: &AgentThreadInstanceRecommendation,
         runtime_fingerprint: Option<&str>,
         claimed: bool,
+        task_scope_key: Option<&str>,
     ) -> Result<(), UsageRepositoryError> {
         self.connection.execute(
             "INSERT INTO agent_schedule_decisions (
                 id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
                 parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
                 context_pressure_percent, context_pressure_limit_percent, cache_hint,
-                candidate_age_seconds, claimed
+                candidate_age_seconds, claimed, task_scope_key
              ) VALUES (
                 lower(hex(randomblob(16))),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 ?1, ?2, (SELECT name FROM agents WHERE id = ?2), ?3,
                 ?4, ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12, ?13
+                ?9, ?10, ?11, ?12, ?13, ?14
              )",
             params![
                 source,
@@ -1397,6 +1434,7 @@ impl SqliteUsageRepository {
                 recommendation.cache_hint,
                 recommendation.candidate_age_seconds,
                 i64::from(claimed),
+                task_scope_key,
             ],
         )?;
         Ok(())
@@ -1410,7 +1448,7 @@ impl SqliteUsageRepository {
             "SELECT id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
                     parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
                     context_pressure_percent, context_pressure_limit_percent, cache_hint,
-                    candidate_age_seconds, claimed
+                    candidate_age_seconds, claimed, task_scope_key
              FROM agent_schedule_decisions
              ORDER BY created_at DESC, rowid DESC
              LIMIT ?1",
@@ -1434,6 +1472,7 @@ impl SqliteUsageRepository {
                     cache_hint: row.get(13)?,
                     candidate_age_seconds: row.get(14)?,
                     claimed: row.get(15)?,
+                    task_scope_key: row.get(16)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1741,6 +1780,7 @@ fn map_agent_thread_instance(
         last_used_at: row.get(15)?,
         last_model_usage_at: row.get(17)?,
         last_observed_at: row.get(18)?,
+        task_scope_key: row.get(19)?,
         closed_at: row.get(16)?,
     })
 }
@@ -2062,6 +2102,14 @@ fn validate_runtime_key(value: &str, field: &'static str) -> Result<String, Usag
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         return Err(UsageServiceError::InvalidField(field));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_task_scope_key(value: &str) -> Result<String, UsageServiceError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
+        return Err(UsageServiceError::InvalidField("taskScopeKey"));
     }
     Ok(value.to_owned())
 }
@@ -2486,6 +2534,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(decision.decision, "REUSE");
@@ -2507,6 +2556,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(decision.decision, "SPAWN");
@@ -2562,6 +2612,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "REUSE".to_owned(),
                 expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(plan.recommendation.decision, "REUSE");
@@ -2575,6 +2626,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "REUSE".to_owned(),
                 expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+                task_scope_key: None,
             })
             .unwrap_err();
         assert_eq!(error.code(), "AGENT_THREAD_DECISION_CHANGED");
@@ -2627,6 +2679,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         let decisions = service
@@ -2656,6 +2709,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "REUSE".to_owned(),
                 expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+                task_scope_key: None,
             })
             .unwrap();
         let decisions = service
@@ -2665,6 +2719,72 @@ mod tests {
         assert_eq!(decisions[0].source, "DESKTOP_EXECUTE");
         assert_eq!(decisions[0].decision, "REUSE");
         assert_eq!(decisions[1].source, "DESKTOP_PREVIEW");
+    }
+
+    #[test]
+    fn task_scope_key_gates_preview_reuse_and_is_audited() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        service
+            .set_agent_instance_workspace_scope(AgentThreadInstanceWorkspaceScopeRequest {
+                thread_id: "thread-child-1".to_owned(),
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+        let fingerprint = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap()
+            .runtime_fingerprint
+            .expect("seed agent 应能计算运行时指纹");
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET runtime_fingerprint = ?1, task_scope_key = 'auth-oauth2'
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [&fingerprint],
+            )
+            .unwrap();
+
+        let preview = |task_scope_key: Option<&str>| {
+            service.recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: None,
+                task_scope_key: task_scope_key.map(str::to_owned),
+            })
+        };
+
+        // 同键复用。
+        let same = preview(Some("auth-oauth2")).unwrap();
+        assert_eq!(same.decision, "REUSE");
+        assert_eq!(same.candidate_thread_id.as_deref(), Some("thread-child-1"));
+
+        // 无键与异键任务都不得复用绑定了任务键的 Thread。
+        for task_scope_key in [None, Some("payments")] {
+            let other = preview(task_scope_key).unwrap();
+            assert_eq!(other.decision, "SPAWN");
+            assert_eq!(other.reason_code, "NO_WORKSPACE_SCOPE_MATCH");
+            assert_eq!(other.candidate_thread_id, None);
+        }
+
+        // 决策审计记录固化任务键。
+        let decisions = service
+            .list_schedule_decisions(AgentScheduleDecisionListRequest::default())
+            .unwrap();
+        assert_eq!(decisions.len(), 3);
+        assert_eq!(decisions[2].task_scope_key.as_deref(), Some("auth-oauth2"));
+        assert_eq!(decisions[1].task_scope_key, None);
+        assert_eq!(decisions[0].task_scope_key.as_deref(), Some("payments"));
+
+        // 非法任务键被拒绝。
+        let error = preview(Some("   ")).unwrap_err();
+        assert_eq!(error.code(), "VALIDATION_ERROR");
     }
 
     #[test]
@@ -2687,6 +2807,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(reuse.decision, "SPAWN");
@@ -2699,6 +2820,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: Some("thread-root-other".to_owned()),
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(other_primary.decision, "SPAWN");
@@ -2709,6 +2831,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/other".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(spawn.decision, "SPAWN");
@@ -2870,6 +2993,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "SPAWN".to_owned(),
                 expected_candidate_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap_err();
 
@@ -2899,6 +3023,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "SPAWN".to_owned(),
                 expected_candidate_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap_err();
         assert_eq!(mismatch.code(), "VALIDATION_ERROR");
@@ -2916,6 +3041,7 @@ mod tests {
                         input: "执行任务".to_owned(),
                         expected_decision: "SPAWN".to_owned(),
                         expected_candidate_thread_id: None,
+                        task_scope_key: None,
                     })
                     .is_ok()
             );
@@ -2928,6 +3054,7 @@ mod tests {
                 input: "执行任务".to_owned(),
                 expected_decision: "SPAWN".to_owned(),
                 expected_candidate_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap_err();
         assert_eq!(posix_case_mismatch.code(), "VALIDATION_ERROR");
@@ -2952,6 +3079,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(decision.decision, "SPAWN");
@@ -2983,6 +3111,7 @@ mod tests {
                 agent_id: "agent-1".to_owned(),
                 workspace_scope_key: "c:/workspace/project".to_owned(),
                 parent_thread_id: None,
+                task_scope_key: None,
             })
             .unwrap();
         assert_eq!(decision.decision, "SPAWN");
