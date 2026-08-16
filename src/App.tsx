@@ -21,6 +21,7 @@ import {
   getUsageSummary,
   getUsageMonitorStatus,
   listAgentPresets,
+  listAgentScheduleDecisions,
   listAgentThreadInstances,
   listAgents,
   listModels,
@@ -69,6 +70,7 @@ import {
   type RuntimeModeResponse,
   type RuntimeBridgeStatusResponse,
   type SandboxPolicy,
+  type ScheduleDecisionResponse,
   type SnapshotSummary,
   type SettingsResponse,
   type UsageQueryRequest,
@@ -1600,8 +1602,90 @@ function UsagePage() {
       )}
       <UsageMonitorCard />
       <AgentThreadInstancesPanel />
+      <ScheduleDecisionsPanel />
       <AgentUsagePanel agents={agents} />
     </>
+  );
+}
+
+function scheduleDecisionSourceLabel(source: string): string {
+  return {
+    HELPER: "helper 预检",
+    DESKTOP_PREVIEW: "界面预览",
+    DESKTOP_EXECUTE: "界面执行",
+  }[source] ?? source;
+}
+
+function ScheduleDecisionsPanel() {
+  const [decisions, setDecisions] = useState<ScheduleDecisionResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      setDecisions(await listAgentScheduleDecisions({ limit: 30 }));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  return (
+    <section className="agent-instance-card" aria-labelledby="schedule-decision-title">
+      <header>
+        <div>
+          <span className="eyebrow">Schedule Decisions</span>
+          <h2 id="schedule-decision-title">调度决策记录</h2>
+          <p>只追加记录 helper 预检与界面预览/执行产生的每次 REUSE / SPAWN 决策及其原因。</p>
+        </div>
+        <div className="runtime-monitor-actions">
+          <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
+            {loading ? "刷新中…" : "刷新"}
+          </button>
+        </div>
+      </header>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {!loading && !error && decisions.length === 0 && (
+        <div className="usage-empty">尚无调度决策记录；helper 预检或界面评估后才会出现。</div>
+      )}
+      {!error && decisions.length > 0 && (
+        <div className="usage-record-list">
+          {decisions.map((decision) => (
+            <article
+              className={`reuse-recommendation ${decision.decision.toLowerCase()}`}
+              key={decision.id}
+              title={`Primary：${decision.parentThreadId ?? "未知"}\n候选：${decision.candidateThreadId ?? "—"}\n指纹：${decision.runtimeFingerprint ?? "未知"}`}
+            >
+              <strong>{decision.decision}</strong>
+              <span>{decision.reasonCode}</span>
+              <span className="reuse-recommendation-meta">
+                {formatUsageDate(decision.createdAt)}
+                {" · "}{scheduleDecisionSourceLabel(decision.source)}
+                {" · "}{decision.agentNameSnapshot ?? decision.agentId ?? "Unknown Agent"}
+                {" · "}Scope {decision.workspaceScopeKey}
+                {decision.candidateThreadId
+                  ? ` · 候选 ${shortThreadId(decision.candidateThreadId)}`
+                  : ""}
+                {decision.parentThreadId
+                  ? ` · Primary ${shortThreadId(decision.parentThreadId)}`
+                  : ""}
+                {decision.claimed ? " · 已锁定" : ""}
+                {" · "}Cache {decision.cacheHint}
+              </span>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -1675,7 +1759,16 @@ function UsageMonitorCard() {
           <EnvironmentField label="Protocol" value={monitor.protocolCompatibility} />
           <EnvironmentField label="Bound Thread" value={monitor.managedSession?.threadId ?? null} />
           <EnvironmentField label="Session State" value={monitor.managedSession?.status ?? null} />
+          <EnvironmentField label="最近事件" value={monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : null} />
+          <EnvironmentField label="启动于" value={monitor.startedAt ? formatUsageDate(monitor.startedAt) : null} />
         </dl>
+      )}
+      {(monitor?.status === "FAILED" || monitor?.status === "DEGRADED") && (
+        <small className="runtime-monitor-warning">
+          事件流已断开或降级；生命周期与 Token 数据停留在最近事件（
+          {monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : "未知"}
+          ），恢复前不得当作当前事实。
+        </small>
       )}
       {monitor?.lastError && <small className="runtime-monitor-warning">{monitor.lastError}</small>}
       {error && <small className="runtime-monitor-warning">{error}</small>}
@@ -1772,7 +1865,10 @@ function AgentThreadInstancesPanel() {
         <div>
           <span className="eyebrow">Subagent Threads</span>
           <h2 id="agent-instance-title">子 Agent 实例</h2>
-          <p>查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Workspace Scope。</p>
+          <p>
+            查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Workspace Scope。
+            数据在本页打开时每 5 秒同步一次，离开本页后不会自动同步。
+          </p>
         </div>
         <div className="runtime-monitor-actions">
           {nativeSync && (
@@ -1820,9 +1916,20 @@ function AgentThreadInstancesPanel() {
                     {agentInstanceStatusLabel(instance.status)}
                   </span>
                 </div>
-                <code title={instance.codexThreadId}>Thread {shortThreadId(instance.codexThreadId)}</code>
-                <small>
-                  {formatUsageDate(instance.lastUsedAt)}
+                <code
+                  title={`Child：${instance.codexThreadId}\nParent：${instance.parentThreadId ?? "未知"}`}
+                >
+                  {`Thread ${shortThreadId(instance.codexThreadId)}`}
+                </code>
+                {instance.parentThreadId && (
+                  <code title={instance.parentThreadId}>
+                    {`Primary ${shortThreadId(instance.parentThreadId)}`}
+                  </code>
+                )}
+                <small
+                  title={`最近观察：${formatUsageDate(instance.lastObservedAt ?? instance.lastUsedAt)}\n最近模型使用：${instance.lastModelUsageAt ? formatUsageDate(instance.lastModelUsageAt) : "未知，缓存判定按未知处理"}`}
+                >
+                  {`数据 ${formatDataAge(instance.lastObservedAt)} · 模型使用 ${formatDataAge(instance.lastModelUsageAt)}`}
                 </small>
               </div>
               <dl>
@@ -1880,7 +1987,7 @@ function AgentThreadInstancesPanel() {
                 return recommendation && (
                   <div
                     className={`reuse-recommendation ${recommendation.decision.toLowerCase()}`}
-                    title="该结果已限定到此 Instance 所属的 Primary Thread；实际委派前 helper 会再次实时查询。"
+                    title="该结果基于当前 CAS 数据的预览；实际委派前 cas-helper 会重新读取 Codex 原生状态并按租约重新决策，结果可能变化。"
                   >
                     <strong>{recommendation.decision}</strong>
                     <span>{recommendation.message}</span>
@@ -2173,8 +2280,8 @@ function agentInstanceStatusLabel(status: AgentThreadInstanceStatus): string {
 
 function agentInstanceStatusDescription(status: AgentThreadInstanceStatus): string {
   return {
-    RUNNING: "Thread 当前正在执行 Turn。",
-    IDLE: "最近一次 Turn 已完成，Thread 可以作为后续复用候选。",
+    RUNNING: "依据 rollout 尾部最近事件判定为运行中；数据新鲜度取决于最近一次同步。",
+    IDLE: "依据 rollout 尾部事件判定最近一次 Turn 已完成，可作为复用候选。",
     RECOVERY_REQUIRED: "Thread 曾异常中断，复用前必须显式恢复。",
     CLOSED: "Thread 已关闭，不再参与复用。",
     UNKNOWN: "CAS 尚未获得足够事件来判断 Thread 状态。",
@@ -2184,6 +2291,27 @@ function agentInstanceStatusDescription(status: AgentThreadInstanceStatus): stri
 function formatUsageDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatDataAge(value: string | null): string {
+  if (!value) {
+    return "未知";
+  }
+  const time = new Date(value).getTime();
+  if (Number.isNaN(time)) {
+    return "未知";
+  }
+  const seconds = Math.max(0, Math.floor((Date.now() - time) / 1000));
+  if (seconds < 60) {
+    return `${seconds} 秒前`;
+  }
+  if (seconds < 3600) {
+    return `${Math.floor(seconds / 60)} 分钟前`;
+  }
+  if (seconds < 86400) {
+    return `${Math.floor(seconds / 3600)} 小时前`;
+  }
+  return `${Math.floor(seconds / 86400)} 天前`;
 }
 
 function localDateInputValue(date: Date): string {

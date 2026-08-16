@@ -4,17 +4,17 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
 };
 use cas_scheduler::{
-    Candidate, Profile, Recommendation, normalize_workspace_scope_key, recommend,
-    runtime_fingerprint as shared_runtime_fingerprint,
+    Candidate, Profile, Recommendation, REUSE_CLAIM_TTL_SECONDS,
+    normalize_workspace_scope_key, recommend, runtime_fingerprint as shared_runtime_fingerprint,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 const EXIT_INVALID_ARGUMENTS: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
@@ -221,9 +221,9 @@ fn schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCod
             return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
         }
     };
-    let connection = match Connection::open_with_flags(
+    let mut connection = match Connection::open_with_flags(
         database_path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
         Ok(connection) => connection,
         Err(_) => {
@@ -231,6 +231,10 @@ fn schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCod
             return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
         }
     };
+    if connection.busy_timeout(Duration::from_secs(5)).is_err() {
+        eprintln!("CAS scheduling database unavailable.");
+        return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+    }
     let codex_home = match resolve_codex_home(
         &connection,
         env::var_os("CODEX_HOME"),
@@ -244,7 +248,7 @@ fn schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCod
         }
     };
     match load_recommendation(
-        &connection,
+        &mut connection,
         &codex_home,
         agent_key,
         scope_key,
@@ -375,7 +379,7 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 }
 
 fn load_recommendation(
-    connection: &Connection,
+    connection: &mut Connection,
     codex_home: &Path,
     agent_key: &str,
     scope_key: &str,
@@ -384,13 +388,16 @@ fn load_recommendation(
     let Some(active) = load_active_agent_profile(connection, agent_key)? else {
         return Ok(None);
     };
-    let mut statement = connection.prepare(
+    // F-11：候选读取与 REUSE 租约写入必须在同一 Immediate 事务内，
+    // 否则两个并发 helper 预检可以同时选中同一个 IDLE Thread（双重 REUSE）。
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut statement = transaction.prepare(
         "SELECT id, codex_thread_id, status, input_tokens, cached_input_tokens,
                 output_tokens, total_tokens, current_context_tokens, context_window, runtime_fingerprint,
-                COALESCE(
-                    CAST(MAX(0, (julianday('now') - julianday(last_used_at)) * 86400) AS INTEGER),
-                    0
-                )
+                CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
+                CASE WHEN claimed_until IS NOT NULL
+                          AND julianday(claimed_until) > julianday('now')
+                     THEN 1 ELSE 0 END
          FROM agent_thread_instances
          WHERE agent_id = ?1 AND scope_key = ?2 AND parent_thread_id = ?3
          ORDER BY last_used_at DESC, codex_thread_id ASC",
@@ -411,12 +418,14 @@ fn load_recommendation(
                     context_window: row.get(8)?,
                     runtime_fingerprint: row.get(9)?,
                     age_seconds: row.get(10)?,
+                    claimed: row.get(11)?,
                 })
             },
         )?
         .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
     let native_candidates = load_native_candidates(
-        connection,
+        &transaction,
         codex_home,
         &active.agent_id,
         agent_key,
@@ -431,20 +440,72 @@ fn load_recommendation(
     for mut candidate in native_candidates {
         if let Some(existing) = candidates.get(&candidate.thread_id) {
             candidate.runtime_fingerprint = existing.runtime_fingerprint.clone();
+            // 原生 updated_at 不是可证明的模型使用时间；保留 CAS 已知值，否则保持未知。
+            candidate.age_seconds = existing.age_seconds;
+            candidate.claimed = existing.claimed;
+            candidate.instance_id = existing.instance_id.clone();
         }
         candidates.insert(candidate.thread_id.clone(), candidate);
     }
     let mut candidates = candidates.into_values().collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         left.age_seconds
-            .cmp(&right.age_seconds)
+            .unwrap_or(i64::MAX)
+            .cmp(&right.age_seconds.unwrap_or(i64::MAX))
             .then_with(|| left.thread_id.cmp(&right.thread_id))
     });
-    Ok(Some(recommend(
-        scope_key.to_owned(),
-        candidates,
-        active.profile,
-    )))
+    let runtime_fingerprint = active.profile.runtime_fingerprint.clone();
+    let mut recommendation = recommend(scope_key.to_owned(), candidates, active.profile);
+    if recommendation.decision == "REUSE"
+        && let Some(instance_id) = recommendation.candidate_instance_id.clone()
+    {
+        // 不校验 status：原生合并后的候选状态来自 rollout 新鲜事实，
+        // CAS 行内状态可能尚未同步；租约只依赖身份与租约空闲条件。
+        let changed = transaction.execute(
+            "UPDATE agent_thread_instances
+             SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
+             WHERE id = ?1
+               AND (
+                   claimed_until IS NULL
+                   OR claimed_until <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               )",
+            params![instance_id, format!("+{REUSE_CLAIM_TTL_SECONDS} seconds")],
+        )?;
+        if changed != 1 {
+            return Err(ScheduleError::Database);
+        }
+    }
+    // F-13：与决策同事务写入只追加审计记录，UI 预览不能冒充实际执行日志。
+    transaction.execute(
+        "INSERT INTO agent_schedule_decisions (
+            id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
+            parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
+            context_pressure_percent, context_pressure_limit_percent, cache_hint,
+            candidate_age_seconds, claimed
+         ) VALUES (
+            lower(hex(randomblob(16))),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            'HELPER', ?1, (SELECT name FROM agents WHERE id = ?1), ?2,
+            ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         )",
+        params![
+            active.agent_id,
+            scope_key,
+            parent_thread_id,
+            recommendation.candidate_thread_id,
+            recommendation.decision,
+            recommendation.reason_code,
+            runtime_fingerprint,
+            recommendation.context_pressure_percent,
+            recommendation.context_pressure_limit_percent,
+            recommendation.cache_hint,
+            recommendation.candidate_age_seconds,
+            i64::from(recommendation.decision == "REUSE"
+                || recommendation.reason_code == "THREAD_CLAIMED"),
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(Some(recommendation))
 }
 
 struct ActiveAgentProfile {
@@ -590,10 +651,6 @@ fn load_native_candidates(
     if !native_state_schema_supported(&state_connection) {
         return Err(ScheduleError::NativeStateIncompatible);
     }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or_default();
     let mut candidates = Vec::new();
     for record in load_native_candidate_records(&state_connection)? {
         if record.parent_thread_id != parent_thread_id
@@ -620,7 +677,9 @@ fn load_native_candidates(
             current_context_tokens: rollout.and_then(|state| state.current_context_tokens),
             context_window: rollout.and_then(|state| state.model_context_window),
             runtime_fingerprint: None,
-            age_seconds: now.saturating_sub(record.updated_at).max(0),
+            // F-10：threads.updated_at 无法证明为最近模型请求时间，缓存年龄保持未知。
+            age_seconds: None,
+            claimed: false,
         });
     }
     Ok(candidates)
@@ -714,9 +773,11 @@ fn bind_native_thread(
         "INSERT INTO agent_thread_instances (
             id, agent_id, codex_thread_id, parent_thread_id, scope_key, status,
             input_tokens, cached_input_tokens, output_tokens, total_tokens,
-            current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at
+            current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at,
+            last_observed_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, 'UNKNOWN', 0, 0, 0, 0, NULL, NULL, ?6,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )
@@ -730,7 +791,8 @@ fn bind_native_thread(
             runtime_fingerprint = COALESCE(
                 agent_thread_instances.runtime_fingerprint,
                 excluded.runtime_fingerprint
-            )",
+            ),
+            last_observed_at = excluded.last_observed_at",
         params![
             format!("native-{child_thread_id}"),
             active.agent_id,
@@ -974,6 +1036,7 @@ fn valid_runtime_key(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn accepts_only_token_and_uuid() {
@@ -1212,21 +1275,21 @@ mod tests {
 
     #[test]
     fn scheduling_is_limited_to_current_primary_thread() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         connection
             .execute(
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 20, 0, 5, 25, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 25, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 25, NULL, NULL, NULL, NULL
                  )",
                 [],
             )
             .unwrap();
 
         let reuse = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1238,7 +1301,7 @@ mod tests {
         assert_eq!(reuse.reason_code, "RUNTIME_FINGERPRINT_UNKNOWN");
 
         let other_primary = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1253,14 +1316,14 @@ mod tests {
 
     #[test]
     fn native_child_is_scheduled_without_cas_sync() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         insert_native_child(&home, "thread-native", "thread-root", 10, "open");
         std::fs::create_dir_all(home.join("thread-writer-locks")).unwrap();
         std::fs::write(home.join("thread-writer-locks/thread-native.lock"), "").unwrap();
 
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1271,18 +1334,20 @@ mod tests {
 
         assert_eq!(recommendation.decision, "SPAWN");
         assert_eq!(recommendation.reason_code, "RUNTIME_FINGERPRINT_UNKNOWN");
+        // F-10：原生 threads.updated_at 不得被当作模型使用时间，候选年龄必须保持未知。
+        assert_eq!(recommendation.candidate_age_seconds, None);
         std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
     fn active_native_turn_is_not_scheduled_for_reuse() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         insert_native_child(&home, "thread-native", "thread-root", 10, "open");
         write_native_rollout(&home, "thread-native", "task_started");
 
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1298,14 +1363,14 @@ mod tests {
 
     #[test]
     fn native_state_overwrites_stale_cas_candidate_status_and_tokens() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         connection
             .execute(
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'RUNNING', 5, 0, 0, 5, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, NULL
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, NULL, NULL, NULL, NULL
                  )",
                 [],
             )
@@ -1319,7 +1384,7 @@ mod tests {
         .unwrap();
 
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1335,14 +1400,14 @@ mod tests {
 
     #[test]
     fn native_refresh_preserves_reliable_cas_runtime_fingerprint() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         connection
             .execute(
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
                  )",
                 [&runtime_fingerprint(
                     &connection,
@@ -1363,7 +1428,7 @@ mod tests {
             .unwrap();
         insert_native_child(&home, "thread-native", "thread-root", 10, "open");
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1386,7 +1451,7 @@ mod tests {
         insert_native_child(&home, "thread-native", "thread-root", 10, "open");
 
         let unbound = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1426,7 +1491,7 @@ mod tests {
             1
         );
         let reuse = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1445,7 +1510,7 @@ mod tests {
             )
             .unwrap();
         let changed = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1538,7 +1603,8 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'UNKNOWN', 0, 0, 0, 0, NULL,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, 'old-fingerprint'
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, 'old-fingerprint',
+                    NULL, NULL, NULL
                  )",
                 [],
             )
@@ -1570,7 +1636,7 @@ mod tests {
 
     #[test]
     fn runtime_fingerprint_reads_runtime_rows_and_ignores_insert_order() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let fingerprint = || {
             runtime_fingerprint(
                 &connection,
@@ -1672,7 +1738,7 @@ mod tests {
 
     #[test]
     fn helper_profile_reads_provider_runtime_fields_from_database() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         let fingerprint = runtime_fingerprint(
             &connection,
@@ -1694,14 +1760,14 @@ mod tests {
                 "INSERT INTO agent_thread_instances VALUES (
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
-                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
                  )",
                 [&fingerprint],
             )
             .unwrap();
 
         let reuse = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1710,6 +1776,9 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(reuse.decision, "REUSE");
+        // last_model_usage_at 为 NULL 时缓存提示必须按未知输出，而不是伪装成命中窗口。
+        assert_eq!(reuse.cache_hint, "UNKNOWN");
+        assert_eq!(reuse.candidate_age_seconds, None);
 
         connection
             .execute(
@@ -1721,7 +1790,7 @@ mod tests {
             )
             .unwrap();
         let changed = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1735,8 +1804,101 @@ mod tests {
     }
 
     #[test]
+    fn reuse_claim_blocks_concurrent_schedule_until_lease_expires() {
+        let mut connection = scheduling_connection();
+        let home = native_state_home();
+        let fingerprint = runtime_fingerprint(
+            &connection,
+            "agent-1",
+            "model-1",
+            "deepseek",
+            None,
+            "https://api.deepseek.example/v1",
+            "RESPONSES",
+            None,
+            "deepseek-v4",
+            "HIGH",
+            "WORKSPACE_WRITE",
+            "",
+        )
+        .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_thread_instances VALUES (
+                    'instance-1', 'agent-1', 'thread-child', 'thread-root',
+                    'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
+                    '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL
+                 )",
+                [&fingerprint],
+            )
+            .unwrap();
+
+        let first = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.decision, "REUSE");
+        // F-13：决策与租约同事务写入只追加审计记录。
+        let audit = connection
+            .query_row(
+                "SELECT source, decision, candidate_thread_id, claimed
+                 FROM agent_schedule_decisions ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(audit, ("HELPER".to_owned(), "REUSE".to_owned(), "thread-child".to_owned(), 1));
+
+        // F-11：租约内的第二次并发预检不得再次选中同一 IDLE Thread。
+        let second = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second.decision, "SPAWN");
+        assert_eq!(second.reason_code, "THREAD_CLAIMED");
+
+        // 租约过期后 Thread 重新可复用。
+        connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 seconds')
+                 WHERE id = 'instance-1'",
+                [],
+            )
+            .unwrap();
+        let third = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(third.decision, "REUSE");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn native_current_context_is_separate_from_cumulative_tokens() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         insert_native_child(&home, "thread-native", "thread-root", 1_667_247, "open");
         std::fs::write(
@@ -1746,7 +1908,7 @@ mod tests {
         )
         .unwrap();
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1761,7 +1923,7 @@ mod tests {
 
     #[test]
     fn merged_candidates_prefer_the_most_recent_idle_thread() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         connection
             .execute(
@@ -1769,7 +1931,8 @@ mod tests {
                     'instance-old', 'agent-1', 'a-old', 'thread-root',
                     'c:/workspace/project', 'IDLE', 10, 0, 0, 10, 100,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'),
-                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'), NULL, NULL
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'), NULL, NULL,
+                    NULL, NULL, NULL
                  )",
                 [],
             )
@@ -1777,7 +1940,7 @@ mod tests {
         insert_native_child(&home, "z-recent", "thread-root", 10, "open");
 
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1793,7 +1956,7 @@ mod tests {
 
     #[test]
     fn native_candidates_require_current_parent_scope_and_agent_identity() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = native_state_home();
         insert_native_child(&home, "z-valid", "thread-root", 10, "open");
         insert_native_child_with_identity(
@@ -1831,7 +1994,7 @@ mod tests {
         );
 
         let recommendation = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1847,7 +2010,7 @@ mod tests {
 
     #[test]
     fn unknown_native_state_schema_stops_scheduling() {
-        let connection = scheduling_connection();
+        let mut connection = scheduling_connection();
         let home = unique_temp_dir("unknown-native-state");
         std::fs::create_dir_all(&home).unwrap();
         Connection::open(home.join("state_99.sqlite"))
@@ -1856,7 +2019,7 @@ mod tests {
             .unwrap();
 
         let result = load_recommendation(
-            &connection,
+            &mut connection,
             &home,
             "executor",
             "c:/workspace/project",
@@ -1891,6 +2054,7 @@ mod tests {
                 "CREATE TABLE agents (
                     id TEXT PRIMARY KEY,
                     agent_key TEXT NOT NULL,
+                    name TEXT,
                     role_key TEXT,
                     enabled INTEGER NOT NULL,
                     reuse_strategy TEXT NOT NULL,
@@ -1954,7 +2118,28 @@ mod tests {
                     created_at TEXT NOT NULL,
                     last_used_at TEXT NOT NULL,
                     current_context_tokens INTEGER,
-                    runtime_fingerprint TEXT
+                    runtime_fingerprint TEXT,
+                    last_model_usage_at TEXT,
+                    last_observed_at TEXT,
+                    claimed_until TEXT
+                 );
+                 CREATE TABLE agent_schedule_decisions (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    agent_id TEXT,
+                    agent_name_snapshot TEXT,
+                    workspace_scope_key TEXT NOT NULL,
+                    parent_thread_id TEXT,
+                    candidate_thread_id TEXT,
+                    decision TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    runtime_fingerprint TEXT,
+                    context_pressure_percent INTEGER,
+                    context_pressure_limit_percent INTEGER,
+                    cache_hint TEXT NOT NULL,
+                    candidate_age_seconds INTEGER,
+                    claimed INTEGER NOT NULL DEFAULT 0
                  );
                  INSERT INTO agents (
                     id, agent_key, role_key, enabled, reuse_strategy, cache_retention_override_seconds

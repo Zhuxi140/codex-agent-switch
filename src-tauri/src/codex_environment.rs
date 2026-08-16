@@ -1,11 +1,15 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use crate::codex_schema_probe::{SchemaCapability, probe_schema_capabilities};
 
 #[cfg(windows)]
 use serde::Deserialize;
@@ -27,6 +31,46 @@ const RUNTIME_OVERRIDE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MINIMUM_MULTI_AGENT_VERSION: ClientVersion = ClientVersion(0, 144, 0);
 #[cfg(windows)]
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+
+// F-02：能力探测结果按 (executable, version) 进程内缓存，environment() 轮询不重复拉起探测进程。
+static AGENT_EXECUTION_CAPABILITY_CACHE: Mutex<
+    Option<HashMap<(PathBuf, String), SchemaCapability>>,
+> = Mutex::new(None);
+
+fn cached_agent_execution_capability(executable: &Path, version: &str) -> SchemaCapability {
+    let mut guard = AGENT_EXECUTION_CAPABILITY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    let key = (executable.to_path_buf(), version.to_owned());
+    if let Some(cached) = cache.get(&key) {
+        return *cached;
+    }
+    let probed = probe_schema_capabilities(executable, &env::temp_dir()).agent_execution;
+    cache.insert(key, probed);
+    probed
+}
+
+/// 无法证明能力时 Fail Closed：仅 Supported 视为可用，其余给出具体缺失项。
+fn multi_agent_capability_issue(
+    capability: SchemaCapability,
+) -> Option<(&'static str, &'static str)> {
+    match capability {
+        SchemaCapability::Supported => None,
+        SchemaCapability::NotDeclared => Some((
+            "CODEX_AGENT_EXECUTION_SCHEMA_NOT_DECLARED",
+            "当前 Codex 的 app-server schema 未声明子 Agent Thread 执行接口，多 Agent 编排不可用。",
+        )),
+        SchemaCapability::Incompatible => Some((
+            "CODEX_AGENT_EXECUTION_SCHEMA_INCOMPATIBLE",
+            "当前 Codex 的 app-server schema 与 CAS 依赖的子 Agent 执行契约不兼容（字段缺失或新增必填）。",
+        )),
+        SchemaCapability::Unavailable => Some((
+            "CODEX_AGENT_EXECUTION_SCHEMA_UNPROVED",
+            "无法证明当前 Codex 具备子 Agent 执行能力（schema 探测失败或超时），已按不可用处理。",
+        )),
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +192,22 @@ pub(crate) fn detect_with_codex_home(custom_codex_home: Option<PathBuf>) -> Code
         ));
     }
 
+    // F-02：最低版本只是快速基线；多 Agent 真正可用还必须由当前可执行文件的
+    // app-server schema 证明子 Agent 执行契约，无法证明时 Fail Closed。
+    let multi_agent_available = if !supported {
+        false
+    } else {
+        let version = version.clone().expect("supported 蕴含版本探测成功");
+        let capability = executable
+            .as_ref()
+            .map(|path| cached_agent_execution_capability(path, &version))
+            .unwrap_or(SchemaCapability::Unavailable);
+        if let Some((code, message)) = multi_agent_capability_issue(capability) {
+            issues.push(issue(code, DiagnosticSeverity::Error, message));
+        }
+        capability == SchemaCapability::Supported
+    };
+
     CodexEnvironment {
         detected: executable.is_some(),
         executable_path: executable.map(path_to_string),
@@ -156,9 +216,16 @@ pub(crate) fn detect_with_codex_home(custom_codex_home: Option<PathBuf>) -> Code
         supported,
         configuration_readable,
         configuration_writable,
-        multi_agent_available: supported,
+        multi_agent_available,
         issues,
     }
+}
+
+pub(crate) fn clear_capability_cache() {
+    let mut guard = AGENT_EXECUTION_CAPABILITY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = None;
 }
 
 pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
@@ -577,6 +644,23 @@ mod tests {
     fn compares_multi_agent_baseline() {
         assert!(parse_client_version("0.144.0").unwrap() >= MINIMUM_MULTI_AGENT_VERSION);
         assert!(parse_client_version("0.143.9").unwrap() < MINIMUM_MULTI_AGENT_VERSION);
+    }
+
+    #[test]
+    fn only_proven_schema_capability_enables_multi_agent() {
+        assert_eq!(
+            multi_agent_capability_issue(SchemaCapability::Supported),
+            None
+        );
+        for capability in [
+            SchemaCapability::NotDeclared,
+            SchemaCapability::Incompatible,
+            SchemaCapability::Unavailable,
+        ] {
+            let (code, _) = multi_agent_capability_issue(capability)
+                .unwrap_or_else(|| panic!("{capability:?} 必须给出具体缺失项"));
+            assert!(code.starts_with("CODEX_AGENT_EXECUTION_SCHEMA"));
+        }
     }
 
     #[test]

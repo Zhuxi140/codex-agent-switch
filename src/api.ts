@@ -689,6 +689,8 @@ export interface AgentThreadInstanceResponse {
   runtimeFingerprint: string | null;
   createdAt: string;
   lastUsedAt: string;
+  lastModelUsageAt: string | null;
+  lastObservedAt: string | null;
   closedAt: string | null;
 }
 
@@ -765,6 +767,31 @@ export function listAgentThreadInstances(
   request: { agentId?: string | null; limit?: number } = {},
 ): Promise<AgentThreadInstanceListResponse> {
   return invoke<AgentThreadInstanceListResponse>("agent_thread_instance_list", { request });
+}
+
+export interface ScheduleDecisionResponse {
+  id: string;
+  createdAt: string;
+  source: "HELPER" | "DESKTOP_PREVIEW" | "DESKTOP_EXECUTE" | string;
+  agentId: string | null;
+  agentNameSnapshot: string | null;
+  workspaceScopeKey: string;
+  parentThreadId: string | null;
+  candidateThreadId: string | null;
+  decision: string;
+  reasonCode: string;
+  runtimeFingerprint: string | null;
+  contextPressurePercent: number | null;
+  contextPressureLimitPercent: number;
+  cacheHint: string;
+  candidateAgeSeconds: number | null;
+  claimed: boolean;
+}
+
+export function listAgentScheduleDecisions(
+  request: { limit?: number } = {},
+): Promise<ScheduleDecisionResponse[]> {
+  return invoke<ScheduleDecisionResponse[]>("agent_schedule_decision_list", { request });
 }
 
 export function setAgentThreadInstanceWorkspaceScope(

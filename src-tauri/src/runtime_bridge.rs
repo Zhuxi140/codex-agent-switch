@@ -1,18 +1,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use uuid::Uuid;
 
+use crate::codex_schema_probe::{SchemaCapability, probe_schema_capabilities};
 use crate::provider::ApiError;
 use crate::usage::{
     AgentRuntimeProfile, AgentThreadExecutionPlan, AgentThreadExecutionRequest, UsageAttribution,
@@ -21,7 +20,6 @@ use crate::usage::{
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct RuntimeBridgeService {
     data_home: PathBuf,
@@ -113,8 +111,7 @@ impl RuntimeBridgeService {
         }
 
         let started_at = self.usage.current_timestamp()?;
-        let schema_capabilities =
-            probe_schema_capabilities(executable, &self.data_home).unwrap_or_default();
+        let schema_capabilities = probe_schema_capabilities(executable, &self.data_home);
         {
             let mut state = self.state()?;
             let mut managed_session = state.managed_session.clone();
@@ -855,16 +852,6 @@ pub(crate) enum ProtocolCompatibility {
     Degraded,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(crate) enum SchemaCapability {
-    Supported,
-    NotDeclared,
-    Incompatible,
-    #[default]
-    Unavailable,
-}
-
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ManagedSessionStatus {
@@ -1046,174 +1033,6 @@ pub(crate) struct AgentThreadExecutionResponse {
     thread_id: String,
     turn_id: String,
     status: ManagedSessionStatus,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct SchemaCapabilities {
-    usage: SchemaCapability,
-    managed_session: SchemaCapability,
-    agent_execution: SchemaCapability,
-}
-
-fn probe_schema_capabilities(
-    executable: &Path,
-    data_home: &Path,
-) -> Result<SchemaCapabilities, RuntimeBridgeError> {
-    let probe_root = data_home
-        .join("runtime-schema-probes")
-        .join(Uuid::new_v4().to_string());
-    fs::create_dir_all(&probe_root).map_err(RuntimeBridgeError::SchemaProbe)?;
-    let result = (|| {
-        let mut child = Command::new(executable)
-            .args(["app-server", "generate-json-schema", "--out"])
-            .arg(&probe_root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(RuntimeBridgeError::SchemaProbe)?;
-        let deadline = Instant::now() + SCHEMA_PROBE_TIMEOUT;
-        let succeeded = loop {
-            match child.try_wait().map_err(RuntimeBridgeError::SchemaProbe)? {
-                Some(status) => break status.success(),
-                None if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    break false;
-                }
-                None => thread::sleep(Duration::from_millis(25)),
-            }
-        };
-        if !succeeded {
-            return Ok(SchemaCapabilities::default());
-        }
-        let usage = if find_schema_file(&probe_root, "ThreadTokenUsageUpdatedNotification.json")
-            .is_some()
-        {
-            SchemaCapability::Supported
-        } else {
-            SchemaCapability::NotDeclared
-        };
-        let managed_session = managed_session_schema_capability(&probe_root);
-        let agent_execution = agent_execution_schema_capability(&probe_root);
-        Ok(SchemaCapabilities {
-            usage,
-            managed_session,
-            agent_execution,
-        })
-    })();
-    let _ = fs::remove_dir_all(&probe_root);
-    result
-}
-
-fn managed_session_schema_capability(probe_root: &Path) -> SchemaCapability {
-    let schemas = [
-        ("ThreadStartParams.json", &[][..]),
-        ("ThreadResumeParams.json", &["threadId"][..]),
-        ("TurnStartParams.json", &["input", "threadId"][..]),
-    ];
-    let mut loaded = Vec::with_capacity(schemas.len());
-    for (name, supported_required) in schemas {
-        let Some(path) = find_schema_file(probe_root, name) else {
-            return SchemaCapability::NotDeclared;
-        };
-        let Ok(contents) = fs::read_to_string(path) else {
-            return SchemaCapability::Incompatible;
-        };
-        let Ok(schema) = serde_json::from_str::<Value>(&contents) else {
-            return SchemaCapability::Incompatible;
-        };
-        loaded.push((schema, supported_required));
-    }
-    if loaded
-        .iter()
-        .all(|(schema, supported)| schema_requires_only(schema, supported))
-    {
-        SchemaCapability::Supported
-    } else {
-        SchemaCapability::Incompatible
-    }
-}
-
-fn agent_execution_schema_capability(probe_root: &Path) -> SchemaCapability {
-    let managed_capability = managed_session_schema_capability(probe_root);
-    if managed_capability != SchemaCapability::Supported {
-        return managed_capability;
-    }
-
-    let schemas = [
-        (
-            "ThreadStartParams.json",
-            &[
-                "cwd",
-                "model",
-                "modelProvider",
-                "developerInstructions",
-                "sandbox",
-            ][..],
-        ),
-        (
-            "ThreadResumeParams.json",
-            &[
-                "threadId",
-                "cwd",
-                "model",
-                "modelProvider",
-                "developerInstructions",
-                "sandbox",
-            ][..],
-        ),
-        ("TurnStartParams.json", &["threadId", "input", "effort"][..]),
-    ];
-    for (name, properties) in schemas {
-        let Some(path) = find_schema_file(probe_root, name) else {
-            return SchemaCapability::NotDeclared;
-        };
-        let Ok(contents) = fs::read_to_string(path) else {
-            return SchemaCapability::Incompatible;
-        };
-        let Ok(schema) = serde_json::from_str::<Value>(&contents) else {
-            return SchemaCapability::Incompatible;
-        };
-        if !properties.iter().all(|property| {
-            schema
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_some_and(|declared| declared.contains_key(*property))
-        }) {
-            return SchemaCapability::Incompatible;
-        }
-    }
-    SchemaCapability::Supported
-}
-
-fn schema_requires_only(schema: &Value, supported_required: &[&str]) -> bool {
-    schema
-        .get("required")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .all(|field| {
-            field
-                .as_str()
-                .is_some_and(|field| supported_required.contains(&field))
-        })
-}
-
-fn find_schema_file(root: &Path, file_name: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some(file_name) {
-            return Some(path);
-        }
-        if path.is_dir()
-            && let Some(found) = find_schema_file(&path, file_name)
-        {
-            return Some(found);
-        }
-    }
-    None
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2092,18 +1911,9 @@ impl fmt::Display for ProtocolParseError {
 mod tests {
     use super::*;
     use crate::usage::UsageListRequest;
-
-    #[test]
-    fn managed_session_schema_rejects_new_unknown_required_fields() {
-        assert!(schema_requires_only(
-            &json!({"required": ["input", "threadId"]}),
-            &["input", "threadId"],
-        ));
-        assert!(!schema_requires_only(
-            &json!({"required": ["input", "threadId", "futureRequired"]}),
-            &["input", "threadId"],
-        ));
-    }
+    use std::fs;
+    use std::time::Instant;
+    use uuid::Uuid;
 
     #[test]
     fn agent_profile_maps_to_exact_app_server_overrides() {

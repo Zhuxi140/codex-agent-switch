@@ -1,6 +1,7 @@
 mod agent;
 mod codex_config;
 mod codex_environment;
+mod codex_schema_probe;
 mod configuration;
 mod domain;
 mod model;
@@ -45,11 +46,11 @@ use runtime_bridge::{
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
-    AgentThreadExecutionRequest, AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
-    AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
-    AgentThreadInstanceResponse, AgentThreadInstanceWorkspaceScopeRequest,
-    NativeSubagentSyncResponse, UsageListRequest, UsageQueryRequest, UsageRecordResponse,
-    UsageService, UsageSummaryResponse,
+    AgentScheduleDecisionListRequest, AgentThreadExecutionRequest, AgentThreadInstanceListRequest,
+    AgentThreadInstanceListResponse, AgentThreadInstanceRecommendRequest,
+    AgentThreadInstanceRecommendation, AgentThreadInstanceResponse,
+    AgentThreadInstanceWorkspaceScopeRequest, NativeSubagentSyncResponse, ScheduleDecisionResponse,
+    UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
 };
 
 #[derive(Serialize)]
@@ -104,6 +105,7 @@ fn codex_get_environment(
 fn codex_redetect(
     state: tauri::State<'_, ConfigurationService>,
 ) -> Result<CodexEnvironment, ApiError> {
+    codex_environment::clear_capability_cache();
     state.environment().map_err(ApiError::from)
 }
 
@@ -445,6 +447,14 @@ fn agent_thread_instance_recommend(
 }
 
 #[tauri::command]
+fn agent_schedule_decision_list(
+    state: tauri::State<'_, UsageService>,
+    request: AgentScheduleDecisionListRequest,
+) -> Result<Vec<ScheduleDecisionResponse>, ApiError> {
+    state.list_schedule_decisions(request)
+}
+
+#[tauri::command]
 fn agent_thread_instance_execute(
     bridge: tauri::State<'_, RuntimeBridgeService>,
     request: AgentThreadExecutionRequest,
@@ -577,6 +587,7 @@ pub fn run() {
             usage_get_summary,
             usage_list_records,
             agent_thread_instance_list,
+            agent_schedule_decision_list,
             agent_thread_instance_set_workspace_scope,
             agent_thread_instance_recommend,
             agent_thread_instance_execute,

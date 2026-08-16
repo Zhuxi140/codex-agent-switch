@@ -8,7 +8,7 @@ use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
 };
 use cas_scheduler::{
-    Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile,
+    Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile, REUSE_CLAIM_TTL_SECONDS,
     normalize_workspace_scope_key as canonical_workspace_scope_key, recommend as schedule_instance,
     runtime_fingerprint as shared_runtime_fingerprint,
 };
@@ -172,7 +172,26 @@ impl UsageService {
         let profile = repository.scheduling_profile(&agent_id)?;
         let candidates =
             repository.scope_candidates(&agent_id, &scope_key, parent_thread_id.as_deref())?;
-        Ok(recommend_instance(scope_key, candidates, profile))
+        let recommendation = recommend_instance(scope_key.clone(), candidates, profile.clone());
+        repository.record_schedule_decision(
+            "DESKTOP_PREVIEW",
+            Some(&agent_id),
+            &scope_key,
+            parent_thread_id.as_deref(),
+            &recommendation,
+            profile.runtime_fingerprint.as_deref(),
+            recommendation.reason_code == "THREAD_CLAIMED",
+        )?;
+        Ok(recommendation)
+    }
+
+    pub(crate) fn list_schedule_decisions(
+        &self,
+        request: AgentScheduleDecisionListRequest,
+    ) -> Result<Vec<ScheduleDecisionResponse>, ApiError> {
+        Ok(self
+            .repository()?
+            .list_schedule_decisions(request.limit.unwrap_or(30).min(200))?)
     }
 
     pub(crate) fn prepare_agent_execution(
@@ -189,15 +208,35 @@ impl UsageService {
         if !matches!(request.expected_decision.as_str(), "REUSE" | "SPAWN") {
             return Err(UsageServiceError::InvalidField("expectedDecision").into());
         }
-        let repository = self.repository()?;
+        let mut repository = self.repository()?;
         let scheduling_profile = repository.scheduling_profile(&agent_id)?;
         let candidates = repository.scope_candidates(&agent_id, &scope_key, None)?;
-        let recommendation = recommend_instance(scope_key.clone(), candidates, scheduling_profile);
+        let recommendation =
+            recommend_instance(scope_key.clone(), candidates, scheduling_profile.clone());
         if recommendation.decision != request.expected_decision
             || recommendation.candidate_thread_id != request.expected_candidate_thread_id
         {
             return Err(UsageServiceError::DecisionChanged.into());
         }
+        if recommendation.decision == "REUSE" {
+            let fingerprint = scheduling_profile
+                .runtime_fingerprint
+                .as_deref()
+                .ok_or(UsageServiceError::DecisionChanged)?;
+            let Some(instance_id) = recommendation.candidate_instance_id.clone() else {
+                return Err(UsageServiceError::DecisionChanged.into());
+            };
+            repository.claim_agent_thread_instance(&instance_id, fingerprint)?;
+        }
+        repository.record_schedule_decision(
+            "DESKTOP_EXECUTE",
+            Some(&agent_id),
+            &scope_key,
+            None,
+            &recommendation,
+            scheduling_profile.runtime_fingerprint.as_deref(),
+            recommendation.reason_code == "THREAD_CLAIMED",
+        )?;
         let profile = repository
             .agent_runtime_profile(&agent_id)?
             .ok_or(UsageServiceError::AgentRuntimeUnavailable)?;
@@ -447,6 +486,33 @@ pub(crate) struct AgentThreadInstanceRecommendation {
     candidate_age_seconds: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ScheduleDecisionResponse {
+    pub(crate) id: String,
+    pub(crate) created_at: String,
+    pub(crate) source: String,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) agent_name_snapshot: Option<String>,
+    pub(crate) workspace_scope_key: String,
+    pub(crate) parent_thread_id: Option<String>,
+    pub(crate) candidate_thread_id: Option<String>,
+    pub(crate) decision: String,
+    pub(crate) reason_code: String,
+    pub(crate) runtime_fingerprint: Option<String>,
+    pub(crate) context_pressure_percent: Option<i64>,
+    pub(crate) context_pressure_limit_percent: i64,
+    pub(crate) cache_hint: String,
+    pub(crate) candidate_age_seconds: Option<i64>,
+    pub(crate) claimed: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentScheduleDecisionListRequest {
+    limit: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AgentThreadExecutionPlan {
     pub(crate) profile: AgentRuntimeProfile,
@@ -488,6 +554,8 @@ pub(crate) struct AgentThreadInstanceResponse {
     runtime_fingerprint: Option<String>,
     created_at: String,
     last_used_at: String,
+    last_model_usage_at: Option<String>,
+    last_observed_at: Option<String>,
     closed_at: Option<String>,
 }
 
@@ -865,7 +933,8 @@ impl SqliteUsageRepository {
         let mut statement = self.connection.prepare(
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
-                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at
+                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
+                    last_model_usage_at, last_observed_at
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
              ORDER BY last_used_at DESC, codex_thread_id ASC
@@ -896,7 +965,8 @@ impl SqliteUsageRepository {
             .query_row(
                 "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
-                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at
+                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
+                    last_model_usage_at, last_observed_at
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -915,10 +985,11 @@ impl SqliteUsageRepository {
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    COALESCE(
-                        CAST(MAX(0, (julianday('now') - julianday(last_used_at)) * 86400) AS INTEGER),
-                        0
-                    )
+                    last_model_usage_at, last_observed_at,
+                    CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
+                    CASE WHEN claimed_until IS NOT NULL
+                              AND julianday(claimed_until) > julianday('now')
+                         THEN 1 ELSE 0 END
              FROM agent_thread_instances
              WHERE agent_id = ?1
                AND scope_key = ?2
@@ -939,7 +1010,8 @@ impl SqliteUsageRepository {
                     current_context_tokens: instance.current_context_tokens,
                     context_window: instance.context_window,
                     runtime_fingerprint: instance.runtime_fingerprint,
-                    age_seconds: row.get(17)?,
+                    age_seconds: row.get(19)?,
+                    claimed: row.get(20)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1194,17 +1266,20 @@ impl SqliteUsageRepository {
             "INSERT INTO agent_thread_instances (
                 id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                 scope_key, status, input_tokens, cached_input_tokens, output_tokens,
-                total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at
+                total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
+                last_model_usage_at, last_observed_at
              ) VALUES (
                 ?1, ?2, ?3, ?4, NULL, ?5, ?6, 0, 0, 0, 0, NULL, NULL, ?7,
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL,
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              )
              ON CONFLICT(codex_thread_id) DO UPDATE SET
                 scope_key = excluded.scope_key,
                 status = excluded.status,
                 runtime_fingerprint = COALESCE(agent_thread_instances.runtime_fingerprint, excluded.runtime_fingerprint),
-                last_used_at = excluded.last_used_at",
+                last_used_at = excluded.last_used_at,
+                last_observed_at = excluded.last_observed_at",
             params![
                 Uuid::new_v4().to_string(),
                 profile.agent_id,
@@ -1225,7 +1300,9 @@ impl SqliteUsageRepository {
     ) -> Result<(), UsageServiceError> {
         let changed = self.connection.execute(
             "UPDATE agent_thread_instances
-             SET status = ?2, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             SET status = ?2,
+                 last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE codex_thread_id = ?1",
             params![thread_id, status],
         )?;
@@ -1242,11 +1319,125 @@ impl SqliteUsageRepository {
     ) -> Result<(), UsageServiceError> {
         self.connection.execute(
             "UPDATE agent_thread_instances
-             SET status = ?2, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             SET status = ?2,
+                 last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE codex_thread_id = ?1",
             params![thread_id, status],
         )?;
         Ok(())
+    }
+
+    fn claim_agent_thread_instance(
+        &mut self,
+        instance_id: &str,
+        runtime_fingerprint: &str,
+    ) -> Result<(), UsageServiceError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE agent_thread_instances
+             SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?3)
+             WHERE id = ?1
+               AND status = 'IDLE'
+               AND runtime_fingerprint = ?2
+               AND (
+                   claimed_until IS NULL
+                   OR claimed_until <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+               )",
+            params![
+                instance_id,
+                runtime_fingerprint,
+                format!("+{REUSE_CLAIM_TTL_SECONDS} seconds"),
+            ],
+        )?;
+        transaction.commit()?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(UsageServiceError::DecisionChanged)
+        }
+    }
+
+    fn record_schedule_decision(
+        &self,
+        source: &str,
+        agent_id: Option<&str>,
+        workspace_scope_key: &str,
+        parent_thread_id: Option<&str>,
+        recommendation: &AgentThreadInstanceRecommendation,
+        runtime_fingerprint: Option<&str>,
+        claimed: bool,
+    ) -> Result<(), UsageRepositoryError> {
+        self.connection.execute(
+            "INSERT INTO agent_schedule_decisions (
+                id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
+                parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
+                context_pressure_percent, context_pressure_limit_percent, cache_hint,
+                candidate_age_seconds, claimed
+             ) VALUES (
+                lower(hex(randomblob(16))),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                ?1, ?2, (SELECT name FROM agents WHERE id = ?2), ?3,
+                ?4, ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11, ?12, ?13
+             )",
+            params![
+                source,
+                agent_id,
+                workspace_scope_key,
+                parent_thread_id,
+                recommendation.candidate_thread_id.as_deref(),
+                recommendation.decision,
+                recommendation.reason_code,
+                runtime_fingerprint,
+                recommendation.context_pressure_percent,
+                recommendation.context_pressure_limit_percent,
+                recommendation.cache_hint,
+                recommendation.candidate_age_seconds,
+                i64::from(claimed),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn list_schedule_decisions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ScheduleDecisionResponse>, UsageRepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
+                    parent_thread_id, candidate_thread_id, decision, reason_code, runtime_fingerprint,
+                    context_pressure_percent, context_pressure_limit_percent, cache_hint,
+                    candidate_age_seconds, claimed
+             FROM agent_schedule_decisions
+             ORDER BY created_at DESC, rowid DESC
+             LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok(ScheduleDecisionResponse {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    source: row.get(2)?,
+                    agent_id: row.get(3)?,
+                    agent_name_snapshot: row.get(4)?,
+                    workspace_scope_key: row.get(5)?,
+                    parent_thread_id: row.get(6)?,
+                    candidate_thread_id: row.get(7)?,
+                    decision: row.get(8)?,
+                    reason_code: row.get(9)?,
+                    runtime_fingerprint: row.get(10)?,
+                    context_pressure_percent: row.get(11)?,
+                    context_pressure_limit_percent: row.get(12)?,
+                    cache_hint: row.get(13)?,
+                    candidate_age_seconds: row.get(14)?,
+                    claimed: row.get(15)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(UsageRepositoryError::from)
     }
 }
 
@@ -1459,10 +1650,12 @@ fn upsert_native_agent_instance(
         "INSERT INTO agent_thread_instances (
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
-                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at
+                    total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
+                    last_model_usage_at, last_observed_at
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13,
-            CASE WHEN ?7 = 'CLOSED' THEN ?13 ELSE NULL END
+            CASE WHEN ?7 = 'CLOSED' THEN ?13 ELSE NULL END,
+            NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = excluded.agent_id,
@@ -1479,6 +1672,7 @@ fn upsert_native_agent_instance(
             ),
             created_at = MIN(agent_thread_instances.created_at, excluded.created_at),
             last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at),
+            last_observed_at = excluded.last_observed_at,
             closed_at = excluded.closed_at
          WHERE agent_thread_instances.agent_id IS NOT excluded.agent_id
             OR agent_thread_instances.agent_name_snapshot IS NOT excluded.agent_name_snapshot
@@ -1493,7 +1687,8 @@ fn upsert_native_agent_instance(
             OR agent_thread_instances.context_window IS NOT excluded.context_window
             OR excluded.created_at < agent_thread_instances.created_at
             OR excluded.last_used_at > agent_thread_instances.last_used_at
-            OR agent_thread_instances.closed_at IS NOT excluded.closed_at",
+            OR agent_thread_instances.closed_at IS NOT excluded.closed_at
+            OR agent_thread_instances.last_observed_at IS NOT excluded.last_observed_at",
         params![
             format!("native-{}", record.thread_id),
             agent_id,
@@ -1544,6 +1739,8 @@ fn map_agent_thread_instance(
         runtime_fingerprint: row.get(13)?,
         created_at: row.get(14)?,
         last_used_at: row.get(15)?,
+        last_model_usage_at: row.get(17)?,
+        last_observed_at: row.get(18)?,
         closed_at: row.get(16)?,
     })
 }
@@ -1754,9 +1951,11 @@ fn sync_agent_thread_instance(
         "INSERT INTO agent_thread_instances (
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
-            total_tokens, current_context_tokens, context_window, created_at, last_used_at, closed_at
+            total_tokens, current_context_tokens, context_window, created_at, last_used_at, closed_at,
+            last_model_usage_at, last_observed_at
          ) VALUES (
-            ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL
+            ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL,
+            ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = COALESCE(agent_thread_instances.agent_id, excluded.agent_id),
@@ -1781,7 +1980,15 @@ fn sync_agent_thread_instance(
                 ELSE agent_thread_instances.current_context_tokens
             END,
             context_window = excluded.context_window,
-            last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at)",
+            last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at),
+            last_model_usage_at = MAX(
+                COALESCE(
+                    agent_thread_instances.last_model_usage_at,
+                    excluded.last_model_usage_at
+                ),
+                excluded.last_model_usage_at
+            ),
+            last_observed_at = excluded.last_observed_at",
         params![
             format!("thread-{}", record.id),
             record.agent_id,
@@ -2122,6 +2329,9 @@ mod tests {
             instances[0].workspace_scope_key.as_deref(),
             Some("c:/workspace/project")
         );
+        // F-10：原生 threads.updated_at 语义未证明为模型请求时间，只能推进观察时间。
+        assert_eq!(instances[0].last_model_usage_at, None);
+        assert!(instances[0].last_observed_at.is_some());
         let second_sync = service.sync_native_subagents(&root).unwrap();
         assert_eq!(second_sync.synced_count, 1);
         assert_eq!(
@@ -2151,6 +2361,34 @@ mod tests {
         assert_eq!(sync.synced_count, 0);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn model_usage_time_comes_from_usage_events_not_observations() {
+        let service = UsageService::in_memory();
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+
+        let instances = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap();
+        assert_eq!(
+            instances[0].last_model_usage_at.as_deref(),
+            Some("2026-08-11T10:01:00Z")
+        );
+        assert!(instances[0].last_observed_at.is_some());
+
+        // 执行状态翻转只是观察事实，不得覆盖或伪造模型使用时间。
+        service
+            .mark_agent_execution_running("thread-child-1")
+            .unwrap();
+        let instances = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap();
+        assert_eq!(
+            instances[0].last_model_usage_at.as_deref(),
+            Some("2026-08-11T10:01:00Z")
+        );
+        assert!(instances[0].last_observed_at.is_some());
     }
 
     #[test]
@@ -2211,6 +2449,222 @@ mod tests {
             instances[0].parent_thread_id.as_deref(),
             Some("thread-root-1")
         );
+    }
+
+    #[test]
+    fn claimed_thread_is_not_reused_and_preview_reports_the_claim() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        service
+            .set_agent_instance_workspace_scope(AgentThreadInstanceWorkspaceScopeRequest {
+                thread_id: "thread-child-1".to_owned(),
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+        let fingerprint = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap()
+            .runtime_fingerprint
+            .expect("seed agent 应能计算运行时指纹");
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET runtime_fingerprint = ?1
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [&fingerprint],
+            )
+            .unwrap();
+
+        let decision = service
+            .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: None,
+            })
+            .unwrap();
+        assert_eq!(decision.decision, "REUSE");
+
+        // F-11：有效租约内的 Thread 不得再次复用，且原因可解释。
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+60 seconds')
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [],
+            )
+            .unwrap();
+        let decision = service
+            .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: None,
+            })
+            .unwrap();
+        assert_eq!(decision.decision, "SPAWN");
+        assert_eq!(decision.reason_code, "THREAD_CLAIMED");
+    }
+
+    #[test]
+    fn execution_claims_reusable_thread_once() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        service
+            .set_agent_instance_workspace_scope(AgentThreadInstanceWorkspaceScopeRequest {
+                thread_id: "thread-child-1".to_owned(),
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO active_agent_bindings (
+                    role_key, agent_id, created_at, updated_at
+                 ) VALUES ('executor', 'agent-1', '2026-08-11T10:00:00Z', '2026-08-11T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let fingerprint = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap()
+            .runtime_fingerprint
+            .expect("seed agent 应能计算运行时指纹");
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET runtime_fingerprint = ?1
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [&fingerprint],
+            )
+            .unwrap();
+
+        let plan = service
+            .prepare_agent_execution(AgentThreadExecutionRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                cwd: "C:\\workspace\\project".to_owned(),
+                input: "执行任务".to_owned(),
+                expected_decision: "REUSE".to_owned(),
+                expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(plan.recommendation.decision, "REUSE");
+
+        // F-11：首次执行已写入租约，同一候选的第二次 REUSE 执行必须被拒绝。
+        let error = service
+            .prepare_agent_execution(AgentThreadExecutionRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                cwd: "C:\\workspace\\project".to_owned(),
+                input: "执行任务".to_owned(),
+                expected_decision: "REUSE".to_owned(),
+                expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+            })
+            .unwrap_err();
+        assert_eq!(error.code(), "AGENT_THREAD_DECISION_CHANGED");
+    }
+
+    #[test]
+    fn schedule_decisions_are_recorded_for_preview_and_execution() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        service
+            .set_agent_instance_workspace_scope(AgentThreadInstanceWorkspaceScopeRequest {
+                thread_id: "thread-child-1".to_owned(),
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO active_agent_bindings (
+                    role_key, agent_id, created_at, updated_at
+                 ) VALUES ('executor', 'agent-1', '2026-08-11T10:00:00Z', '2026-08-11T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let fingerprint = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap()
+            .runtime_fingerprint
+            .expect("seed agent 应能计算运行时指纹");
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET runtime_fingerprint = ?1
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [&fingerprint],
+            )
+            .unwrap();
+
+        // 预览决策也写入审计记录，但来源必须是 DESKTOP_PREVIEW。
+        service
+            .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: None,
+            })
+            .unwrap();
+        let decisions = service
+            .list_schedule_decisions(AgentScheduleDecisionListRequest::default())
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].source, "DESKTOP_PREVIEW");
+        assert_eq!(decisions[0].decision, "REUSE");
+        assert_eq!(
+            decisions[0].candidate_thread_id.as_deref(),
+            Some("thread-child-1")
+        );
+        assert_eq!(
+            decisions[0].runtime_fingerprint.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(
+            decisions[0].agent_name_snapshot.as_deref(),
+            Some("Executor")
+        );
+
+        service
+            .prepare_agent_execution(AgentThreadExecutionRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                cwd: "C:\\workspace\\project".to_owned(),
+                input: "执行任务".to_owned(),
+                expected_decision: "REUSE".to_owned(),
+                expected_candidate_thread_id: Some("thread-child-1".to_owned()),
+            })
+            .unwrap();
+        let decisions = service
+            .list_schedule_decisions(AgentScheduleDecisionListRequest::default())
+            .unwrap();
+        assert_eq!(decisions.len(), 2);
+        assert_eq!(decisions[0].source, "DESKTOP_EXECUTE");
+        assert_eq!(decisions[0].decision, "REUSE");
+        assert_eq!(decisions[1].source, "DESKTOP_PREVIEW");
     }
 
     #[test]
@@ -2563,22 +3017,24 @@ mod tests {
             reuse_strategy: "HOT".to_owned(),
             ..AgentSchedulingProfile::default()
         };
-        assert_eq!(context_pressure_limit(&profile, 10_000), 90);
+        assert_eq!(context_pressure_limit(&profile, Some(10_000)), 90);
 
         profile.reuse_strategy = "COLD".to_owned();
-        assert_eq!(context_pressure_limit(&profile, 10_000), 60);
+        assert_eq!(context_pressure_limit(&profile, Some(10_000)), 60);
 
         profile.cache_support = "SUPPORTED".to_owned();
         profile.cache_retention_hint_seconds = Some(300);
-        assert_eq!(context_pressure_limit(&profile, 301), 50);
+        assert_eq!(context_pressure_limit(&profile, Some(301)), 50);
         assert_eq!(cache_hint(&profile, Some(301)), "OUTSIDE_RETENTION_HINT");
+        assert_eq!(context_pressure_limit(&profile, None), 50);
+        assert_eq!(cache_hint(&profile, None), "UNKNOWN");
 
         profile.agent_cache_retention_override_seconds = Some(120);
         assert_eq!(
             effective_cache_retention(&profile),
             (Some(120), "AGENT_OVERRIDE")
         );
-        assert_eq!(context_pressure_limit(&profile, 121), 50);
+        assert_eq!(context_pressure_limit(&profile, Some(121)), 50);
 
         profile.agent_cache_retention_override_seconds = Some(600);
         assert_eq!(effective_cache_retention(&profile), (Some(300), "PROVIDER"));

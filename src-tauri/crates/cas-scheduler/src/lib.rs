@@ -1,3 +1,7 @@
+/// REUSE 短租约时长：覆盖「预检返回 REUSE」到「follow-up 使 Thread 进入 RUNNING」的窗口。
+// ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
+pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     pub instance_id: String,
@@ -10,7 +14,11 @@ pub struct Candidate {
     pub current_context_tokens: Option<i64>,
     pub context_window: Option<i64>,
     pub runtime_fingerprint: Option<String>,
-    pub age_seconds: i64,
+    /// 距最近一次可证明的模型使用（`last_model_usage_at`）的秒数；
+    /// `None` 表示只有观察时间、没有可证明的模型使用时间，缓存判定按未知处理。
+    pub age_seconds: Option<i64>,
+    /// 该 Thread 是否处于其他并发预检的有效 Claim 租约内。
+    pub claimed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +117,7 @@ pub fn recommend(
 ) -> Recommendation {
     if let Some(candidate) = candidates.iter().find(|candidate| {
         candidate.status == "IDLE"
+            && !candidate.claimed
             && profile.runtime_fingerprint.is_some()
             && candidate.runtime_fingerprint == profile.runtime_fingerprint
             && context_pressure_percent(candidate).is_some_and(|percent| {
@@ -147,6 +156,16 @@ pub fn recommend(
                     "RUNTIME_FINGERPRINT_UNKNOWN"
                 },
                 "候选 Thread 的运行时配置与当前 Agent 不一致或未知，无法安全复用。",
+                workspace_scope_key,
+                Some(candidate),
+                &profile,
+            );
+        }
+        if candidate.claimed {
+            return recommendation(
+                "SPAWN",
+                "THREAD_CLAIMED",
+                "同一 Workspace Scope 的空闲 Thread 刚被并发预检锁定，建议新建或稍后重试。",
                 workspace_scope_key,
                 Some(candidate),
                 &profile,
@@ -211,7 +230,7 @@ fn recommendation(
     candidate: Option<&Candidate>,
     profile: &Profile,
 ) -> Recommendation {
-    let age_seconds = candidate.map(|candidate| candidate.age_seconds);
+    let age_seconds = candidate.map(|candidate| candidate.age_seconds).flatten();
     let (cache_retention_hint_seconds, cache_retention_source) = effective_cache_retention(profile);
     Recommendation {
         decision,
@@ -221,10 +240,7 @@ fn recommendation(
         candidate_instance_id: candidate.map(|candidate| candidate.instance_id.clone()),
         candidate_thread_id: candidate.map(|candidate| candidate.thread_id.clone()),
         context_pressure_percent: candidate.and_then(context_pressure_percent),
-        context_pressure_limit_percent: context_pressure_limit(
-            profile,
-            age_seconds.unwrap_or_default(),
-        ),
+        context_pressure_limit_percent: context_pressure_limit(profile, age_seconds),
         reuse_strategy: profile.reuse_strategy.clone(),
         cache_support: profile.cache_support.clone(),
         cache_retention_type: profile.cache_retention_type.clone(),
@@ -235,14 +251,15 @@ fn recommendation(
     }
 }
 
-pub fn context_pressure_limit(profile: &Profile, age_seconds: i64) -> i64 {
+pub fn context_pressure_limit(profile: &Profile, age_seconds: Option<i64>) -> i64 {
     let base = base_context_pressure_limit(&profile.reuse_strategy);
     if profile.reuse_strategy == "HOT" {
         return base;
     }
     let (retention, _) = effective_cache_retention(profile);
+    // 模型使用时间未知时无法证明仍在缓存窗口内，按已过窗口的保守方向处理。
     let cache_penalty = profile.cache_support == "UNSUPPORTED"
-        || retention.is_some_and(|retention| age_seconds > retention);
+        || age_seconds.is_none_or(|age| retention.is_some_and(|retention| age > retention));
     if cache_penalty { base - 10 } else { base }
 }
 
@@ -311,8 +328,20 @@ mod tests {
             current_context_tokens: Some(total_tokens),
             context_window: Some(100),
             runtime_fingerprint: Some("fingerprint".to_owned()),
-            age_seconds: 10,
+            age_seconds: Some(10),
+            claimed: false,
         }
+    }
+
+    #[test]
+    fn claimed_idle_thread_spawns_until_lease_expires() {
+        let mut profile = Profile::default();
+        profile.runtime_fingerprint = Some("fingerprint".to_owned());
+        let mut candidate = candidate("IDLE", 50);
+        candidate.claimed = true;
+        let result = recommend("c:/workspace/project".to_owned(), vec![candidate], profile);
+        assert_eq!(result.decision, "SPAWN");
+        assert_eq!(result.reason_code, "THREAD_CLAIMED");
     }
 
     #[test]
@@ -325,6 +354,29 @@ mod tests {
         assert_eq!(result.decision, "REUSE");
         assert_eq!(result.candidate_thread_id.as_deref(), Some("thread-1"));
         assert_eq!(result.context_pressure_percent, Some(50));
+    }
+
+    #[test]
+    fn unknown_model_usage_age_is_unknown_cache_and_penalizes_limit() {
+        let mut profile = Profile::default();
+        profile.runtime_fingerprint = Some("fingerprint".to_owned());
+        profile.cache_support = "SUPPORTED".to_owned();
+        profile.cache_retention_hint_seconds = Some(300);
+        let mut candidate = candidate("IDLE", 50);
+        candidate.age_seconds = None;
+        let result = recommend("c:/workspace/project".to_owned(), vec![candidate], profile);
+        assert_eq!(result.decision, "REUSE");
+        assert_eq!(result.cache_hint, "UNKNOWN");
+        assert_eq!(result.candidate_age_seconds, None);
+        assert_eq!(result.context_pressure_limit_percent, 70);
+
+        let mut profile = Profile::default();
+        profile.cache_support = "SUPPORTED".to_owned();
+        profile.cache_retention_hint_seconds = Some(300);
+        assert_eq!(context_pressure_limit(&profile, Some(10)), 80);
+        assert_eq!(context_pressure_limit(&profile, None), 70);
+        assert_eq!(cache_hint(&profile, Some(10)), "WITHIN_RETENTION_HINT");
+        assert_eq!(cache_hint(&profile, None), "UNKNOWN");
     }
 
     #[test]
