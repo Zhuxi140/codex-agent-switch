@@ -5,6 +5,13 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # glib (RUSTSEC) <0.20 修复版存在，但 gtk3-rs 停在 0.18（0.19/0.20 未发布），
+      # tauri 2.11.5 的 Linux GTK 链锁死 glib ^0.18，无任何可安装组合能到达 0.20。
+      # 该链仅存在于 Linux 目标，Windows 构建不编译 glib，无实际影响；
+      # 等 gtk3-rs / tauri 发布新版本后移除此规则，告警会随 glib >=0.20 自动消除。
+      - dependency-name: "glib"
+        versions: ["<0.20"]
 
   - package-ecosystem: npm
     directory: /
