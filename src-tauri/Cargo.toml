@@ -1,6 +1,6 @@
 [package]
 name = "codex-agent-switch"
-version = "0.4.0"
+version = "0.4.1"
 description = "Codex multi-agent model binding manager"
 authors = ["Codex Agent Switch contributors"]
 edition = "2024"

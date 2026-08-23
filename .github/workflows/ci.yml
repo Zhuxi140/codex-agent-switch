@@ -26,8 +26,11 @@ jobs:
       - name: 准备 cas-helper sidecar
         run: npm run prepare:sidecar
 
+      - name: Rust 格式检查
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
       - name: Rust 单元测试
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
 
       - name: Rust Release 编译
         run: cargo build --release --manifest-path src-tauri/Cargo.toml

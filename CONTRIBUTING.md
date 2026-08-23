@@ -12,7 +12,8 @@
 
 ```bash
 npm.cmd run build          # 前端构建验证（tsc + vite build）
-cargo test --manifest-path src-tauri/Cargo.toml   # Rust 单元测试
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check  # Rust 格式检查
+cargo test --manifest-path src-tauri/Cargo.toml --workspace      # 全 workspace 单元测试
 npm.cmd run bundle:windows # 生成 Windows 安装包（NSIS）
 ```
 
@@ -28,7 +29,7 @@ npm.cmd run bundle:windows # 生成 Windows 安装包（NSIS）
 2. 遵循既有代码风格（外科手术式修改：只改必要部分）
 3. 所有改动必须通过验证：
    - `npm.cmd run build` 通过
-   - `cargo test --manifest-path src-tauri/Cargo.toml` 通过（涉及 Rust 改动时）
+   - `cargo test --manifest-path src-tauri/Cargo.toml --workspace` 通过（涉及 Rust 改动时）
 4. 每个 PR 保持单一职责，方便审查与回滚
 
 ## 代码与文档约定

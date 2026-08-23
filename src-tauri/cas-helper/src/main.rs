@@ -10,8 +10,8 @@ use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
 };
 use cas_scheduler::{
-    Candidate, Profile, Recommendation, REUSE_CLAIM_TTL_SECONDS,
-    normalize_workspace_scope_key, recommend, runtime_fingerprint as shared_runtime_fingerprint,
+    Candidate, Profile, REUSE_CLAIM_TTL_SECONDS, Recommendation, normalize_workspace_scope_key,
+    recommend, runtime_fingerprint as shared_runtime_fingerprint,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -39,9 +39,12 @@ fn main() -> ExitCode {
                     .and_then(|path| normalize_workspace_scope_key(&path.to_string_lossy()))
             });
             match (database_path, scope_key) {
-                (Some(database_path), Some(scope_key)) => {
-                    schedule(database_path, &agent_key, &scope_key, task_scope_key.as_deref())
-                }
+                (Some(database_path), Some(scope_key)) => schedule(
+                    database_path,
+                    &agent_key,
+                    &scope_key,
+                    task_scope_key.as_deref(),
+                ),
                 _ => {
                     eprintln!("CAS scheduling environment unavailable.");
                     ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
@@ -104,9 +107,7 @@ enum Command {
 
 fn valid_task_key(value: &str) -> Option<String> {
     let value = value.trim();
-    (!value.is_empty()
-        && value.len() <= 200
-        && !value.chars().any(char::is_control))
+    (!value.is_empty() && value.len() <= 200 && !value.chars().any(char::is_control))
         .then(|| value.to_owned())
 }
 
@@ -142,9 +143,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         let scope_key =
             normalize_workspace_scope_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
         let task_scope_key = match args.next() {
-            Some(value) => Some(
-                valid_task_key(&valid_argument(value)?).ok_or(())?,
-            ),
+            Some(value) => Some(valid_task_key(&valid_argument(value)?).ok_or(())?),
             None => None,
         };
         if args.next().is_some() || database_path.as_os_str().is_empty() {
@@ -162,9 +161,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         let child_thread_id =
             valid_runtime_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
         let task_scope_key = match args.next() {
-            Some(value) => Some(
-                valid_task_key(&valid_argument(value)?).ok_or(())?,
-            ),
+            Some(value) => Some(valid_task_key(&valid_argument(value)?).ok_or(())?),
             None => None,
         };
         if args.next().is_some() {
@@ -457,22 +454,21 @@ fn load_recommendation(
     }
     let candidates = statement
         .query_map(rusqlite::params_from_iter(bound_parameters), |row| {
-                Ok(Candidate {
-                    instance_id: row.get(0)?,
-                    thread_id: row.get(1)?,
-                    status: row.get(2)?,
-                    input_tokens: row.get(3)?,
-                    cached_input_tokens: row.get(4)?,
-                    output_tokens: row.get(5)?,
-                    total_tokens: row.get(6)?,
-                    current_context_tokens: row.get(7)?,
-                    context_window: row.get(8)?,
-                    runtime_fingerprint: row.get(9)?,
-                    age_seconds: row.get(10)?,
-                    claimed: row.get(11)?,
-                })
-            },
-        )?
+            Ok(Candidate {
+                instance_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                status: row.get(2)?,
+                input_tokens: row.get(3)?,
+                cached_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                total_tokens: row.get(6)?,
+                current_context_tokens: row.get(7)?,
+                context_window: row.get(8)?,
+                runtime_fingerprint: row.get(9)?,
+                age_seconds: row.get(10)?,
+                claimed: row.get(11)?,
+            })
+        })?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
     let native_candidates = load_native_candidates(
@@ -551,8 +547,10 @@ fn load_recommendation(
             recommendation.context_pressure_limit_percent,
             recommendation.cache_hint,
             recommendation.candidate_age_seconds,
-            i64::from(recommendation.decision == "REUSE"
-                || recommendation.reason_code == "THREAD_CLAIMED"),
+            i64::from(
+                recommendation.decision == "REUSE"
+                    || recommendation.reason_code == "THREAD_CLAIMED"
+            ),
             task_scope_key,
         ],
     )?;
@@ -1939,7 +1937,15 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(audit, ("HELPER".to_owned(), "REUSE".to_owned(), "thread-child".to_owned(), 1));
+        assert_eq!(
+            audit,
+            (
+                "HELPER".to_owned(),
+                "REUSE".to_owned(),
+                "thread-child".to_owned(),
+                1
+            )
+        );
 
         // F-11：租约内的第二次并发预检不得再次选中同一 IDLE Thread。
         let second = load_recommendation(

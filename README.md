@@ -3,7 +3,7 @@
 ### 让旗舰模型负责思考，让高性价比模型负责执行
 
 <p align="center">
-  <a href="https://img.shields.io/badge/版本-0.4.0-blue"><img src="https://img.shields.io/badge/版本-0.4.0-blue" alt="版本 0.4.0"></a>
+  <a href="https://img.shields.io/badge/版本-0.4.1-blue"><img src="https://img.shields.io/badge/版本-0.4.1-blue" alt="版本 0.4.1"></a>
   <a href="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6"><img src="https://img.shields.io/badge/平台-Windows%2010%2F11-0078D6" alt="平台 Windows 10/11"></a>
   <a href="https://img.shields.io/badge/License-MIT-yellow"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License MIT"></a>
   <a href="https://github.com/Zhuxi140/codex-agent-switch/actions"><img src="https://img.shields.io/github/actions/workflow/status/Zhuxi140/codex-agent-switch/ci.yml?label=CI" alt="CI"></a>
@@ -12,7 +12,7 @@
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
 > [!WARNING]
-> **v0.4.0 当前仍不推荐作为稳定生产工具安装使用。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+> **v0.4.1 当前仍不推荐作为稳定生产工具安装使用。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
 ## 核心理念
 
@@ -59,9 +59,9 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 子 Agent 内部仍可分级：Executor / Explorer 用高性价比模型跑量，Reviewer 可上调一档换更强模型——所有角色绑定都可在 GUI 中随时调整。
 
-## v0.4.0 快速开始
+## v0.4.1 快速开始
 
-1. 从 GitHub Release 下载 `Codex.Agent.Switch_0.4.0_x64-setup.exe` 并运行安装。
+1. 从 GitHub Release 下载 `Codex.Agent.Switch_0.4.1_x64-setup.exe` 并运行安装。
 2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
 3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
 4. 在 Models 与 Agents 页面绑定模型，并在运行模式中启用编排配置；Preview 后 Apply。
@@ -71,19 +71,19 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 ## 测试状态与客观数据
 
-以下结果对应 v0.4.0 发布前的实际验证，可用仓库中的验证命令复查。
+以下结果对应 v0.4.1 发布前的实际验证，可用仓库中的验证命令复查。
 
-### v0.4.0 发布验证
+### v0.4.1 发布验证
 
 | 验证项 | 命令 | 真实结果 |
 | --- | --- | --- |
-| Rust 格式 | `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` | 通过 |
-| Rust 单测 | `cargo test --manifest-path src-tauri/Cargo.toml` | 112 passed、0 failed、1 ignored |
+| Rust 格式 | `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` | 通过 |
+| Rust 单测 | `cargo test --manifest-path src-tauri/Cargo.toml --workspace` | 163 passed、0 failed、2 ignored |
 | 前端构建 | `npm.cmd run build` | 通过 |
 | Diff 检查 | `git diff --check` | 通过 |
 | NSIS 打包 | `npm.cmd run bundle:windows` | 通过 |
 
-其中 1 个 ignored 测试是依赖外部配置的真实 E2E，不应视为已通过。
+其中 2 个 ignored 测试分别是依赖外部配置的真实 E2E，以及会写入当前 Windows 用户凭据库的合成凭据测试；二者均不应视为已通过。
 
 ### 真实 E2E 覆盖
 
@@ -135,7 +135,7 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 - **显式 Task Scope**：`cas-helper schedule <agent-key> [task-key]` 支持由 Primary 从任务描述提取的稳定任务键（如 `auth-oauth2`）。只有 `task-key` 完全一致的空闲 Thread 才会被复用；未传任务键的预检不会复用任何绑定了任务键的 Thread（fail-closed），CAS 不做任何模糊分类或历史猜测。`bind` 同样接受并固化任务键，既有键不被覆盖。
 
 - **运行时指纹**：每个 Agent 配置生成稳定 `runtime_fingerprint`（纳入 Provider 身份、Base URL、模型、指令、推理与沙箱策略、能力集合），配置变更后旧 Thread 立即失配并 `SPAWN`，不会复用旧配置的线程。
-- **Workspace Scope**：当前工作目录的规范化值（UNIX/UNC 统一归一），不是逻辑任务或模块匹配；执行入口会拒绝 Scope 与实际 `cwd` 不一致的请求。同一工作区内的不同任务不会被 CAS 自动区分。
+- **Workspace Scope**：当前工作目录的规范化值（UNIX/UNC 统一归一），不是逻辑任务或模块匹配；执行入口会拒绝 Scope 与实际 `cwd` 不一致的请求。未提供 Task Scope 时，同一工作区内的不同任务不会被自动区分；提供显式 Task Scope 后才按任务键精确隔离。
 - **上下文健康以当前上下文为准**：仅使用 `current_context_tokens`（来自 App Server `lastTokenUsage` 或 rollout 尾部解析），累计 `totalTokenUsage`/`tokens_used` 只用于用量统计；当前上下文或运行时窗口未知时 fail closed 为 `CONTEXT_UNKNOWN` 并 `SPAWN`，不会把「无法证明健康」当作健康。
 
 调度器还结合 Agent 的 `AUTO` / `HOT` / `COLD` 策略、Provider 的缓存能力和缓存保留提示，避免复用上下文压力过高或已超出缓存窗口的 Thread。
@@ -165,8 +165,8 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 ## 开发验证
 
 ```powershell
-cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+cargo test --manifest-path src-tauri/Cargo.toml --workspace
 npm.cmd run build
 git diff --check
 npm.cmd run bundle:windows
