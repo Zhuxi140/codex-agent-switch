@@ -173,6 +173,8 @@ impl UsageService {
             synced_count,
             unmapped_count: discovered_count.saturating_sub(synced_count),
             message: "已从 Codex 本地状态同步 Primary 原生子 Agent；当前只能可靠取得总 Token，Input / Cached / Output 明细仍以 Runtime Bridge 事件为准。".to_owned(),
+            attempted_at: None,
+            last_success_at: None,
         })
     }
 
@@ -333,6 +335,14 @@ impl UsageService {
             .set_agent_execution_status(thread_id, "RECOVERY_REQUIRED")
     }
 
+    pub(crate) fn mark_agent_execution_recovery_required_if_known(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), UsageServiceError> {
+        self.repository()?
+            .set_agent_execution_status_if_known(thread_id, "RECOVERY_REQUIRED")
+    }
+
     pub(crate) fn mark_agent_execution_idle_if_known(
         &self,
         thread_id: &str,
@@ -436,6 +446,17 @@ pub(crate) struct AgentThreadInstanceListRequest {
     cursor: Option<String>,
 }
 
+impl AgentThreadInstanceListRequest {
+    pub(crate) fn for_project(workspace_scope_key: Option<String>) -> Self {
+        Self {
+            unscoped: workspace_scope_key.is_none(),
+            workspace_scope_key,
+            limit: Some(50),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum NativeSubagentSyncCapability {
@@ -453,6 +474,8 @@ pub(crate) struct NativeSubagentSyncResponse {
     synced_count: usize,
     unmapped_count: usize,
     message: String,
+    attempted_at: Option<String>,
+    last_success_at: Option<String>,
 }
 
 impl NativeSubagentSyncResponse {
@@ -471,6 +494,8 @@ impl NativeSubagentSyncResponse {
             synced_count: 0,
             unmapped_count: 0,
             message: message.into(),
+            attempted_at: None,
+            last_success_at: None,
         }
     }
 
@@ -482,7 +507,27 @@ impl NativeSubagentSyncResponse {
             synced_count: 0,
             unmapped_count: 0,
             message: message.into(),
+            attempted_at: None,
+            last_success_at: None,
         }
+    }
+
+    pub(crate) fn is_supported(&self) -> bool {
+        self.capability == NativeSubagentSyncCapability::Supported
+    }
+
+    pub(crate) fn source_path(&self) -> Option<&str> {
+        self.source_path.as_deref()
+    }
+
+    pub(crate) fn with_observer_timestamps(
+        mut self,
+        attempted_at: String,
+        last_success_at: Option<String>,
+    ) -> Self {
+        self.attempted_at = Some(attempted_at);
+        self.last_success_at = last_success_at;
+        self
     }
 }
 
@@ -507,6 +552,12 @@ impl AgentThreadInstanceListResponse {
 pub(crate) struct AgentThreadInstancePage {
     items: Vec<AgentThreadInstanceResponse>,
     next_cursor: Option<String>,
+}
+
+impl AgentThreadInstancePage {
+    pub(crate) fn into_items(self) -> Vec<AgentThreadInstanceResponse> {
+        self.items
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

@@ -21,12 +21,14 @@ use crate::usage::{
 
 const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROTOCOL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_AUTO_RECOVERY_ATTEMPTS: u8 = 3;
 
 pub(crate) struct RuntimeBridgeService {
     data_home: PathBuf,
     usage: Arc<UsageService>,
     state: Arc<Mutex<RuntimeBridgeState>>,
     worker: Mutex<Option<BridgeWorker>>,
+    launch: Mutex<Option<RuntimeBridgeLaunch>>,
     managed_operation: Mutex<()>,
 }
 
@@ -37,12 +39,20 @@ impl RuntimeBridgeService {
             usage: Arc::new(UsageService::open(database_path)?),
             state: Arc::new(Mutex::new(RuntimeBridgeState::default())),
             worker: Mutex::new(None),
+            launch: Mutex::new(None),
             managed_operation: Mutex::new(()),
         })
     }
 
     pub(crate) fn status(&self) -> Result<RuntimeBridgeStatusResponse, ApiError> {
-        self.status_inner().map_err(ApiError::from)
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
+        match self.recover_inner(false) {
+            Ok(status) => Ok(status),
+            Err(_) => self.status_inner().map_err(ApiError::from),
+        }
     }
 
     pub(crate) fn start(
@@ -51,18 +61,38 @@ impl RuntimeBridgeService {
         codex_home: &Path,
         codex_version: Option<String>,
     ) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         self.start_inner(executable, codex_home, codex_version)
             .map_err(ApiError::from)
     }
 
     pub(crate) fn stop(&self) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         self.stop_inner().map_err(ApiError::from)
+    }
+
+    pub(crate) fn recover(&self) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
+        self.recover_inner(true).map_err(ApiError::from)
     }
 
     pub(crate) fn managed_session_start(
         &self,
         request: ManagedSessionStartRequest,
     ) -> Result<ManagedSessionResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         self.managed_session_start_inner(request)
             .map_err(ApiError::from)
     }
@@ -71,7 +101,23 @@ impl RuntimeBridgeService {
         &self,
         request: ManagedSessionResumeRequest,
     ) -> Result<ManagedSessionResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         self.managed_session_resume_inner(request)
+            .map_err(ApiError::from)
+    }
+
+    pub(crate) fn managed_session_resolve_recovery(
+        &self,
+        request: ManagedSessionRecoveryRequest,
+    ) -> Result<ManagedSessionResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
+        self.managed_session_resolve_recovery_inner(request)
             .map_err(ApiError::from)
     }
 
@@ -79,6 +125,10 @@ impl RuntimeBridgeService {
         &self,
         request: ManagedTurnStartRequest,
     ) -> Result<ManagedTurnStartResponse, ApiError> {
+        let _operation = self
+            .managed_operation
+            .lock()
+            .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         self.managed_turn_start_inner(request)
             .map_err(ApiError::from)
     }
@@ -120,14 +170,13 @@ impl RuntimeBridgeService {
                 && session.status == ManagedSessionStatus::Running
             {
                 session.status = ManagedSessionStatus::RecoveryRequired;
-                session.active_turn_id = None;
             }
             *state = RuntimeBridgeState {
                 status: RuntimeBridgeStatus::Starting,
                 schema_capability: schema_capabilities.usage,
                 managed_session_capability: schema_capabilities.managed_session,
                 agent_execution_capability: schema_capabilities.agent_execution,
-                codex_version,
+                codex_version: codex_version.clone(),
                 started_at: Some(started_at),
                 managed_session,
                 ..RuntimeBridgeState::default()
@@ -142,7 +191,7 @@ impl RuntimeBridgeService {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(RuntimeBridgeError::Spawn)?;
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or(RuntimeBridgeError::MissingPipe("stdin"))?;
@@ -158,11 +207,18 @@ impl RuntimeBridgeService {
         let stopping = Arc::new(AtomicBool::new(false));
         let (initialize_tx, initialize_rx) = mpsc::sync_channel(1);
         let pending_responses = Arc::new(Mutex::new(HashMap::new()));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
 
         let state = Arc::clone(&self.state);
         let usage = Arc::clone(&self.usage);
         let reader_stopping = Arc::clone(&stopping);
         let reader_pending_responses = Arc::clone(&pending_responses);
+        let reader_stdin = Arc::clone(&stdin);
+        let helper_path = self.data_home.join(if cfg!(windows) {
+            "cas-helper.exe"
+        } else {
+            "cas-helper"
+        });
         let stdout_thread = thread::spawn(move || {
             read_app_server_stream(
                 stdout,
@@ -171,6 +227,8 @@ impl RuntimeBridgeService {
                 reader_stopping,
                 initialize_tx,
                 reader_pending_responses,
+                reader_stdin,
+                helper_path,
             );
         });
         let stderr_thread = thread::spawn(move || {
@@ -192,7 +250,7 @@ impl RuntimeBridgeService {
                 }
             }
         });
-        if let Err(error) = write_message(&mut stdin, &initialize) {
+        if let Err(error) = write_shared_message(&stdin, &initialize) {
             cleanup_unstarted_worker(child, stopping, stdout_thread, stderr_thread);
             return Err(error);
         }
@@ -207,7 +265,7 @@ impl RuntimeBridgeService {
             return Err(error);
         }
         if let Err(error) =
-            write_message(&mut stdin, &json!({"method": "initialized", "params": {}}))
+            write_shared_message(&stdin, &json!({"method": "initialized", "params": {}}))
         {
             cleanup_unstarted_worker(child, stopping, stdout_thread, stderr_thread);
             self.set_failed(error.to_string());
@@ -216,15 +274,132 @@ impl RuntimeBridgeService {
 
         *worker_slot = Some(BridgeWorker {
             child,
-            stdin: Some(stdin),
+            stdin,
             stopping,
             stdout_thread: Some(stdout_thread),
             stderr_thread: Some(stderr_thread),
             pending_responses,
             next_request_id: 2,
         });
+        *self.launch()? = Some(RuntimeBridgeLaunch {
+            executable: executable.to_path_buf(),
+            codex_home: codex_home.to_path_buf(),
+            codex_version,
+        });
         self.state()?.status = RuntimeBridgeStatus::Running;
         self.status_inner()
+    }
+
+    fn recover_inner(
+        &self,
+        force: bool,
+    ) -> Result<RuntimeBridgeStatusResponse, RuntimeBridgeError> {
+        let (attempt, previous_session) = {
+            let mut state = self.state()?;
+            if state.status != RuntimeBridgeStatus::Failed
+                || (!force && !auto_recovery_allowed(&state))
+            {
+                return Ok(RuntimeBridgeStatusResponse::from(&*state));
+            }
+            if force {
+                state.recovery_attempt_count = 0;
+            }
+            state.recovery_attempt_count += 1;
+            state.status = RuntimeBridgeStatus::Recovering;
+            state.last_error = None;
+            (state.recovery_attempt_count, state.managed_session.clone())
+        };
+        let launch = match self.launch()?.clone() {
+            Some(launch) => launch,
+            None => {
+                let error = RuntimeBridgeError::RecoveryLaunchUnavailable;
+                self.record_recovery_failure(attempt, &error);
+                return Err(error);
+            }
+        };
+        if let Some(mut worker) = self.worker()?.take()
+            && let Err(error) = worker.stop()
+        {
+            self.record_recovery_failure(attempt, &error);
+            return Err(error);
+        }
+        if let Err(error) =
+            self.start_inner(&launch.executable, &launch.codex_home, launch.codex_version)
+        {
+            self.record_recovery_failure(attempt, &error);
+            return Err(error);
+        }
+
+        let recovered = (|| {
+            let recovered_at = self.usage.current_timestamp()?;
+            if let Some(previous) = previous_session {
+                let mut params = serde_json::Map::from_iter([(
+                    "threadId".to_owned(),
+                    Value::String(previous.thread_id.clone()),
+                )]);
+                if let Some(cwd) = previous.cwd.as_ref() {
+                    params.insert("cwd".to_owned(), Value::String(cwd.clone()));
+                }
+                let result = self.request("thread/resume", Value::Object(params))?;
+                let (thread_id, session_id) = parse_managed_thread(&result)?;
+                if thread_id != previous.thread_id {
+                    return Err(RuntimeBridgeError::UnexpectedThreadResponse);
+                }
+                let was_uncertain = matches!(
+                    previous.status,
+                    ManagedSessionStatus::Running | ManagedSessionStatus::RecoveryRequired
+                );
+                let recovered_status = if was_uncertain {
+                    match recovery_turn_outcome(&result, previous.active_turn_id.as_deref()) {
+                        RecoveryTurnOutcome::Terminal => ManagedSessionStatus::Idle,
+                        RecoveryTurnOutcome::Running | RecoveryTurnOutcome::Unknown => {
+                            ManagedSessionStatus::RecoveryRequired
+                        }
+                    }
+                } else {
+                    ManagedSessionStatus::Idle
+                };
+                let active_turn_id = (recovered_status == ManagedSessionStatus::RecoveryRequired)
+                    .then_some(previous.active_turn_id)
+                    .flatten();
+                self.state()?.managed_session = Some(ManagedSessionState {
+                    thread_id: thread_id.clone(),
+                    session_id,
+                    origin: ManagedSessionOrigin::Resumed,
+                    status: recovered_status,
+                    cwd: previous.cwd,
+                    active_turn_id,
+                    attached_at: recovered_at.clone(),
+                });
+                if recovered_status == ManagedSessionStatus::Idle {
+                    self.usage.mark_agent_execution_idle_if_known(&thread_id)?;
+                } else {
+                    self.usage
+                        .mark_agent_execution_recovery_required_if_known(&thread_id)?;
+                }
+            }
+            let mut state = self.state()?;
+            state.status = RuntimeBridgeStatus::Running;
+            state.recovery_attempt_count = 0;
+            state.last_recovery_at = Some(recovered_at);
+            state.last_error = state
+                .managed_session
+                .as_ref()
+                .is_some_and(|session| session.status == ManagedSessionStatus::RecoveryRequired)
+                .then(|| {
+                    "Bridge 已恢复，但中断时的 Turn 结果仍不确定；CAS 不会自动重放。".to_owned()
+                });
+            Ok(RuntimeBridgeStatusResponse::from(&*state))
+        })();
+        if let Err(error) = &recovered {
+            if let Ok(mut workers) = self.worker()
+                && let Some(mut worker) = workers.take()
+            {
+                let _ = worker.stop();
+            }
+            self.record_recovery_failure(attempt, error);
+        }
+        recovered
     }
 
     fn stop_inner(&self) -> Result<RuntimeBridgeStatusResponse, RuntimeBridgeError> {
@@ -235,6 +410,7 @@ impl RuntimeBridgeService {
         let mut state = self.state()?;
         state.status = RuntimeBridgeStatus::Stopped;
         state.last_error = None;
+        state.recovery_attempt_count = 0;
         if let Some(session) = state.managed_session.as_mut() {
             session.status = ManagedSessionStatus::Detached;
             session.active_turn_id = None;
@@ -248,7 +424,15 @@ impl RuntimeBridgeService {
     ) -> Result<ManagedSessionResponse, RuntimeBridgeError> {
         let cwd = validate_cwd(&request.cwd)?;
         self.ensure_managed_session_supported()?;
-        let result = self.request("thread/start", json!({ "cwd": cwd }))?;
+        let mut params =
+            serde_json::Map::from_iter([("cwd".to_owned(), Value::String(cwd.clone()))]);
+        if let Some(approval_policy) = request.approval_policy {
+            params.insert("approvalPolicy".to_owned(), Value::String(approval_policy));
+        }
+        if let Some(sandbox) = request.sandbox {
+            params.insert("sandbox".to_owned(), Value::String(sandbox));
+        }
+        let result = self.request("thread/start", Value::Object(params))?;
         let (thread_id, session_id) = parse_managed_thread(&result)?;
         self.bind_managed_session(
             thread_id,
@@ -285,6 +469,57 @@ impl RuntimeBridgeService {
         Ok(session)
     }
 
+    fn managed_session_resolve_recovery_inner(
+        &self,
+        request: ManagedSessionRecoveryRequest,
+    ) -> Result<ManagedSessionResponse, RuntimeBridgeError> {
+        let thread_id = validate_thread_id(&request.thread_id)?;
+        let active_turn_id = {
+            let state = self.state()?;
+            if state.status != RuntimeBridgeStatus::Running {
+                return Err(RuntimeBridgeError::NotRunning);
+            }
+            let session = state
+                .managed_session
+                .as_ref()
+                .filter(|session| session.thread_id == thread_id)
+                .ok_or(RuntimeBridgeError::ThreadNotBound)?;
+            if session.status != ManagedSessionStatus::RecoveryRequired {
+                return Ok(ManagedSessionResponse::from(session));
+            }
+            session.active_turn_id.clone()
+        };
+        if !request.abandon_uncertain_turn {
+            let result = self.request(
+                "thread/read",
+                json!({"threadId": thread_id, "includeTurns": true}),
+            )?;
+            match recovery_turn_outcome(&result, active_turn_id.as_deref()) {
+                RecoveryTurnOutcome::Terminal => {}
+                RecoveryTurnOutcome::Running => {
+                    return Err(RuntimeBridgeError::RecoveryTurnStillRunning);
+                }
+                RecoveryTurnOutcome::Unknown => {
+                    return Err(RuntimeBridgeError::RecoveryOutcomeUnknown);
+                }
+            }
+        }
+        let response = {
+            let mut state = self.state()?;
+            state.last_error = None;
+            let session = state
+                .managed_session
+                .as_mut()
+                .filter(|session| session.thread_id == thread_id)
+                .ok_or(RuntimeBridgeError::ThreadNotBound)?;
+            session.status = ManagedSessionStatus::Idle;
+            session.active_turn_id = None;
+            ManagedSessionResponse::from(&*session)
+        };
+        self.usage.mark_agent_execution_idle_if_known(&thread_id)?;
+        Ok(response)
+    }
+
     fn managed_turn_start_inner(
         &self,
         request: ManagedTurnStartRequest,
@@ -308,14 +543,24 @@ impl RuntimeBridgeService {
             session.status = ManagedSessionStatus::Running;
             session.active_turn_id = None;
         }
-        let result = self.request(
-            "turn/start",
-            json!({
-                "threadId": thread_id,
-                "input": [{ "type": "text", "text": input }],
-                "effort": request.effort,
-            }),
-        );
+        let mut params = serde_json::Map::from_iter([
+            ("threadId".to_owned(), Value::String(thread_id.clone())),
+            (
+                "input".to_owned(),
+                json!([{ "type": "text", "text": input }]),
+            ),
+            (
+                "effort".to_owned(),
+                request.effort.map(Value::String).unwrap_or(Value::Null),
+            ),
+        ]);
+        if let Some(approval_policy) = request.approval_policy {
+            params.insert("approvalPolicy".to_owned(), Value::String(approval_policy));
+        }
+        if let Some(sandbox_policy) = request.sandbox_policy {
+            params.insert("sandboxPolicy".to_owned(), sandbox_policy);
+        }
+        let result = self.request("turn/start", Value::Object(params));
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -415,6 +660,8 @@ impl RuntimeBridgeService {
             thread_id: thread_id.clone(),
             input,
             effort: plan.profile.reasoning_effort.clone(),
+            approval_policy: None,
+            sandbox_policy: None,
         });
         let turn = match turn {
             Ok(turn) => turn,
@@ -497,6 +744,12 @@ impl RuntimeBridgeService {
             .map_err(|_| RuntimeBridgeError::StateUnavailable)
     }
 
+    fn launch(&self) -> Result<MutexGuard<'_, Option<RuntimeBridgeLaunch>>, RuntimeBridgeError> {
+        self.launch
+            .lock()
+            .map_err(|_| RuntimeBridgeError::StateUnavailable)
+    }
+
     fn state(&self) -> Result<MutexGuard<'_, RuntimeBridgeState>, RuntimeBridgeError> {
         self.state
             .lock()
@@ -507,6 +760,23 @@ impl RuntimeBridgeService {
         if let Ok(mut state) = self.state.lock() {
             state.status = RuntimeBridgeStatus::Failed;
             state.last_error = Some(message);
+        }
+    }
+
+    fn record_recovery_failure(&self, attempt: u8, error: &RuntimeBridgeError) {
+        let recovered_at = self.usage.current_timestamp().ok();
+        if let Ok(mut state) = self.state.lock() {
+            state.status = RuntimeBridgeStatus::Failed;
+            state.recovery_attempt_count = attempt;
+            state.last_recovery_at = recovered_at;
+            state.last_error = Some(format!(
+                "自动恢复 {attempt}/{MAX_AUTO_RECOVERY_ATTEMPTS} 失败：{error}"
+            ));
+            if let Some(session) = state.managed_session.as_mut() {
+                if session.status == ManagedSessionStatus::Running {
+                    session.status = ManagedSessionStatus::RecoveryRequired;
+                }
+            }
         }
     }
 }
@@ -523,7 +793,7 @@ impl Drop for RuntimeBridgeService {
 
 struct BridgeWorker {
     child: Arc<Mutex<Child>>,
-    stdin: Option<ChildStdin>,
+    stdin: SharedStdin,
     stopping: Arc<AtomicBool>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
@@ -559,11 +829,7 @@ impl BridgeWorker {
             "method": method,
             "params": params
         });
-        let Some(stdin) = self.stdin.as_mut() else {
-            remove_pending_response(&self.pending_responses, request_id);
-            return Err(RuntimeBridgeError::NotRunning);
-        };
-        if let Err(error) = write_message(stdin, &message) {
+        if let Err(error) = write_shared_message(&self.stdin, &message) {
             remove_pending_response(&self.pending_responses, request_id);
             return Err(error);
         }
@@ -578,7 +844,9 @@ impl BridgeWorker {
 
     fn stop(&mut self) -> Result<(), RuntimeBridgeError> {
         self.stopping.store(true, Ordering::Release);
-        self.stdin.take();
+        if let Ok(mut stdin) = self.stdin.lock() {
+            stdin.take();
+        }
         {
             let mut child = self
                 .child
@@ -633,6 +901,21 @@ fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), RuntimeB
 }
 
 type PendingResponse = mpsc::SyncSender<Result<Value, RuntimeBridgeError>>;
+type SharedStdin = Arc<Mutex<Option<ChildStdin>>>;
+
+fn is_initialize_response(message: &Value, initialization_pending: bool) -> bool {
+    initialization_pending
+        && message.get("id").and_then(Value::as_i64) == Some(1)
+        && message.get("method").is_none()
+}
+
+fn write_shared_message(stdin: &SharedStdin, message: &Value) -> Result<(), RuntimeBridgeError> {
+    let mut stdin = stdin
+        .lock()
+        .map_err(|_| RuntimeBridgeError::StateUnavailable)?;
+    let stdin = stdin.as_mut().ok_or(RuntimeBridgeError::NotRunning)?;
+    write_message(stdin, message)
+}
 
 fn read_app_server_stream(
     stdout: impl std::io::Read,
@@ -641,6 +924,8 @@ fn read_app_server_stream(
     stopping: Arc<AtomicBool>,
     initialize_tx: mpsc::SyncSender<Result<(), RuntimeBridgeError>>,
     pending_responses: Arc<Mutex<HashMap<i64, PendingResponse>>>,
+    stdin: SharedStdin,
+    helper_path: PathBuf,
 ) {
     let mut initialize_tx = Some(initialize_tx);
     let mut observer = RuntimeObserver::new(usage);
@@ -659,8 +944,7 @@ fn read_app_server_stream(
                 continue;
             }
         };
-
-        if message.get("id").and_then(Value::as_i64) == Some(1) {
+        if is_initialize_response(&message, initialize_tx.is_some()) {
             if let Some(sender) = initialize_tx.take() {
                 if let Some(error) = message.get("error") {
                     let message = error
@@ -682,6 +966,15 @@ fn read_app_server_stream(
             continue;
         }
 
+        match respond_to_server_request(&message, &stdin, &helper_path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                mark_stream_failure(&state, error.to_string());
+                continue;
+            }
+        }
+
         if resolve_pending_response(&message, &pending_responses) {
             continue;
         }
@@ -690,6 +983,7 @@ fn read_app_server_stream(
             Ok(Some(event)) => {
                 update_managed_session_from_event(&state, &event);
                 let profile = event.profile();
+                let failure_message = event.failure_message().map(str::to_owned);
                 if let Err(error) = observer.observe(event) {
                     mark_stream_failure(&state, error.to_string());
                     continue;
@@ -697,7 +991,7 @@ fn read_app_server_stream(
                 if let Ok(mut state) = state.lock() {
                     state.last_event_at = observer.last_event_at.clone();
                     state.status = RuntimeBridgeStatus::Running;
-                    state.last_error = None;
+                    state.last_error = failure_message;
                     if profile.is_usage() {
                         if profile == ProtocolProfile::UsageLegacy {
                             state.protocol_compatibility = ProtocolCompatibility::LegacyCompatible;
@@ -741,10 +1035,141 @@ fn mark_stream_failure(state: &Arc<Mutex<RuntimeBridgeState>>, message: String) 
         state.status = RuntimeBridgeStatus::Failed;
         state.last_error = Some(message);
         if let Some(session) = state.managed_session.as_mut() {
-            session.status = ManagedSessionStatus::RecoveryRequired;
-            session.active_turn_id = None;
+            if session.status == ManagedSessionStatus::Running {
+                session.status = ManagedSessionStatus::RecoveryRequired;
+            }
         }
     }
+}
+
+fn auto_recovery_allowed(state: &RuntimeBridgeState) -> bool {
+    state.status == RuntimeBridgeStatus::Failed
+        && state.recovery_attempt_count < MAX_AUTO_RECOVERY_ATTEMPTS
+}
+
+fn respond_to_server_request(
+    message: &Value,
+    stdin: &SharedStdin,
+    helper_path: &Path,
+) -> Result<bool, RuntimeBridgeError> {
+    let Some(method) = message.get("method").and_then(Value::as_str) else {
+        return Ok(false);
+    };
+    let Some(request_id) = message.get("id").cloned() else {
+        return Ok(false);
+    };
+    let decision = match method {
+        "item/commandExecution/requestApproval" => {
+            if is_cas_control_plane_request(message, helper_path)
+                || is_isolated_e2e_workspace_request(message)
+            {
+                "accept"
+            } else {
+                "decline"
+            }
+        }
+        "item/fileChange/requestApproval" => {
+            if is_isolated_e2e_file_change_request(message) {
+                "accept"
+            } else {
+                "decline"
+            }
+        }
+        _ => return Ok(false),
+    };
+    write_shared_message(
+        stdin,
+        &json!({
+            "id": request_id,
+            "result": { "decision": decision }
+        }),
+    )?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn is_isolated_e2e_file_change_request(message: &Value) -> bool {
+    std::env::var_os("CAS_E2E_ROOT").is_some()
+        && message
+            .pointer("/params/grantRoot")
+            .is_none_or(Value::is_null)
+}
+
+#[cfg(not(test))]
+fn is_isolated_e2e_file_change_request(_message: &Value) -> bool {
+    false
+}
+
+#[cfg(test)]
+fn is_isolated_e2e_workspace_request(message: &Value) -> bool {
+    let Some(root) = std::env::var_os("CAS_E2E_ROOT").map(PathBuf::from) else {
+        return false;
+    };
+    is_isolated_e2e_workspace_request_for_root(message, &root)
+}
+
+#[cfg(test)]
+fn is_isolated_e2e_workspace_request_for_root(message: &Value, root: &Path) -> bool {
+    if message
+        .pointer("/params/networkApprovalContext")
+        .is_some_and(|value| !value.is_null())
+        || message
+            .pointer("/params/additionalPermissions")
+            .is_some_and(|value| !value.is_null())
+    {
+        return false;
+    }
+    let Some(cwd) = message.pointer("/params/cwd").and_then(Value::as_str) else {
+        return false;
+    };
+    Path::new(cwd).starts_with(root.join("workspace"))
+}
+
+#[cfg(not(test))]
+fn is_isolated_e2e_workspace_request(_message: &Value) -> bool {
+    false
+}
+
+fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
+    let Some(actions) = message
+        .pointer("/params/commandActions")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if actions.len() != 1 {
+        return false;
+    }
+    let expected_prefix = format!("& \"{}\" ", helper_path.to_string_lossy());
+    actions.iter().all(|action| {
+        let Some(command) = action.get("command").and_then(Value::as_str) else {
+            return false;
+        };
+        let Some(arguments) = command.strip_prefix(&expected_prefix) else {
+            return false;
+        };
+        let arguments = arguments.split_ascii_whitespace().collect::<Vec<_>>();
+        let valid_argument = |value: &&str| {
+            !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        };
+        match arguments.as_slice() {
+            ["schedule", agent_key] => valid_argument(agent_key),
+            ["schedule", agent_key, task_key] => {
+                valid_argument(agent_key) && valid_argument(task_key)
+            }
+            ["bind", agent_key, thread_id] => {
+                valid_argument(agent_key) && valid_argument(thread_id)
+            }
+            ["bind", agent_key, thread_id, task_key] => {
+                valid_argument(agent_key) && valid_argument(thread_id) && valid_argument(task_key)
+            }
+            _ => false,
+        }
+    })
 }
 
 fn resolve_pending_response(
@@ -759,7 +1184,7 @@ fn resolve_pending_response(
         .ok()
         .and_then(|mut pending| pending.remove(&request_id));
     let Some(sender) = sender else {
-        return true;
+        return false;
     };
     let result = if let Some(error) = message.get("error") {
         let message = error
@@ -822,6 +1247,7 @@ fn update_managed_session_from_event(state: &Arc<Mutex<RuntimeBridgeState>>, eve
         BridgeEvent::TurnFinished {
             thread_id,
             successful,
+            failure_message,
             ..
         } if thread_id == &session.thread_id => {
             session.status = if *successful {
@@ -830,6 +1256,9 @@ fn update_managed_session_from_event(state: &Arc<Mutex<RuntimeBridgeState>>, eve
                 ManagedSessionStatus::Failed
             };
             session.active_turn_id = None;
+            if !successful {
+                state.last_error = failure_message.clone();
+            }
         }
         _ => {}
     }
@@ -840,6 +1269,7 @@ fn update_managed_session_from_event(state: &Arc<Mutex<RuntimeBridgeState>>, eve
 pub(crate) enum RuntimeBridgeStatus {
     Stopped,
     Starting,
+    Recovering,
     Running,
     Degraded,
     Failed,
@@ -883,6 +1313,13 @@ struct ManagedSessionState {
 }
 
 #[derive(Debug, Clone)]
+struct RuntimeBridgeLaunch {
+    executable: PathBuf,
+    codex_home: PathBuf,
+    codex_version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct RuntimeBridgeState {
     status: RuntimeBridgeStatus,
     protocol_compatibility: ProtocolCompatibility,
@@ -896,6 +1333,8 @@ struct RuntimeBridgeState {
     started_at: Option<String>,
     last_event_at: Option<String>,
     last_error: Option<String>,
+    recovery_attempt_count: u8,
+    last_recovery_at: Option<String>,
     managed_session: Option<ManagedSessionState>,
 }
 
@@ -914,6 +1353,8 @@ impl Default for RuntimeBridgeState {
             started_at: None,
             last_event_at: None,
             last_error: None,
+            recovery_attempt_count: 0,
+            last_recovery_at: None,
             managed_session: None,
         }
     }
@@ -934,6 +1375,10 @@ pub(crate) struct RuntimeBridgeStatusResponse {
     started_at: Option<String>,
     last_event_at: Option<String>,
     last_error: Option<String>,
+    recovery_attempt_count: u8,
+    max_auto_recovery_attempts: u8,
+    auto_recovery_exhausted: bool,
+    last_recovery_at: Option<String>,
     managed_session: Option<ManagedSessionResponse>,
 }
 
@@ -952,6 +1397,11 @@ impl From<&RuntimeBridgeState> for RuntimeBridgeStatusResponse {
             started_at: state.started_at.clone(),
             last_event_at: state.last_event_at.clone(),
             last_error: state.last_error.clone(),
+            recovery_attempt_count: state.recovery_attempt_count,
+            max_auto_recovery_attempts: MAX_AUTO_RECOVERY_ATTEMPTS,
+            auto_recovery_exhausted: state.status == RuntimeBridgeStatus::Failed
+                && state.recovery_attempt_count >= MAX_AUTO_RECOVERY_ATTEMPTS,
+            last_recovery_at: state.last_recovery_at.clone(),
             managed_session: state
                 .managed_session
                 .as_ref()
@@ -964,6 +1414,10 @@ impl From<&RuntimeBridgeState> for RuntimeBridgeStatusResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedSessionStartRequest {
     cwd: String,
+    #[serde(default)]
+    approval_policy: Option<String>,
+    #[serde(default)]
+    sandbox: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -975,11 +1429,23 @@ pub(crate) struct ManagedSessionResumeRequest {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ManagedSessionRecoveryRequest {
+    thread_id: String,
+    #[serde(default)]
+    abandon_uncertain_turn: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ManagedTurnStartRequest {
     thread_id: String,
     input: String,
     #[serde(default)]
     effort: Option<String>,
+    #[serde(default)]
+    approval_policy: Option<String>,
+    #[serde(default)]
+    sandbox_policy: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1078,6 +1544,7 @@ enum BridgeEvent {
     TurnFinished {
         thread_id: String,
         successful: bool,
+        failure_message: Option<String>,
         profile: ProtocolProfile,
     },
 }
@@ -1090,6 +1557,15 @@ impl BridgeEvent {
             | Self::AgentPath { profile, .. }
             | Self::Usage { profile, .. }
             | Self::TurnFinished { profile, .. } => *profile,
+        }
+    }
+
+    fn failure_message(&self) -> Option<&str> {
+        match self {
+            Self::TurnFinished {
+                failure_message, ..
+            } => failure_message.as_deref(),
+            _ => None,
         }
     }
 }
@@ -1316,9 +1792,21 @@ fn parse_turn_finished(params: &Value) -> Result<Option<BridgeEvent>, ProtocolPa
     } else {
         ProtocolProfile::Modern
     };
+    let successful = status == "completed";
+    let failure_message = (!successful).then(|| {
+        params
+            .pointer("/turn/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| params.pointer("/error/message").and_then(Value::as_str))
+            .or_else(|| params.pointer("/turn/error").and_then(Value::as_str))
+            .or_else(|| params.get("error").and_then(Value::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Turn ended with status {status}"))
+    });
     Ok(Some(BridgeEvent::TurnFinished {
         thread_id,
-        successful: status == "completed",
+        successful,
+        failure_message,
         profile,
     }))
 }
@@ -1378,6 +1866,45 @@ fn parse_managed_thread(result: &Value) -> Result<(String, Option<String>), Runt
         .ok_or(RuntimeBridgeError::InvalidProtocolResponse("thread.id"))?;
     let session_id = find_string(thread, &["sessionId", "session_id"]);
     Ok((thread_id, session_id))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryTurnOutcome {
+    Terminal,
+    Running,
+    Unknown,
+}
+
+fn recovery_turn_outcome(result: &Value, active_turn_id: Option<&str>) -> RecoveryTurnOutcome {
+    let Some(active_turn_id) = active_turn_id else {
+        return RecoveryTurnOutcome::Unknown;
+    };
+    let thread = find_object(result, &["thread"]).unwrap_or(result);
+    let Some(turn) = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|turn| {
+            find_string(turn, &["id", "turnId", "turn_id"]).as_deref() == Some(active_turn_id)
+        })
+    else {
+        return RecoveryTurnOutcome::Unknown;
+    };
+    let Some(status) = find_string(turn, &["status"]) else {
+        return RecoveryTurnOutcome::Unknown;
+    };
+    let status = status.to_ascii_lowercase().replace(['_', '-'], "");
+    if matches!(
+        status.as_str(),
+        "completed" | "failed" | "interrupted" | "cancelled" | "canceled"
+    ) {
+        RecoveryTurnOutcome::Terminal
+    } else if matches!(status.as_str(), "inprogress" | "running") {
+        RecoveryTurnOutcome::Running
+    } else {
+        RecoveryTurnOutcome::Unknown
+    }
 }
 
 fn find_object<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
@@ -1725,6 +2252,16 @@ impl From<RuntimeBridgeError> for ApiError {
                 "App Server 曾异常退出，请先恢复该托管会话。",
                 false,
             ),
+            RuntimeBridgeError::RecoveryTurnStillRunning => (
+                "MANAGED_TURN_RECOVERY_STILL_RUNNING",
+                "中断前的 Turn 仍在运行，CAS 不会启动重复任务。",
+                true,
+            ),
+            RuntimeBridgeError::RecoveryOutcomeUnknown => (
+                "MANAGED_TURN_RECOVERY_UNKNOWN",
+                "无法证明中断前 Turn 已结束；请稍后核验，或显式放弃该不确定状态。",
+                true,
+            ),
             RuntimeBridgeError::TurnAlreadyRunning => (
                 "MANAGED_TURN_ALREADY_RUNNING",
                 "当前托管会话已有 Turn 正在运行。",
@@ -1755,6 +2292,11 @@ impl From<RuntimeBridgeError> for ApiError {
                 "APP_SERVER_START_FAILED",
                 "无法启动 Codex App Server。",
                 true,
+            ),
+            RuntimeBridgeError::RecoveryLaunchUnavailable => (
+                "APP_SERVER_RECOVERY_UNAVAILABLE",
+                "缺少上一次成功启动参数，无法自动恢复 Codex App Server。",
+                false,
             ),
             RuntimeBridgeError::StateUnavailable => (
                 "USAGE_MONITOR_STATE_UNAVAILABLE",
@@ -1809,6 +2351,8 @@ pub(crate) enum RuntimeBridgeError {
     InvalidInput,
     ThreadNotBound,
     SessionRecoveryRequired,
+    RecoveryTurnStillRunning,
+    RecoveryOutcomeUnknown,
     TurnAlreadyRunning,
     ProtocolWrite(std::io::Error),
     ProtocolRejected(String),
@@ -1816,6 +2360,7 @@ pub(crate) enum RuntimeBridgeError {
     InvalidProtocolResponse(&'static str),
     UnexpectedThreadResponse,
     StreamClosed,
+    RecoveryLaunchUnavailable,
     RequestIdExhausted,
     Process(std::io::Error),
     SchemaProbe(std::io::Error),
@@ -1846,6 +2391,12 @@ impl fmt::Display for RuntimeBridgeError {
             Self::SessionRecoveryRequired => {
                 formatter.write_str("managed session recovery is required")
             }
+            Self::RecoveryTurnStillRunning => {
+                formatter.write_str("managed turn is still running after recovery")
+            }
+            Self::RecoveryOutcomeUnknown => {
+                formatter.write_str("managed turn recovery outcome is unknown")
+            }
             Self::TurnAlreadyRunning => formatter.write_str("managed turn is already running"),
             Self::ProtocolWrite(error) => write!(formatter, "protocol write failed: {error}"),
             Self::ProtocolRejected(message) => {
@@ -1864,6 +2415,9 @@ impl fmt::Display for RuntimeBridgeError {
                 formatter.write_str("app server returned an unexpected thread")
             }
             Self::StreamClosed => formatter.write_str("app server event stream closed"),
+            Self::RecoveryLaunchUnavailable => {
+                formatter.write_str("runtime bridge recovery launch is unavailable")
+            }
             Self::RequestIdExhausted => formatter.write_str("app server request id exhausted"),
             Self::Process(error) => write!(formatter, "app server process failed: {error}"),
             Self::SchemaProbe(error) => write!(formatter, "schema probe failed: {error}"),
@@ -1992,10 +2546,105 @@ mod tests {
             &json!({"method": "thread/started", "params": {}}),
             &pending,
         ));
+        assert!(!resolve_pending_response(
+            &json!({
+                "id": 99,
+                "method": "item/commandExecution/requestApproval",
+                "params": {}
+            }),
+            &pending,
+        ));
     }
 
     #[test]
-    fn stream_failure_requires_explicit_managed_session_recovery() {
+    fn initialize_response_does_not_swallow_later_server_request_id() {
+        assert!(is_initialize_response(
+            &json!({"id": 1, "result": {}}),
+            true
+        ));
+        assert!(!is_initialize_response(
+            &json!({
+                "id": 1,
+                "method": "item/commandExecution/requestApproval",
+                "params": {}
+            }),
+            false,
+        ));
+    }
+
+    #[test]
+    fn only_exact_cas_control_plane_commands_are_auto_approved() {
+        let helper = Path::new("C:\\CAS Data\\cas-helper.exe");
+        let request = |command: &str| {
+            json!({
+                "params": {
+                    "commandActions": [{"type": "unknown", "command": command}]
+                }
+            })
+        };
+
+        assert!(is_cas_control_plane_request(
+            &request("& \"C:\\CAS Data\\cas-helper.exe\" schedule executor stable-task"),
+            helper,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request("& \"C:\\CAS Data\\cas-helper.exe\" bind executor 019ffb28-1234 stable-task"),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request("& \"C:\\CAS Data\\cas-helper.exe\" token credential-id"),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request("& \"C:\\CAS Data\\cas-helper.exe\" schedule executor; Remove-Item victim"),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request("& \"C:\\Other\\cas-helper.exe\" schedule executor stable-task"),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &json!({
+                "params": {
+                    "commandActions": [
+                        {
+                            "type": "unknown",
+                            "command": "& \"C:\\CAS Data\\cas-helper.exe\" schedule executor stable-task"
+                        },
+                        {"type": "unknown", "command": "Remove-Item victim"}
+                    ]
+                }
+            }),
+            helper,
+        ));
+    }
+
+    #[test]
+    fn e2e_auto_approval_stays_inside_isolated_workspace_without_escalation() {
+        let root = Path::new("C:\\Temp\\cas-rc1-test");
+        let request = |cwd: &str| json!({"params": {"cwd": cwd}});
+
+        assert!(is_isolated_e2e_workspace_request_for_root(
+            &request("C:\\Temp\\cas-rc1-test\\workspace"),
+            root,
+        ));
+        assert!(!is_isolated_e2e_workspace_request_for_root(
+            &request("C:\\Temp\\cas-rc1-test\\cas-data"),
+            root,
+        ));
+        assert!(!is_isolated_e2e_workspace_request_for_root(
+            &json!({
+                "params": {
+                    "cwd": "C:\\Temp\\cas-rc1-test\\workspace",
+                    "additionalPermissions": {"network": {"enabled": true}}
+                }
+            }),
+            root,
+        ));
+    }
+
+    #[test]
+    fn stream_failure_preserves_uncertain_turn_for_safe_recovery() {
         let state = Arc::new(Mutex::new(RuntimeBridgeState {
             managed_session: Some(ManagedSessionState {
                 thread_id: "thread-1".to_owned(),
@@ -2013,7 +2662,98 @@ mod tests {
         let session = state.managed_session.as_ref().unwrap();
         assert_eq!(state.status, RuntimeBridgeStatus::Failed);
         assert_eq!(session.status, ManagedSessionStatus::RecoveryRequired);
-        assert!(session.active_turn_id.is_none());
+        assert_eq!(session.active_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn idle_stream_failure_does_not_invent_an_uncertain_turn() {
+        let state = Arc::new(Mutex::new(RuntimeBridgeState {
+            managed_session: Some(ManagedSessionState {
+                thread_id: "thread-1".to_owned(),
+                session_id: Some("session-1".to_owned()),
+                origin: ManagedSessionOrigin::Started,
+                status: ManagedSessionStatus::Idle,
+                cwd: Some("C:\\workspace".to_owned()),
+                active_turn_id: None,
+                attached_at: "2026-08-11T00:00:00Z".to_owned(),
+            }),
+            ..RuntimeBridgeState::default()
+        }));
+        mark_stream_failure(&state, "closed".to_owned());
+        let state = state.lock().unwrap();
+        let session = state.managed_session.as_ref().unwrap();
+        assert_eq!(state.status, RuntimeBridgeStatus::Failed);
+        assert_eq!(session.status, ManagedSessionStatus::Idle);
+        assert_eq!(session.active_turn_id, None);
+    }
+
+    #[test]
+    fn recovery_only_clears_a_proven_terminal_turn_and_has_a_retry_ceiling() {
+        let thread = |status: &str| {
+            json!({
+                "thread": {
+                    "id": "thread-1",
+                    "turns": [{"id": "turn-1", "status": status}]
+                }
+            })
+        };
+        assert_eq!(
+            recovery_turn_outcome(&thread("completed"), Some("turn-1")),
+            RecoveryTurnOutcome::Terminal
+        );
+        assert_eq!(
+            recovery_turn_outcome(&thread("inProgress"), Some("turn-1")),
+            RecoveryTurnOutcome::Running
+        );
+        assert_eq!(
+            recovery_turn_outcome(&thread("completed"), Some("turn-other")),
+            RecoveryTurnOutcome::Unknown
+        );
+        assert_eq!(
+            recovery_turn_outcome(&thread("completed"), None),
+            RecoveryTurnOutcome::Unknown
+        );
+
+        let mut state = RuntimeBridgeState {
+            status: RuntimeBridgeStatus::Failed,
+            recovery_attempt_count: MAX_AUTO_RECOVERY_ATTEMPTS - 1,
+            ..RuntimeBridgeState::default()
+        };
+        assert!(auto_recovery_allowed(&state));
+        state.recovery_attempt_count = MAX_AUTO_RECOVERY_ATTEMPTS;
+        assert!(!auto_recovery_allowed(&state));
+        state.status = RuntimeBridgeStatus::Stopped;
+        state.recovery_attempt_count = 0;
+        assert!(!auto_recovery_allowed(&state));
+    }
+
+    #[test]
+    fn failed_turn_preserves_app_server_error_message() {
+        let event = parse_bridge_event(&json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "status": "failed",
+                    "error": {"message": "provider rejected tool output"}
+                }
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        let BridgeEvent::TurnFinished {
+            successful,
+            failure_message,
+            ..
+        } = event
+        else {
+            panic!("expected turn completion event");
+        };
+        assert!(!successful);
+        assert_eq!(
+            failure_message.as_deref(),
+            Some("provider rejected tool output")
+        );
     }
 
     #[test]
@@ -2212,6 +2952,7 @@ mod tests {
             .observe(BridgeEvent::TurnFinished {
                 thread_id: "child".to_owned(),
                 successful: true,
+                failure_message: None,
                 profile: ProtocolProfile::Modern,
             })
             .unwrap();
@@ -2244,13 +2985,19 @@ mod tests {
             .start_inner(Path::new(&executable), Path::new(&codex_home), None)
             .unwrap();
         let session = bridge
-            .managed_session_start_inner(ManagedSessionStartRequest { cwd })
+            .managed_session_start_inner(ManagedSessionStartRequest {
+                cwd,
+                approval_policy: None,
+                sandbox: None,
+            })
             .unwrap();
         bridge
             .managed_turn_start_inner(ManagedTurnStartRequest {
                 thread_id: session.thread_id,
                 input: prompt,
                 effort: None,
+                approval_policy: None,
+                sandbox_policy: None,
             })
             .unwrap();
 
@@ -2288,3 +3035,6 @@ mod tests {
         assert!(usage_persisted, "no subagent usage record persisted");
     }
 }
+
+#[cfg(test)]
+mod rc_e2e;

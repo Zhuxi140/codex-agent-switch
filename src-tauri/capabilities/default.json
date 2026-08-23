@@ -3,10 +3,12 @@
   "identifier": "default",
   "description": "主窗口基础权限",
   "windows": [
-    "main"
+    "main",
+    "project-monitor"
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     {
       "identifier": "opener:allow-open-url",
       "allow": [

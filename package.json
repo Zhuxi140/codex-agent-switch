@@ -9,6 +9,9 @@
     "build:bundle": "npm run build && npm run prepare:sidecar",
     "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
     "bundle:windows": "tauri build --bundles nsis",
+    "e2e:orchestration": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1",
+    "e2e:orchestration:matrix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1 -Stage RC2",
+    "e2e:runtime-recovery": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1 -Stage PHASE6",
     "poc:app-server": "node scripts/cas-app-server-poc.mjs",
     "poc:app-server:self-test": "node scripts/cas-app-server-poc.mjs --self-test",
     "tauri": "tauri"

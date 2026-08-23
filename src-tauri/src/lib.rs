@@ -11,8 +11,10 @@ mod runtime_bridge;
 mod settings;
 mod usage;
 
-use serde::Serialize;
-use tauri::Manager;
+use std::sync::Mutex;
+
+use serde::{Deserialize, Serialize};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 use agent::{
     AgentBindingResponse, AgentCreateRequest, AgentDeleteRequest, AgentDetailResponse,
@@ -40,9 +42,9 @@ use provider::{
     ProviderUpdateRequest,
 };
 use runtime_bridge::{
-    AgentThreadExecutionResponse, ManagedSessionResponse, ManagedSessionResumeRequest,
-    ManagedSessionStartRequest, ManagedTurnStartRequest, ManagedTurnStartResponse,
-    RuntimeBridgeService, RuntimeBridgeStatusResponse,
+    AgentThreadExecutionResponse, ManagedSessionRecoveryRequest, ManagedSessionResponse,
+    ManagedSessionResumeRequest, ManagedSessionStartRequest, ManagedTurnStartRequest,
+    ManagedTurnStartResponse, RuntimeBridgeService, RuntimeBridgeStatusResponse,
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
@@ -50,9 +52,65 @@ use usage::{
     AgentThreadInstanceListResponse, AgentThreadInstanceRecommendRequest,
     AgentThreadInstanceRecommendation, AgentThreadInstanceResponse,
     AgentThreadInstanceWorkspaceScopeRequest, AgentThreadProjectListResponse,
-    NativeSubagentSyncResponse, ScheduleDecisionResponse, UsageListRequest, UsageQueryRequest,
-    UsageRecordResponse, UsageService, UsageSummaryResponse,
+    AgentThreadProjectSummaryResponse, NativeSubagentSyncResponse, ScheduleDecisionResponse,
+    UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
 };
+
+const PROJECT_MONITOR_WINDOW_LABEL: &str = "project-monitor";
+
+#[derive(Default)]
+struct NativeObserverService {
+    state: Mutex<NativeObserverState>,
+}
+
+#[derive(Default)]
+struct NativeObserverState {
+    source_path: Option<String>,
+    last_success_at: Option<String>,
+}
+
+impl NativeObserverService {
+    fn sync(
+        &self,
+        usage: &UsageService,
+        configuration: &ConfigurationService,
+    ) -> Result<NativeSubagentSyncResponse, ApiError> {
+        let attempted_at = usage.current_timestamp().map_err(ApiError::from)?;
+        let response = sync_native_subagents_once(usage, configuration)?;
+        let mut observer = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let source_path = response.source_path().map(str::to_owned);
+        if observer.source_path != source_path {
+            observer.source_path = source_path;
+            observer.last_success_at = None;
+        }
+        if response.is_supported() {
+            observer.last_success_at = Some(attempted_at.clone());
+        }
+        Ok(response.with_observer_timestamps(attempted_at, observer.last_success_at.clone()))
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMonitorSnapshotRequest {
+    workspace_scope_key: Option<String>,
+    #[serde(default)]
+    include_instances: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProjectMonitorSnapshotResponse {
+    projects: Vec<AgentThreadProjectSummaryResponse>,
+    instances: Vec<AgentThreadInstanceResponse>,
+    sync: NativeSubagentSyncResponse,
+    orchestration_enabled: bool,
+    active_agent_count: usize,
+    project_excluded: bool,
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -414,9 +472,10 @@ fn usage_list_records(
 fn agent_thread_instance_list(
     state: tauri::State<'_, UsageService>,
     configuration: tauri::State<'_, ConfigurationService>,
+    observer: tauri::State<'_, NativeObserverService>,
     request: AgentThreadInstanceListRequest,
 ) -> Result<AgentThreadInstanceListResponse, ApiError> {
-    let sync = sync_native_subagents(&state, &configuration)?;
+    let sync = observer.sync(&state, &configuration)?;
     let page = state.list_agent_instances(request)?;
     Ok(AgentThreadInstanceListResponse::new(page, sync))
 }
@@ -425,13 +484,129 @@ fn agent_thread_instance_list(
 fn agent_thread_project_list(
     state: tauri::State<'_, UsageService>,
     configuration: tauri::State<'_, ConfigurationService>,
+    observer: tauri::State<'_, NativeObserverService>,
 ) -> Result<AgentThreadProjectListResponse, ApiError> {
-    let sync = sync_native_subagents(&state, &configuration)?;
+    let sync = observer.sync(&state, &configuration)?;
     let items = state.list_agent_thread_projects()?;
     Ok(AgentThreadProjectListResponse::new(items, sync))
 }
 
-fn sync_native_subagents(
+#[tauri::command]
+fn native_subagent_sync(
+    state: tauri::State<'_, UsageService>,
+    configuration: tauri::State<'_, ConfigurationService>,
+    observer: tauri::State<'_, NativeObserverService>,
+) -> Result<NativeSubagentSyncResponse, ApiError> {
+    observer.sync(&state, &configuration)
+}
+
+#[tauri::command]
+fn project_monitor_snapshot(
+    state: tauri::State<'_, UsageService>,
+    configuration: tauri::State<'_, ConfigurationService>,
+    observer: tauri::State<'_, NativeObserverService>,
+    request: ProjectMonitorSnapshotRequest,
+) -> Result<ProjectMonitorSnapshotResponse, ApiError> {
+    let sync = observer.sync(&state, &configuration)?;
+    let projects = state.list_agent_thread_projects()?;
+    let instances = if request.include_instances {
+        state
+            .list_agent_instances(AgentThreadInstanceListRequest::for_project(
+                request.workspace_scope_key.clone(),
+            ))?
+            .into_items()
+    } else {
+        Vec::new()
+    };
+    let mode = configuration
+        .project_monitor_mode(request.workspace_scope_key.as_deref())
+        .map_err(ApiError::from)?;
+    Ok(ProjectMonitorSnapshotResponse {
+        projects,
+        instances,
+        sync,
+        orchestration_enabled: mode.active_agent_count > 0,
+        active_agent_count: mode.active_agent_count,
+        project_excluded: request.include_instances && mode.project_excluded,
+    })
+}
+
+#[tauri::command]
+async fn project_monitor_open(app: tauri::AppHandle) -> Result<(), ApiError> {
+    if let Some(window) = app.get_webview_window(PROJECT_MONITOR_WINDOW_LABEL) {
+        window.show().map_err(|_| project_monitor_window_error())?;
+        window
+            .set_focus()
+            .map_err(|_| project_monitor_window_error())?;
+        return Ok(());
+    }
+    let window = WebviewWindowBuilder::new(
+        &app,
+        PROJECT_MONITOR_WINDOW_LABEL,
+        WebviewUrl::App("index.html?window=project-monitor".into()),
+    )
+    .title("CAS 项目监控")
+    .inner_size(380.0, 360.0)
+    .min_inner_size(320.0, 260.0)
+    .resizable(true)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(true)
+    .build()
+    .map_err(|_| project_monitor_window_error())?;
+    let window_to_hide = window.clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            api.prevent_close();
+            let _ = window_to_hide.hide();
+        }
+    });
+    Ok(())
+}
+
+#[tauri::command]
+fn project_monitor_hide(app: tauri::AppHandle) -> Result<(), ApiError> {
+    if let Some(window) = app.get_webview_window(PROJECT_MONITOR_WINDOW_LABEL) {
+        window.hide().map_err(|_| project_monitor_window_error())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn project_monitor_set_always_on_top(
+    app: tauri::AppHandle,
+    always_on_top: bool,
+) -> Result<(), ApiError> {
+    if let Some(window) = app.get_webview_window(PROJECT_MONITOR_WINDOW_LABEL) {
+        window
+            .set_always_on_top(always_on_top)
+            .map_err(|_| project_monitor_window_error())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn project_monitor_focus_main(app: tauri::AppHandle) -> Result<(), ApiError> {
+    if let Some(window) = app.get_webview_window("main") {
+        window.show().map_err(|_| project_monitor_window_error())?;
+        window
+            .set_focus()
+            .map_err(|_| project_monitor_window_error())?;
+    }
+    Ok(())
+}
+
+fn project_monitor_window_error() -> ApiError {
+    ApiError::new(
+        "PROJECT_MONITOR_WINDOW_FAILED",
+        "项目监控浮窗操作失败，请重试。",
+        true,
+        None,
+    )
+}
+
+fn sync_native_subagents_once(
     state: &UsageService,
     configuration: &ConfigurationService,
 ) -> Result<NativeSubagentSyncResponse, ApiError> {
@@ -517,6 +692,13 @@ fn usage_monitor_stop(
 }
 
 #[tauri::command]
+fn usage_monitor_recover(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+) -> Result<RuntimeBridgeStatusResponse, ApiError> {
+    bridge.recover()
+}
+
+#[tauri::command]
 fn usage_monitor_status(
     bridge: tauri::State<'_, RuntimeBridgeService>,
 ) -> Result<RuntimeBridgeStatusResponse, ApiError> {
@@ -540,6 +722,14 @@ fn usage_managed_session_resume(
 }
 
 #[tauri::command]
+fn usage_managed_session_resolve_recovery(
+    bridge: tauri::State<'_, RuntimeBridgeService>,
+    request: ManagedSessionRecoveryRequest,
+) -> Result<ManagedSessionResponse, ApiError> {
+    bridge.managed_session_resolve_recovery(request)
+}
+
+#[tauri::command]
 fn usage_managed_turn_start(
     bridge: tauri::State<'_, RuntimeBridgeService>,
     request: ManagedTurnStartRequest,
@@ -558,6 +748,7 @@ pub fn run() {
             app.manage(ModelService::open(&database_path)?);
             app.manage(AgentService::open(&database_path)?);
             app.manage(UsageService::open(&database_path)?);
+            app.manage(NativeObserverService::default());
             app.manage(RuntimeBridgeService::open(&database_path, &data_home)?);
             app.manage(ConfigurationService::open(&database_path, &data_home)?);
             Ok(())
@@ -604,17 +795,25 @@ pub fn run() {
             diagnostics_run,
             usage_get_summary,
             usage_list_records,
+            native_subagent_sync,
             agent_thread_instance_list,
             agent_thread_project_list,
+            project_monitor_snapshot,
+            project_monitor_open,
+            project_monitor_hide,
+            project_monitor_set_always_on_top,
+            project_monitor_focus_main,
             agent_schedule_decision_list,
             agent_thread_instance_set_workspace_scope,
             agent_thread_instance_recommend,
             agent_thread_instance_execute,
             usage_monitor_start,
             usage_monitor_stop,
+            usage_monitor_recover,
             usage_monitor_status,
             usage_managed_session_start,
             usage_managed_session_resume,
+            usage_managed_session_resolve_recovery,
             usage_managed_turn_start
         ])
         .build(tauri::generate_context!())

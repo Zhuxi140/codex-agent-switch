@@ -38,8 +38,11 @@ import {
   listProjectExclusions,
   listSnapshots,
   listUsageRecords,
+  openProjectMonitor,
   recommendAgentThreadInstance,
   redetectCodex,
+  recoverUsageMonitor,
+  resolveManagedSessionRecovery,
   restoreSnapshot,
   resolveRuntimeModeConflict,
   runDiagnostics,
@@ -49,6 +52,7 @@ import {
   setAgentThreadInstanceWorkspaceScope,
   testModelConnection,
   switchRuntimeMode,
+  syncNativeSubagents,
   updateSettings,
   updateAgent,
   updateModel,
@@ -365,6 +369,18 @@ export function App() {
   const [error, setError] = useState<string | null>(null);
   const [appearance, setAppearance] = useState<Appearance>("SYSTEM");
   const [customFontFamily, setCustomFontFamily] = useState<string | null>(null);
+  const [runtimeBridge, setRuntimeBridge] = useState<RuntimeBridgeStatusResponse | null>(null);
+  const [nativeObserver, setNativeObserver] = useState<NativeSubagentSyncResponse | null>(null);
+  const [nativeObserverError, setNativeObserverError] = useState<string | null>(null);
+
+  const refreshNativeObserver = useCallback(() => {
+    syncNativeSubagents()
+      .then((status) => {
+        setNativeObserver(status);
+        setNativeObserverError(null);
+      })
+      .catch((reason: unknown) => setNativeObserverError(errorMessage(reason)));
+  }, []);
 
   useEffect(() => {
     getAppBootstrap().then(setBootstrap).catch((reason: unknown) => {
@@ -379,6 +395,29 @@ export function App() {
         setCustomFontFamily(settings.customFontFamily);
       })
       .catch((reason: unknown) => setError(errorMessage(reason)));
+  }, []);
+
+  useEffect(() => {
+    refreshNativeObserver();
+    const timer = window.setInterval(refreshNativeObserver, 3_000);
+    return () => window.clearInterval(timer);
+  }, [refreshNativeObserver]);
+
+  useEffect(() => {
+    let active = true;
+    const refreshRuntimeBridge = () => {
+      getUsageMonitorStatus()
+        .then((status) => {
+          if (active) setRuntimeBridge(status);
+        })
+        .catch(() => undefined);
+    };
+    refreshRuntimeBridge();
+    const timer = window.setInterval(refreshRuntimeBridge, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
   }, []);
 
   useEffect(() => {
@@ -421,6 +460,7 @@ export function App() {
               }
             : current,
         );
+        refreshNativeObserver();
       })
       .catch((reason: unknown) => setError(errorMessage(reason)))
       .finally(() => setDetecting(false));
@@ -450,7 +490,21 @@ export function App() {
           ))}
         </nav>
         <div className="topbar-status">
-          <span className={bootstrap?.codex.detected ? "online" : ""} aria-hidden="true" />
+          <Tooltip
+            content={nativeObserverError
+              ? `原生 Thread 观察失败：${nativeObserverError}`
+              : nativeObserver
+                ? `${nativeObserver.message}\n最近成功：${nativeObserver.lastSuccessAt ? formatDataAge(nativeObserver.lastSuccessAt) : "尚无"}`
+                : "正在启动原生 Thread 观察"}
+            focusable
+            label="原生 Thread 观察状态"
+          >
+            <span className={`native-observer-status ${nativeObserver?.capability.toLowerCase() ?? "loading"}`}>
+              <span aria-hidden="true" />
+              Native
+            </span>
+          </Tooltip>
+          <span className={`codex-ready-dot ${bootstrap?.codex.detected ? "online" : ""}`} aria-hidden="true" />
           <Tooltip
             content={bootstrap?.codex.version ? `Codex ${bootstrap.codex.version}` : "尚未读取到 Codex 版本"}
             focusable
@@ -470,6 +524,7 @@ export function App() {
             environment={environment}
             error={error}
             onRedetect={handleRedetect}
+            runtimeBridge={runtimeBridge}
           />
         ) : page === "usage" ? (
           <UsagePage />
@@ -482,7 +537,10 @@ export function App() {
         ) : page === "settings" ? (
           <SettingsPage
             onAppearanceChange={setAppearance}
-            onEnvironmentChange={setEnvironment}
+            onEnvironmentChange={(nextEnvironment) => {
+              setEnvironment(nextEnvironment);
+              refreshNativeObserver();
+            }}
             onFontFamilyChange={setCustomFontFamily}
           />
         ) : (
@@ -498,6 +556,7 @@ interface OverviewPageProps {
   environment: CodexEnvironmentResponse | null;
   error: string | null;
   onRedetect: () => void;
+  runtimeBridge: RuntimeBridgeStatusResponse | null;
 }
 
 function OverviewPage({
@@ -505,6 +564,7 @@ function OverviewPage({
   environment,
   error,
   onRedetect,
+  runtimeBridge,
 }: OverviewPageProps) {
   const [configuration, setConfiguration] = useState<ConfigurationStatusResponse | null>(null);
   const [runtimeMode, setRuntimeMode] = useState<RuntimeModeResponse | null>(null);
@@ -793,6 +853,8 @@ function OverviewPage({
           onRedetect={onRedetect}
         />
       )}
+
+      {runtimeBridge && <RuntimeBridgeSummary monitor={runtimeBridge} />}
 
       <header className="overview-heading">
         <div>
@@ -1947,12 +2009,25 @@ type UsageRange = "TODAY" | "7_DAYS" | "ALL" | "CUSTOM";
 function UsagePage() {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentError, setAgentError] = useState<string | null>(null);
+  const [monitorOpening, setMonitorOpening] = useState(false);
 
   useEffect(() => {
     listAgents()
       .then(setAgents)
       .catch((reason: unknown) => setAgentError(errorMessage(reason)));
   }, []);
+
+  async function showProjectMonitor() {
+    setMonitorOpening(true);
+    try {
+      await openProjectMonitor();
+      setAgentError(null);
+    } catch (reason: unknown) {
+      setAgentError(errorMessage(reason));
+    } finally {
+      setMonitorOpening(false);
+    }
+  }
 
   return (
     <>
@@ -1962,6 +2037,16 @@ function UsagePage() {
           <h1>用量监控</h1>
           <p>查看 Primary 与子 Agent 的 Token 使用汇总和会话明细。</p>
         </div>
+        <button
+          aria-busy={monitorOpening || undefined}
+          className="secondary-button"
+          disabled={monitorOpening}
+          onClick={() => void showProjectMonitor()}
+          type="button"
+        >
+          <UiIcon name="threads" />
+          {monitorOpening ? "正在打开…" : "打开项目浮窗"}
+        </button>
       </header>
       {agentError && (
         <section className="notice error">
@@ -2084,6 +2169,33 @@ function ScheduleDecisionsPanel() {
   );
 }
 
+function RuntimeBridgeSummary({ monitor }: { monitor: RuntimeBridgeStatusResponse }) {
+  const session = monitor.managedSession;
+  const recovery = monitor.status === "RECOVERING"
+    ? "正在恢复"
+    : monitor.autoRecoveryExhausted
+      ? "自动恢复已停止"
+      : monitor.lastRecoveryAt
+        ? `已恢复 · ${formatDataAge(monitor.lastRecoveryAt)}`
+        : "—";
+  return (
+    <section className={`runtime-bridge-summary ${monitor.status.toLowerCase()}`}>
+      <div className="runtime-bridge-summary-title">
+        <span aria-hidden="true" />
+        <strong>Runtime Bridge</strong>
+        {monitor.lastError && <InfoTip label={monitor.lastError} />}
+      </div>
+      <dl>
+        <div><dt>连接</dt><dd>{monitor.status}</dd></div>
+        <div><dt>Primary</dt><dd>{session ? shortThreadId(session.threadId) : "—"}</dd></div>
+        <div><dt>Session</dt><dd>{session?.status ?? "—"}</dd></div>
+        <div><dt>最近事件</dt><dd>{monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : "—"}</dd></div>
+        <div><dt>恢复</dt><dd>{recovery}</dd></div>
+      </dl>
+    </section>
+  );
+}
+
 function UsageMonitorCard() {
   const [monitor, setMonitor] = useState<RuntimeBridgeStatusResponse | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2100,6 +2212,8 @@ function UsageMonitorCard() {
 
   useEffect(() => {
     void refresh();
+    const timer = window.setInterval(() => void refresh(), 3_000);
+    return () => window.clearInterval(timer);
   }, [refresh]);
 
   async function setRunning(running: boolean) {
@@ -2107,6 +2221,41 @@ function UsageMonitorCard() {
     setError(null);
     try {
       setMonitor(running ? await startUsageMonitor() : await stopUsageMonitor());
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function recoverBridge() {
+    setBusy(true);
+    setError(null);
+    try {
+      setMonitor(await recoverUsageMonitor());
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function resolveRecovery(abandonUncertainTurn: boolean) {
+    const threadId = monitor?.managedSession?.threadId;
+    if (!threadId) return;
+    if (
+      abandonUncertainTurn
+      && !window.confirm("放弃对中断 Turn 结果的继续核验？CAS 不会重放旧任务，但原任务仍可能在上游完成。")
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await resolveManagedSessionRecovery(threadId, abandonUncertainTurn);
+      await refresh();
     } catch (reason: unknown) {
       setError(errorMessage(reason));
       await refresh();
@@ -2127,9 +2276,14 @@ function UsageMonitorCard() {
           <button className="secondary-button" disabled={busy} onClick={() => void refresh()} type="button">
             刷新
           </button>
+          {monitor?.status === "FAILED" && (
+            <button className="secondary-button" disabled={busy} onClick={() => void recoverBridge()} type="button">
+              重新恢复
+            </button>
+          )}
           <button
             className="primary-button"
-            disabled={busy || monitor?.status === "RUNNING"}
+            disabled={busy || ["RUNNING", "STARTING", "RECOVERING", "FAILED"].includes(monitor?.status ?? "")}
             onClick={() => void setRunning(true)}
             type="button"
           >
@@ -2148,15 +2302,28 @@ function UsageMonitorCard() {
       {monitor && (
         <dl className="runtime-monitor-grid">
           <EnvironmentField label="Bridge" value={monitor.status} />
-          <EnvironmentField label="Usage Schema" value={monitor.schemaCapability} />
-          <EnvironmentField label="Session Schema" value={monitor.managedSessionCapability} />
-          <EnvironmentField label="Agent Execution" value={monitor.agentExecutionCapability} />
-          <EnvironmentField label="Protocol" value={monitor.protocolCompatibility} />
-          <EnvironmentField label="Bound Thread" value={monitor.managedSession?.threadId ?? null} />
-          <EnvironmentField label="Session State" value={monitor.managedSession?.status ?? null} />
+          <EnvironmentField label="Primary Thread" value={monitor.managedSession?.threadId ?? null} />
+          <EnvironmentField label="Session" value={monitor.managedSession?.status ?? null} />
           <EnvironmentField label="最近事件" value={monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : null} />
-          <EnvironmentField label="启动于" value={monitor.startedAt ? formatUsageDate(monitor.startedAt) : null} />
+          <EnvironmentField label="最近恢复" value={monitor.lastRecoveryAt ? formatDataAge(monitor.lastRecoveryAt) : null} />
+          <EnvironmentField
+            label="恢复尝试"
+            value={monitor.recoveryAttemptCount > 0
+              ? `${monitor.recoveryAttemptCount} / ${monitor.maxAutoRecoveryAttempts}`
+              : "—"}
+          />
         </dl>
+      )}
+      {monitor?.status === "RUNNING" && monitor.managedSession?.status === "RECOVERY_REQUIRED" && (
+        <div className="runtime-recovery-actions">
+          <span>中断前 Turn 的最终状态尚未确认，CAS 已禁止自动重放。</span>
+          <button className="secondary-button" disabled={busy} onClick={() => void resolveRecovery(false)} type="button">
+            核验原 Turn
+          </button>
+          <button className="ghost-button" disabled={busy} onClick={() => void resolveRecovery(true)} type="button">
+            放弃不确定状态
+          </button>
+        </div>
       )}
       {(monitor?.status === "FAILED" || monitor?.status === "DEGRADED") && (
         <small className="runtime-monitor-warning">
@@ -2168,8 +2335,8 @@ function UsageMonitorCard() {
       {monitor?.lastError && <ExpandableMessage className="runtime-monitor-warning" text={monitor.lastError} />}
       {error && <ExpandableMessage className="runtime-monitor-warning" text={error} />}
       <small className="runtime-monitor-note">
-        独立启动的 Codex Desktop / CLI 不会被旁路监听；异常退出后需显式恢复原 Thread，
-        CAS 不会自动重放上一个 Turn。
+        CAS 最多自动恢复 {monitor?.maxAutoRecoveryAttempts ?? 3} 次，并 Resume 原 Primary；
+        独立启动的 Codex Desktop / CLI 不会被旁路监听，异常 Turn 也不会被自动重放。
       </small>
     </section>
   );

@@ -703,6 +703,8 @@ export interface NativeSubagentSyncResponse {
   syncedCount: number;
   unmappedCount: number;
   message: string;
+  attemptedAt: string | null;
+  lastSuccessAt: string | null;
 }
 
 export interface AgentThreadInstanceListResponse {
@@ -724,6 +726,15 @@ export interface AgentThreadProjectSummaryResponse {
 export interface AgentThreadProjectListResponse {
   items: AgentThreadProjectSummaryResponse[];
   sync: NativeSubagentSyncResponse;
+}
+
+export interface ProjectMonitorSnapshotResponse {
+  projects: AgentThreadProjectSummaryResponse[];
+  instances: AgentThreadInstanceResponse[];
+  sync: NativeSubagentSyncResponse;
+  orchestrationEnabled: boolean;
+  activeAgentCount: number;
+  projectExcluded: boolean;
 }
 
 export interface AgentThreadInstanceRecommendation {
@@ -797,6 +808,35 @@ export function listAgentThreadProjects(): Promise<AgentThreadProjectListRespons
   return invoke<AgentThreadProjectListResponse>("agent_thread_project_list");
 }
 
+export function syncNativeSubagents(): Promise<NativeSubagentSyncResponse> {
+  return invoke<NativeSubagentSyncResponse>("native_subagent_sync");
+}
+
+export function getProjectMonitorSnapshot(
+  workspaceScopeKey: string | null,
+  includeInstances: boolean,
+): Promise<ProjectMonitorSnapshotResponse> {
+  return invoke<ProjectMonitorSnapshotResponse>("project_monitor_snapshot", {
+    request: { workspaceScopeKey, includeInstances },
+  });
+}
+
+export function openProjectMonitor(): Promise<void> {
+  return invoke<void>("project_monitor_open");
+}
+
+export function hideProjectMonitor(): Promise<void> {
+  return invoke<void>("project_monitor_hide");
+}
+
+export function setProjectMonitorAlwaysOnTop(alwaysOnTop: boolean): Promise<void> {
+  return invoke<void>("project_monitor_set_always_on_top", { alwaysOnTop });
+}
+
+export function focusMainWindow(): Promise<void> {
+  return invoke<void>("project_monitor_focus_main");
+}
+
 export interface ScheduleDecisionResponse {
   id: string;
   createdAt: string;
@@ -858,6 +898,7 @@ export function executeAgentThread(request: {
 export type RuntimeBridgeStatus =
   | "STOPPED"
   | "STARTING"
+  | "RECOVERING"
   | "RUNNING"
   | "DEGRADED"
   | "FAILED";
@@ -904,6 +945,10 @@ export interface RuntimeBridgeStatusResponse {
   startedAt: string | null;
   lastEventAt: string | null;
   lastError: string | null;
+  recoveryAttemptCount: number;
+  maxAutoRecoveryAttempts: number;
+  autoRecoveryExhausted: boolean;
+  lastRecoveryAt: string | null;
   managedSession: ManagedSessionResponse | null;
 }
 
@@ -913,6 +958,10 @@ export function startUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {
 
 export function stopUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {
   return invoke<RuntimeBridgeStatusResponse>("usage_monitor_stop");
+}
+
+export function recoverUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {
+  return invoke<RuntimeBridgeStatusResponse>("usage_monitor_recover");
 }
 
 export function getUsageMonitorStatus(): Promise<RuntimeBridgeStatusResponse> {
@@ -931,6 +980,15 @@ export function resumeManagedUsageSession(
 ): Promise<ManagedSessionResponse> {
   return invoke<ManagedSessionResponse>("usage_managed_session_resume", {
     request: { threadId, cwd },
+  });
+}
+
+export function resolveManagedSessionRecovery(
+  threadId: string,
+  abandonUncertainTurn = false,
+): Promise<ManagedSessionResponse> {
+  return invoke<ManagedSessionResponse>("usage_managed_session_resolve_recovery", {
+    request: { threadId, abandonUncertainTurn },
   });
 }
 

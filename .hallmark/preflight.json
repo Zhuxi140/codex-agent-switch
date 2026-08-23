@@ -1,0 +1,13 @@
+{
+  "scope": "component",
+  "framework": "React 19 + TypeScript + Tauri 2",
+  "genre": "modern-minimal",
+  "tone": "technical",
+  "theme": "existing CAS cool-neutral",
+  "typography": "system font with user-configured system font override",
+  "motion": "existing restrained CSS transitions; reduced-motion supported",
+  "component": "project monitor window",
+  "responsiveWidths": [320, 375, 414, 768],
+  "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "success"],
+  "dependenciesAdded": []
+}

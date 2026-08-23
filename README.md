@@ -12,7 +12,7 @@
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
 > [!WARNING]
-> **v0.4.1 当前仍不推荐作为稳定生产工具安装使用。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
 ## 核心理念
 
@@ -77,12 +77,17 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 166 passed、0 failed、2 ignored |
+| Rust Workspace 测试 | 174 passed、0 failed、5 ignored |
 | 前端生产构建 | 通过 |
 | Diff 检查 | 通过 |
-| 真实 Primary → Child → REUSE/SPAWN/WAIT E2E | 待 RC 阶段完成 |
+| Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
+| Codex Native RC-2：并发与失配调度矩阵 | 通过（`gpt-5.6-terra`） |
+| Codex Native Phase 6：App Server 断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`） |
+| Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化和紧凑编排提示词。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 6 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
+
+当前 workspace 的 5 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试，以及 4 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
 ### v0.4.1 发布验证
 
@@ -100,10 +105,16 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 | 链路 | 状态 | 覆盖边界 |
 | --- | --- | --- |
-| Codex Native `gpt-5.6-terra` 子 Agent | 已人工验证 | 已完成 SPAWN → 执行 → 结果返回，并写入目标文件 |
+| Codex Native `gpt-5.6-terra` 子 Agent | RC-1、RC-2、Phase 6 自动化通过 | 同一 Primary 下完成 SPAWN → bind → IDLE → REUSE；并发与失配矩阵通过；空闲断流后恢复同一 Primary，显式停止后不自动拉起 |
 | DeepSeek Responses 子 Agent | 已有成功实测 | 仅说明该实测配置可运行，不外推至其他 Provider 或模型 |
-| 外部配置 E2E 自动化 | 未纳入默认测试 | 仍依赖实际 Provider、模型与工具协议配置 |
+| 外部配置 E2E 自动化 | 已提供独立命令，未纳入默认测试 | 依赖当前 Codex 登录、活动 Agent、真实 Provider 与模型；失败会保留 JSON 证据 |
 | 阿里及其他 Provider | 待测试 | 不声明已通过 |
+
+2026-08-23 的 Codex Native RC-1 运行使用 `gpt-5.6-terra`：首次决策为 `SPAWN`，第二次为 `REUSE`，两个任务复用同一 Child Thread，最终生命周期为 `IDLE`，重复 Child 数为 0，累计归属 Token 为 178,060。两个 Primary Turn 均因 Codex App Server 未原生结束而使用 `turn/interrupt` 收束，并在证据中标记为 `UPSTREAM_STALL_RECOVERY`；该兼容结果不等同于原生 `turn/completed`。单次样本仅证明链路正确，不用于宣称性能或 Token 节省。
+
+同日 RC-2 在另一条真实 Codex Native 父子链路上通过：两个相同 Task Scope 的并发预检严格得到 1 个 `SPAWN` 与 1 个 `WAIT / SPAWN_RESERVED`；更换 Workspace、Runtime Fingerprint 以及把临时原生 rollout 的当前 Context 合成到 100% 时，分别稳定得到 `NO_WORKSPACE_SCOPE_MATCH`、`RUNTIME_FINGERPRINT_MISMATCH` 与 `CONTEXT_PRESSURE`。矩阵探针只执行预检，结束后 Child 记录仍为 1。Context 项明确是隔离 rollout 的合成状态探针，不是额外消耗 258,400 Token 的模型运行。
+
+Phase 6 使用原生 `gpt-5.6-terra` 先完成一个文本 Turn，再强制终止 App Server。CAS 随后恢复了相同的 Primary Thread ID，Session 回到 `IDLE`；显式停止 Bridge 后，状态轮询没有再次启动进程。该样本证明空闲断流恢复链路，不替代运行中 Turn、中断风暴与多 Codex 版本的完整恢复矩阵。
 
 ### 效率对比（待持续实测）
 
@@ -160,7 +171,10 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 - **第三方 Provider**：支持 Responses API Provider、模型发现和能力校验；凭据不写入 Codex 配置文件。
 - **原生 Thread 同步**：同步子 Agent Thread 及其生命周期状态（基于 rollout 事实，而非 writer lock），便于确认运行、完成和空闲状态。
 - **Token 监控**：采集输入、缓存输入、输出、推理输出与总 Token，并单独记录当前上下文 Token（`current_context_tokens`）；页面按项目进入二层查看其子 Agent、Thread 与调度决策。CAS 只统计 Token，不计算或展示费用，也不保存 Prompt、Response 正文或 API Key。
+- **项目监控浮窗（当前主分支开发快照）**：从用量监控页面打开一个 Windows 单实例浮窗，选择并记住所关注项目，查看项目是否被排除、已启用 Agent 数、运行/恢复/复用状态、项目累计 Token、当前观察增量、活跃 Thread 累计 Token 与 Top 3 Thread。浮窗支持置顶、返回主窗口和隐藏；隐藏后可从主窗口恢复，不会重复创建窗口。
 - **重启提示**：配置同步后，只要检测到新的 Codex 实例，红色重启提示即可自动清除。
+
+项目监控数据默认每 3 秒刷新一次。这里展示的是 CAS 从 Codex 原生 Thread/rollout 观测到的 Token 与生命周期事实，不是实时计费器；窗口关闭按钮会执行隐藏，以保留项目选择和置顶偏好。2026-08-23 已在真实 Windows 桌面端完成“打开 → 隐藏 → 从用量监控重新打开”的闭环验证，重新出现后仍只有一个浮窗，并恢复原项目、Thread、Token 和同步状态。
 
 ## 配置与安全
 
@@ -170,8 +184,8 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 ## Roadmap（下一阶段：v0.5 RC）
 
-- **真实编排闭环**：固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token、Context 与决策日志。
-- **并发与失配矩阵**：验证同任务并发返回 SPAWN / WAIT，Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定创建新 Thread。
+- **真实编排闭环（RC-1 已完成）**：Codex Native 已固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token 与决策日志。
+- **并发与失配矩阵（RC-2 已完成）**：同任务并发返回唯一 SPAWN 与 WAIT；Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定拒绝旧 Thread，并给出 SPAWN 建议。
 - **恢复能力**：覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和 Runtime Bridge 断流恢复。
 - **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
 
@@ -188,6 +202,14 @@ npm.cmd run bundle:windows
 ```
 
 `bundle:windows` 会生成 NSIS x64 安装包，并携带 `cas-helper.exe`。
+
+需要真实 Codex 登录和活动 Agent 时，可单独执行 RC-1、RC-2 或 Phase 6；它们不会进入默认测试：
+
+```powershell
+npm.cmd run e2e:orchestration -- -AgentKey <agent-key> -TimeoutSeconds 180
+npm.cmd run e2e:orchestration:matrix -- -AgentKey <codex-native-agent-key> -TimeoutSeconds 180
+npm.cmd run e2e:runtime-recovery -- -TimeoutSeconds 120
+```
 
 ## 系统要求
 

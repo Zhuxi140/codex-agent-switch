@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use cas_scheduler::{
     effective_model_default_reasoning, effective_model_reasoning_efforts,
-    resolve_agent_reasoning_effort,
+    normalize_workspace_scope_key, resolve_agent_reasoning_effort,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, exists as secret_exists};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
@@ -84,6 +84,17 @@ impl ConfigurationService {
         let helper_path = data_home.join("cas-helper.exe");
         fs::create_dir_all(&data_home).unwrap();
         fs::write(&helper_path, b"test helper").unwrap();
+        Self::for_e2e(database_path, data_home, codex_home, helper_path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_e2e(
+        database_path: PathBuf,
+        data_home: PathBuf,
+        codex_home: PathBuf,
+        helper_path: PathBuf,
+    ) -> Self {
+        fs::create_dir_all(&data_home).unwrap();
         open_database(&database_path).unwrap();
         Self {
             database_path,
@@ -252,6 +263,33 @@ impl ConfigurationService {
     ) -> Result<Vec<ProjectExclusionResponse>, ConfigurationError> {
         let connection = open_database(&self.database_path)?;
         load_project_exclusions(&connection)
+    }
+
+    pub(crate) fn project_monitor_mode(
+        &self,
+        workspace_scope_key: Option<&str>,
+    ) -> Result<ProjectMonitorMode, ConfigurationError> {
+        let connection = open_database(&self.database_path)?;
+        let mut active_agent_ids = load_active_agent_bindings(&connection)?
+            .into_iter()
+            .map(|binding| binding.agent_id)
+            .collect::<HashSet<_>>();
+        if active_agent_ids.is_empty()
+            && let Some(agent_id) = load_active_agent_id(&connection)?
+        {
+            active_agent_ids.insert(agent_id);
+        }
+        let project_excluded = match workspace_scope_key.and_then(normalize_workspace_scope_key) {
+            Some(workspace) => load_project_exclusions(&connection)?
+                .iter()
+                .filter_map(|exclusion| normalize_workspace_scope_key(&exclusion.project_path))
+                .any(|excluded| workspace_is_within(&workspace, &excluded)),
+            None => false,
+        };
+        Ok(ProjectMonitorMode {
+            active_agent_count: active_agent_ids.len(),
+            project_excluded,
+        })
     }
 
     pub(crate) fn add_project_exclusion(
@@ -1458,6 +1496,11 @@ pub(crate) struct RuntimeModeResponse {
     legacy_active_agent_id: Option<String>,
 }
 
+pub(crate) struct ProjectMonitorMode {
+    pub(crate) active_agent_count: usize,
+    pub(crate) project_excluded: bool,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeModeSwitchRequest {
@@ -2420,8 +2463,8 @@ fn render_orchestration_instructions(
 可用 Agent\n{active_agents}\n\n\
 硬规则\n\
 1. 本编排规则只约束 Primary/root；Child 直接执行父任务，禁止再次编排或递归创建同职责 Agent。Primary 负责理解、规划、审查与收束。\n\
-2. {write_rule} 仅分析/方案任务不得写入；专项探索、验证、审查优先交给对应 phase。\n\
-3. 新的独立任务首次委派前运行一次：`{scheduling_command}`。helper 自动读取 CAS 数据库、当前目录和 `CODEX_THREAD_ID`。可明确提取稳定任务键时传 `[task-key]`（格式 `[a-z0-9][a-z0-9_-]{{0,63}}`）；只有完全同键 Thread 可复用，无键不会复用有键 Thread。不得用模糊分类或猜测历史来编造任务键；不确定就省略。所有固定判断由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
+2. {write_rule} 仅分析/方案任务不得写入；专项探索、验证、审查优先交给对应 phase。`schedule` / `bind` 只更新 CAS 本地调度元数据，是 Primary 必须亲自执行的控制面操作，不属于任务写入、实现命令或外部状态变更；不得以权限或委派规则为由在调用前拒绝。\n\
+3. 新的独立任务首次委派前必须实际调用 Shell 运行一次：`{scheduling_command}`。helper 自动读取 CAS 数据库、当前目录和 `CODEX_THREAD_ID`。只有工具返回的具体错误才算命令失败；未产生 `commandExecution` 时严禁自行声称被权限或策略阻止。可明确提取稳定任务键时传 `[task-key]`（格式 `[a-z0-9][a-z0-9_-]{{0,63}}`）；只有完全同键 Thread 可复用，无键不会复用有键 Thread。不得用模糊分类或猜测历史来编造任务键；不确定就省略。所有固定判断由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache 数据重新判断。\n\
 4. 只接受唯一一行 `CAS1|<REUSE、SPAWN或WAIT>|<thread-id或->|<reason>`，忽略 Shell 诊断；零行或多行均失败：\n\
    - `REUSE`：用 `followup_task` 向返回 Thread 发送完整任务；不得 spawn，不执行 bind。\n\
    - `SPAWN`：按第 5 条创建；成功后立即运行 `{bind_command}`，task-key 必须与预检一致；只有 bind 成功才算完成。\n\
@@ -2591,6 +2634,9 @@ fn load_mixed_catalog_resources(
         object.insert("multi_agent_version".to_owned(), "v1".into());
         object.remove("tool_mode");
         object.insert("shell_type".to_owned(), "shell_command".into());
+        object
+            .entry("supports_parallel_tool_calls".to_owned())
+            .or_insert_with(|| false.into());
         if slugs.insert(slug) {
             models.push(model);
         }
@@ -4189,6 +4235,13 @@ fn normalized_project_path(path: &Path) -> String {
     }
 }
 
+fn workspace_is_within(workspace: &str, excluded: &str) -> bool {
+    workspace == excluded
+        || workspace
+            .strip_prefix(excluded)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 fn restore_file_exact(path: &Path, existed: bool, content: &str) -> Result<(), ConfigurationError> {
     if existed {
         atomic_write(path, content.as_bytes())
@@ -4332,30 +4385,39 @@ fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
         .encode_wide()
         .chain(Some(0))
         .collect::<Vec<_>>();
-    // SAFETY: all pointers reference NUL-terminated buffers for the duration of the call.
-    let succeeded = unsafe {
-        if destination_path_exists(destination.as_slice()) {
-            ReplaceFileW(
-                destination.as_ptr(),
-                source.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_IGNORE_MERGE_ERRORS,
-                std::ptr::null(),
-                std::ptr::null(),
-            )
-        } else {
-            MoveFileExW(
-                source.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
+    const ERROR_UNABLE_TO_REMOVE_REPLACED: i32 = 1175;
+    for delay_ms in [0, 10, 20, 40, 80] {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
-    };
-    if succeeded == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+        // SAFETY: all pointers reference NUL-terminated buffers for the duration of the call.
+        let succeeded = unsafe {
+            if destination_path_exists(destination.as_slice()) {
+                ReplaceFileW(
+                    destination.as_ptr(),
+                    source.as_ptr(),
+                    std::ptr::null(),
+                    REPLACEFILE_IGNORE_MERGE_ERRORS,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            } else {
+                MoveFileExW(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            }
+        };
+        if succeeded != 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_UNABLE_TO_REMOVE_REPLACED) || delay_ms == 80 {
+            return Err(error);
+        }
     }
+    unreachable!()
 }
 
 #[cfg(windows)]
@@ -4559,6 +4621,10 @@ mod tests {
         assert_eq!(mixed_catalog["models"][0]["slug"], "gpt-5.6-sol");
         assert_eq!(mixed_catalog["models"][0]["multi_agent_version"], "v1");
         assert_eq!(mixed_catalog["models"][0]["shell_type"], "shell_command");
+        assert_eq!(
+            mixed_catalog["models"][0]["supports_parallel_tool_calls"],
+            false
+        );
         assert!(mixed_catalog["models"][0].get("tool_mode").is_none());
         assert_eq!(mixed_catalog["models"][1]["slug"], "deepseek-v4-flash");
 
@@ -5370,12 +5436,20 @@ mod tests {
         assert!(!active_global.contains("显式传入 model"));
         assert!(active_global.starts_with("# 用户全局规则"));
 
-        context
+        let default_response = context
             .service
             .switch_runtime_mode(RuntimeModeSwitchRequest {
                 active_agent_ids: Vec::new(),
             })
             .unwrap();
+        assert!(
+            matches!(
+                default_response.status,
+                ApplyStatus::Applied | ApplyStatus::NoChanges
+            ),
+            "Default 切换未应用：{}",
+            serde_json::to_string(&default_response).unwrap()
+        );
         let restored = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH))
             .unwrap()
             .parse::<DocumentMut>()
@@ -5419,6 +5493,8 @@ mod tests {
         );
         assert!(strict.contains("当前失败策略：Strict Stop"));
         assert!(strict.contains("严禁 Primary 自行接管写入"));
+        assert!(strict.contains("是 Primary 必须亲自执行的控制面操作"));
+        assert!(strict.contains("未产生 `commandExecution` 时严禁自行声称"));
         assert!(strict.contains("同一具体任务同一时刻只允许一个对应子 Agent"));
         assert!(strict.contains("单次等待超时只表示尚未返回"));
         assert!(strict.contains("上下文耗尽"));
@@ -5990,5 +6066,21 @@ mod tests {
                 [&agent_id],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn workspace_exclusion_requires_a_path_boundary() {
+        assert!(workspace_is_within(
+            "c:/workspace/project/subdir",
+            "c:/workspace/project"
+        ));
+        assert!(workspace_is_within(
+            "c:/workspace/project",
+            "c:/workspace/project"
+        ));
+        assert!(!workspace_is_within(
+            "c:/workspace/project-copy",
+            "c:/workspace/project"
+        ));
     }
 }
