@@ -4,6 +4,8 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue, value};
 
+pub(crate) use cas_scheduler::render_delegated_agent_instructions;
+
 use crate::domain::{Agent, BaseBinding, Model, ResponsesProvider};
 
 const AUTH_TIMEOUT_MS: i64 = 5_000;
@@ -14,8 +16,6 @@ const GLOBAL_ORCHESTRATION_BEGIN: &str = "<!-- CAS ORCHESTRATION v1 BEGIN -->";
 const GLOBAL_ORCHESTRATION_END: &str = "<!-- CAS ORCHESTRATION v1 END -->";
 pub(crate) const ORCHESTRATION_RUNTIME_CONTRACT: &str =
     "CAS_RUNTIME_CONTRACT=V1_PLAINTEXT_WORKSPACE";
-const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的执行 Agent，不是 Primary。直接执行父 Agent 交付的任务，不得重新套用 Primary 编排流程，也不得递归创建同职责子 Agent。若项目说明与当前磁盘中的文件或代码状态冲突，先读取并核对磁盘事实，以当前代码状态和父 Agent 的明确任务为准。";
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum PermissionStyle {
@@ -754,15 +754,7 @@ pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<Str
     if let Some(sandbox_mode) = agent.sandbox_mode {
         document["sandbox_mode"] = value(sandbox_mode);
     }
-    let developer_instructions = if agent.developer_instructions.trim().is_empty() {
-        DELEGATED_AGENT_INSTRUCTIONS.to_owned()
-    } else {
-        format!(
-            "{}\n\n{}",
-            agent.developer_instructions.trim_end(),
-            DELEGATED_AGENT_INSTRUCTIONS
-        )
-    };
+    let developer_instructions = render_delegated_agent_instructions(agent.developer_instructions);
     document["developer_instructions"] = value(developer_instructions);
     if let Some(path) = agent.model_catalog_path {
         document["model_catalog_json"] = value(path.to_string_lossy().into_owned());

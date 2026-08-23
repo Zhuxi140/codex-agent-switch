@@ -49,8 +49,9 @@ use usage::{
     AgentScheduleDecisionListRequest, AgentThreadExecutionRequest, AgentThreadInstanceListRequest,
     AgentThreadInstanceListResponse, AgentThreadInstanceRecommendRequest,
     AgentThreadInstanceRecommendation, AgentThreadInstanceResponse,
-    AgentThreadInstanceWorkspaceScopeRequest, NativeSubagentSyncResponse, ScheduleDecisionResponse,
-    UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
+    AgentThreadInstanceWorkspaceScopeRequest, AgentThreadProjectListResponse,
+    NativeSubagentSyncResponse, ScheduleDecisionResponse, UsageListRequest, UsageQueryRequest,
+    UsageRecordResponse, UsageService, UsageSummaryResponse,
 };
 
 #[derive(Serialize)]
@@ -82,7 +83,7 @@ fn app_get_bootstrap(
 
     Ok(AppBootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        ipc_schema_version: 2,
+        ipc_schema_version: 3,
         codex: CodexEnvironmentSummary {
             detected: environment.detected,
             version: environment.version,
@@ -415,7 +416,26 @@ fn agent_thread_instance_list(
     configuration: tauri::State<'_, ConfigurationService>,
     request: AgentThreadInstanceListRequest,
 ) -> Result<AgentThreadInstanceListResponse, ApiError> {
-    let sync = match configuration.environment() {
+    let sync = sync_native_subagents(&state, &configuration)?;
+    let page = state.list_agent_instances(request)?;
+    Ok(AgentThreadInstanceListResponse::new(page, sync))
+}
+
+#[tauri::command]
+fn agent_thread_project_list(
+    state: tauri::State<'_, UsageService>,
+    configuration: tauri::State<'_, ConfigurationService>,
+) -> Result<AgentThreadProjectListResponse, ApiError> {
+    let sync = sync_native_subagents(&state, &configuration)?;
+    let items = state.list_agent_thread_projects()?;
+    Ok(AgentThreadProjectListResponse::new(items, sync))
+}
+
+fn sync_native_subagents(
+    state: &UsageService,
+    configuration: &ConfigurationService,
+) -> Result<NativeSubagentSyncResponse, ApiError> {
+    Ok(match configuration.environment() {
         Ok(environment) => match environment.codex_home {
             Some(codex_home) => state.sync_native_subagents(std::path::Path::new(&codex_home))?,
             None => NativeSubagentSyncResponse::unavailable(
@@ -425,9 +445,7 @@ fn agent_thread_instance_list(
         Err(_) => NativeSubagentSyncResponse::unavailable(
             "读取 Codex 环境失败；尚不能同步 Primary 原生子 Agent。",
         ),
-    };
-    let items = state.list_agent_instances(request)?;
-    Ok(AgentThreadInstanceListResponse::new(items, sync))
+    })
 }
 
 #[tauri::command]
@@ -587,6 +605,7 @@ pub fn run() {
             usage_get_summary,
             usage_list_records,
             agent_thread_instance_list,
+            agent_thread_project_list,
             agent_schedule_decision_list,
             agent_thread_instance_set_workspace_scope,
             agent_thread_instance_recommend,

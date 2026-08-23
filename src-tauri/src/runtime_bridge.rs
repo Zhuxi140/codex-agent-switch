@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::codex_config::render_delegated_agent_instructions;
 use crate::codex_schema_probe::{SchemaCapability, probe_schema_capabilities};
 use crate::provider::ApiError;
 use crate::usage::{
@@ -408,11 +409,12 @@ impl RuntimeBridgeService {
             &plan.profile,
             &thread_id,
             &plan.workspace_scope_key,
+            plan.task_scope_key.as_deref(),
         )?;
         let turn = self.managed_turn_start_inner(ManagedTurnStartRequest {
             thread_id: thread_id.clone(),
             input,
-            effort: reasoning_effort(&plan.profile).map(str::to_owned),
+            effort: plan.profile.reasoning_effort.clone(),
         });
         let turn = match turn {
             Ok(turn) => turn,
@@ -1350,7 +1352,7 @@ fn agent_thread_params(profile: &AgentRuntimeProfile, cwd: &str) -> Value {
     let mut params = json!({
         "cwd": cwd,
         "model": profile.model_slug,
-        "developerInstructions": profile.instruction,
+        "developerInstructions": render_delegated_agent_instructions(&profile.instruction),
         "sandbox": match profile.sandbox_policy.as_str() {
             "READ_ONLY" => Some("read-only"),
             "WORKSPACE_WRITE" => Some("workspace-write"),
@@ -1368,15 +1370,6 @@ fn agent_thread_params(profile: &AgentRuntimeProfile, cwd: &str) -> Value {
             );
     }
     params
-}
-
-fn reasoning_effort(profile: &AgentRuntimeProfile) -> Option<&'static str> {
-    match profile.reasoning_policy.as_str() {
-        "LOW" => Some("low"),
-        "MEDIUM" => Some("medium"),
-        "HIGH" => Some("high"),
-        _ => None,
-    }
 }
 
 fn parse_managed_thread(result: &Value) -> Result<(String, Option<String>), RuntimeBridgeError> {
@@ -1923,23 +1916,23 @@ mod tests {
             agent_name: "Executor".to_owned(),
             instruction: "只执行已明确的实现任务。".to_owned(),
             sandbox_policy: "WORKSPACE_WRITE".to_owned(),
-            reasoning_policy: "HIGH".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
             model_slug: "deepseek-v4-flash".to_owned(),
             model_provider: Some("cas_deepseek".to_owned()),
             runtime_fingerprint: "test".to_owned(),
         };
 
-        assert_eq!(
-            agent_thread_params(&profile, "C:\\workspace\\project"),
-            json!({
-                "cwd": "C:\\workspace\\project",
-                "model": "deepseek-v4-flash",
-                "modelProvider": "cas_deepseek",
-                "developerInstructions": "只执行已明确的实现任务。",
-                "sandbox": "workspace-write",
-            })
-        );
-        assert_eq!(reasoning_effort(&profile), Some("high"));
+        let params = agent_thread_params(&profile, "C:\\workspace\\project");
+        assert_eq!(params.get("cwd"), Some(&json!("C:\\workspace\\project")));
+        assert_eq!(params.get("model"), Some(&json!("deepseek-v4-flash")));
+        assert_eq!(params.get("modelProvider"), Some(&json!("cas_deepseek")));
+        assert_eq!(params.get("sandbox"), Some(&json!("workspace-write")));
+        let instructions = params
+            .get("developerInstructions")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(instructions.contains("只执行已明确的实现任务。"));
+        assert!(instructions.contains("你是由 Primary 委派的执行 Agent"));
     }
 
     #[test]
@@ -1950,7 +1943,7 @@ mod tests {
             agent_name: "Native Executor".to_owned(),
             instruction: "执行任务。".to_owned(),
             sandbox_policy: "WORKSPACE_WRITE".to_owned(),
-            reasoning_policy: "HIGH".to_owned(),
+            reasoning_effort: Some("high".to_owned()),
             model_slug: "gpt-5.6-luna".to_owned(),
             model_provider: None,
             runtime_fingerprint: "test".to_owned(),

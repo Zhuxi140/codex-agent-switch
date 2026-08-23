@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { createPortal } from "react-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -23,6 +31,7 @@ import {
   listAgentPresets,
   listAgentScheduleDecisions,
   listAgentThreadInstances,
+  listAgentThreadProjects,
   listAgents,
   listModels,
   listProviders,
@@ -52,6 +61,7 @@ import {
   type AgentThreadInstanceResponse,
   type AgentThreadInstanceRecommendation,
   type AgentThreadInstanceStatus,
+  type AgentThreadProjectSummaryResponse,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
   type ConfigurationStatusResponse,
@@ -97,6 +107,255 @@ const navigation: Array<{ label: string; page?: Page }> = [
   { label: "诊断", page: "diagnostics" },
   { label: "设置", page: "settings" },
 ];
+
+type IconName =
+  | "alert"
+  | "book"
+  | "check"
+  | "chevron-down"
+  | "chevron-right"
+  | "chevron-up"
+  | "close"
+  | "clock"
+  | "copy"
+  | "edit"
+  | "external-link"
+  | "info"
+  | "refresh"
+  | "threads"
+  | "tokens"
+  | "trash"
+  | "users"
+  | "x-circle";
+
+function UiIcon({ name }: { name: IconName }) {
+  let content: ReactNode;
+  switch (name) {
+    case "alert":
+      content = <><path d="M10.3 4.2 2.7 17.4A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.6L13.7 4.2a2 2 0 0 0-3.4 0Z" /><path d="M12 9v4M12 17h.01" /></>;
+      break;
+    case "book":
+      content = <><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" /><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z" /></>;
+      break;
+    case "check":
+      content = <path d="m5 12 4 4L19 6" />;
+      break;
+    case "chevron-down":
+      content = <path d="m6 9 6 6 6-6" />;
+      break;
+    case "chevron-right":
+      content = <path d="m9 18 6-6-6-6" />;
+      break;
+    case "chevron-up":
+      content = <path d="m18 15-6-6-6 6" />;
+      break;
+    case "close":
+      content = <path d="M6 6l12 12M18 6 6 18" />;
+      break;
+    case "clock":
+      content = <><circle cx="12" cy="12" r="9" /><path d="M12 7v5l3 2" /></>;
+      break;
+    case "copy":
+      content = <><rect x="8" y="8" width="12" height="12" rx="2" /><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2" /></>;
+      break;
+    case "edit":
+      content = <><path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" /></>;
+      break;
+    case "external-link":
+      content = <><path d="M14 4h6v6M20 4l-9 9" /><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" /></>;
+      break;
+    case "info":
+      content = <><circle cx="12" cy="12" r="9" /><path d="M12 11v5" /><path d="M12 8h.01" /></>;
+      break;
+    case "refresh":
+      content = <><path d="M20 7v5h-5" /><path d="M4 17v-5h5" /><path d="M6.1 9A7 7 0 0 1 18 6l2 2M18 15a7 7 0 0 1-11.9 3L4 16" /></>;
+      break;
+    case "threads":
+      content = <><circle cx="6" cy="5" r="2" /><circle cx="18" cy="7" r="2" /><circle cx="6" cy="19" r="2" /><path d="M8 5h3a3 3 0 0 1 3 3v7a4 4 0 0 1-4 4H8M14 10h2a2 2 0 0 0 2-2" /></>;
+      break;
+    case "tokens":
+      content = <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></>;
+      break;
+    case "trash":
+      content = <><path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6" /></>;
+      break;
+    case "users":
+      content = <><circle cx="9" cy="8" r="3" /><path d="M3 20a6 6 0 0 1 12 0M16 4a3 3 0 0 1 0 6M17 14a5 5 0 0 1 4 5" /></>;
+      break;
+    case "x-circle":
+      content = <><circle cx="12" cy="12" r="9" /><path d="m9 9 6 6M15 9l-6 6" /></>;
+      break;
+  }
+  return (
+    <svg aria-hidden="true" className="ui-icon" fill="none" viewBox="0 0 24 24">
+      <g stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.8">
+        {content}
+      </g>
+    </svg>
+  );
+}
+
+function Tooltip({
+  children,
+  content,
+  focusable = false,
+  label,
+}: {
+  children: ReactNode;
+  content: string;
+  focusable?: boolean;
+  label?: string;
+}) {
+  const tooltipId = useId();
+  const anchorRef = useRef<HTMLSpanElement>(null);
+  const openTimer = useRef<number | null>(null);
+  const closeTimer = useRef<number | null>(null);
+  const [position, setPosition] = useState<{ above: boolean; left: number; top: number } | null>(null);
+
+  function clearTimers() {
+    if (openTimer.current !== null) window.clearTimeout(openTimer.current);
+    if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    openTimer.current = null;
+    closeTimer.current = null;
+  }
+
+  function show(delay: number) {
+    clearTimers();
+    const open = () => {
+      const bounds = anchorRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+      const above = bounds.bottom + 130 > window.innerHeight;
+      setPosition({
+        above,
+        left: Math.min(window.innerWidth - 156, Math.max(156, bounds.left + bounds.width / 2)),
+        top: above ? bounds.top - 8 : bounds.bottom + 8,
+      });
+    };
+    if (delay === 0) open();
+    else openTimer.current = window.setTimeout(open, delay);
+  }
+
+  function hide(delay = 0) {
+    if (openTimer.current !== null) window.clearTimeout(openTimer.current);
+    openTimer.current = null;
+    if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+    closeTimer.current = window.setTimeout(() => setPosition(null), delay);
+  }
+
+  useEffect(() => () => clearTimers(), []);
+
+  return (
+    <>
+      <span
+        aria-describedby={position ? tooltipId : undefined}
+        aria-label={focusable ? label ?? content : undefined}
+        className="tooltip-anchor"
+        onBlur={() => hide(80)}
+        onFocus={() => show(0)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape") hide();
+        }}
+        onMouseEnter={() => show(800)}
+        onMouseLeave={() => hide(120)}
+        ref={anchorRef}
+        tabIndex={focusable ? 0 : undefined}
+      >
+        {children}
+      </span>
+      {position && createPortal(
+        <span
+          className={`ui-tooltip ${position.above ? "above" : ""}`}
+          id={tooltipId}
+          onMouseEnter={() => {
+            if (closeTimer.current !== null) window.clearTimeout(closeTimer.current);
+            closeTimer.current = null;
+          }}
+          onMouseLeave={() => hide()}
+          role="tooltip"
+          style={{ left: position.left, top: position.top }}
+        >
+          {content}
+        </span>,
+        document.body,
+      )}
+    </>
+  );
+}
+
+function IconButton({
+  disabled = false,
+  icon,
+  label,
+  loading = false,
+  onClick,
+  state = "idle",
+  tone = "neutral",
+}: {
+  disabled?: boolean;
+  icon: IconName;
+  label: string;
+  loading?: boolean;
+  onClick: () => void;
+  state?: "idle" | "error" | "success";
+  tone?: "neutral" | "danger";
+}) {
+  return (
+    <Tooltip content={label}>
+      <button
+        aria-busy={loading || undefined}
+        aria-label={label}
+        className={`icon-button ${tone}`}
+        data-state={loading ? "loading" : state}
+        disabled={disabled || loading}
+        onClick={onClick}
+        type="button"
+      >
+        <UiIcon name={loading ? "refresh" : icon} />
+      </button>
+    </Tooltip>
+  );
+}
+
+function CopyIconButton({ label, value }: { label: string; value: string }) {
+  const [state, setState] = useState<"idle" | "error" | "success">("idle");
+  const resetTimer = useRef<number | null>(null);
+
+  useEffect(() => () => {
+    if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
+  }, []);
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setState("success");
+    } catch {
+      setState("error");
+    }
+    if (resetTimer.current !== null) window.clearTimeout(resetTimer.current);
+    resetTimer.current = window.setTimeout(() => setState("idle"), 2500);
+  }
+
+  const statusLabel = state === "success" ? "已复制" : state === "error" ? "复制失败" : label;
+  return (
+    <>
+      <IconButton
+        icon={state === "success" ? "check" : "copy"}
+        label={statusLabel}
+        onClick={() => void copy()}
+        state={state}
+      />
+      <span aria-live="polite" className="sr-only">{state === "idle" ? "" : statusLabel}</span>
+    </>
+  );
+}
+
+function InfoTip({ label }: { label: string }) {
+  return (
+    <Tooltip content={label} focusable label={label}>
+      <span className="info-tip"><UiIcon name="info" /></span>
+    </Tooltip>
+  );
+}
 
 export function App() {
   const [page, setPage] = useState<Page>("overview");
@@ -190,11 +449,17 @@ export function App() {
             </button>
           ))}
         </nav>
-        <div className="topbar-status" title={bootstrap?.codex.version ?? undefined}>
+        <div className="topbar-status">
           <span className={bootstrap?.codex.detected ? "online" : ""} aria-hidden="true" />
-          <span>
-            {!bootstrap ? "正在检测" : bootstrap.codex.detected ? "Codex Ready" : "Codex 未检测"}
-          </span>
+          <Tooltip
+            content={bootstrap?.codex.version ? `Codex ${bootstrap.codex.version}` : "尚未读取到 Codex 版本"}
+            focusable
+            label={bootstrap?.codex.version ? `Codex 版本 ${bootstrap.codex.version}` : "尚未读取到 Codex 版本"}
+          >
+            <span>
+              {!bootstrap ? "正在检测" : bootstrap.codex.detected ? "Codex Ready" : "Codex 未检测"}
+            </span>
+          </Tooltip>
         </div>
       </header>
 
@@ -501,6 +766,9 @@ function OverviewPage({
   const runtimeUsesSubagents = currentAgentIds.length > 0 || Boolean(runtimeMode?.legacyActiveAgentId);
   const restartPending = runtimeUsesSubagents && Boolean(configuration?.restartRecommended);
   const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
+  const visibleSelectedAgents = selectedAgents.slice(0, 2);
+  const hiddenSelectedAgents = selectedAgents.slice(2);
+  const latestSnapshot = snapshots[0];
   return (
     <>
       {configurationConflict && (
@@ -526,11 +794,9 @@ function OverviewPage({
         />
       )}
 
-      <header>
+      <header className="overview-heading">
         <div>
-          <span className="eyebrow">Runtime Mode</span>
           <h1>选择 Codex 的工作方式</h1>
-          <p>使用 Default 让 Codex 全权负责，或按 Role 启用多个由 CAS 管理的子 Agent。</p>
         </div>
       </header>
 
@@ -543,10 +809,9 @@ function OverviewPage({
 
       <section className="configuration-card runtime-mode-card">
         <div className="configuration-heading">
-          <div>
-            <span className="eyebrow">Mode Switch</span>
+          <div className="overview-mode-title">
             <h2>运行模式</h2>
-            <p>切换时自动创建 Snapshot，并在失败时回滚 CAS-owned 配置。</p>
+            <InfoTip label="切换前自动创建 Snapshot；同步失败时回滚 CAS-owned 配置。" />
           </div>
           <span className={`mode-status ${
             restartPending
@@ -569,17 +834,6 @@ function OverviewPage({
             </span>
           </div>
         )}
-        {(selectedMode === "SUBAGENT" || (runtimeMode?.activeBindings.length ?? 0) > 0) && (
-          <div className="orchestration-warning" role="note">
-            子 Agent 会继承 Primary 的实时权限。CAS 会配置 V1 明文委派与 Workspace
-            基线；切换后必须完全退出并重启 Codex，再新建任务，并保持 Auto 或
-            Workspace。
-            {failurePolicy === "STRICT_STOP"
-              ? " 当前为 Strict Stop：委派失败后 Primary 必须停止。"
-              : " 当前为 Primary Fallback：委派失败后 Primary 会先显式警告，再接管任务；这是指令约束，不是权限隔离。"}
-          </div>
-        )}
-
         <div className="runtime-mode-options" role="radiogroup" aria-label="Codex 运行模式">
           <div className={`runtime-mode-option ${selectedMode === "DEFAULT" ? "selected" : ""}`}>
             <input
@@ -589,10 +843,13 @@ function OverviewPage({
               onChange={() => setSelectedMode("DEFAULT")}
               type="radio"
             />
-            <label className="runtime-mode-copy" htmlFor="runtime-mode-default">
-              <strong>Default</strong>
-              <small>不启用 CAS 子 Agent，不改动 Codex 的主模型、MCP 或其他外部配置。</small>
-            </label>
+            <div className="runtime-mode-copy">
+              <div className="runtime-mode-title">
+                <label htmlFor="runtime-mode-default"><strong>Default</strong></label>
+                <InfoTip label="CAS 不写入子 Agent 编排配置；Codex 主模型、MCP 与其他外部配置保持不变。" />
+              </div>
+              <small>Codex 全权负责，不启用 CAS 子 Agent。</small>
+            </div>
             {defaultIsCurrent && <span className="current-mode-tag">当前</span>}
           </div>
 
@@ -604,20 +861,37 @@ function OverviewPage({
               onChange={() => setSelectedMode("SUBAGENT")}
               type="radio"
             />
-            <span className="runtime-mode-copy">
-              <label htmlFor="runtime-mode-subagent">
-                <strong>使用子 Agent</strong>
-                <small>不同 Role 可以同时运行；同一 Role 只能选择一个 Agent。Primary 只负责规划、审查与收束。</small>
-              </label>
+            <div className="runtime-mode-copy">
+              <div className="runtime-mode-title">
+                <label htmlFor="runtime-mode-subagent"><strong>使用子 Agent</strong></label>
+                <InfoTip
+                  label={`不同 Role 可以同时运行，同一 Role 只能选择一个 Agent。Primary 负责规划、审查与收束；子 Agent 继承 Primary 的实时权限。切换后需完全退出并重启 Codex，再新建任务，并保持 Auto 或 Workspace。当前失败策略：${failurePolicy === "STRICT_STOP" ? "Strict Stop，委派失败后停止" : "Primary Fallback，警告后由 Primary 接管"}。`}
+                />
+              </div>
+              <small>按 Role 配置 Agent；同一 Role 只启用一个。</small>
               <div className="selected-agent-summary" aria-label="已配置的子 Agent">
                 {selectedAgents.length === 0 ? (
                   <small>尚未配置子 Agent。</small>
                 ) : (
-                  selectedAgents.map((agent) => (
-                    <span key={agent.id}>
-                      {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}（{agent.agentKey}）
-                    </span>
-                  ))
+                  <>
+                    <strong className="selected-agent-count">已配置 {selectedAgents.length} 个</strong>
+                    {visibleSelectedAgents.map((agent) => (
+                      <span key={agent.id}>
+                        {agent.model?.providerKey ?? "未绑定供应商"} / {agent.name}
+                      </span>
+                    ))}
+                    {hiddenSelectedAgents.length > 0 && (
+                      <Tooltip
+                        content={hiddenSelectedAgents.map((agent) =>
+                          `${agent.model?.providerKey ?? "未绑定供应商"} / ${agent.name}`
+                        ).join(" · ")}
+                        focusable
+                        label={`另外 ${hiddenSelectedAgents.length} 个 Agent`}
+                      >
+                        <span>+{hiddenSelectedAgents.length}</span>
+                      </Tooltip>
+                    )}
+                  </>
                 )}
               </div>
               <button
@@ -641,7 +915,7 @@ function OverviewPage({
                     : "Primary Fallback 会警告后由 Primary 接管。"}
                 </em>
               )}
-            </span>
+            </div>
             {runtimeMode && (runtimeMode.activeBindings.length > 0 || runtimeMode.legacyActiveAgentId) && (
               <span className="current-mode-tag">当前：{runtimeMode.activeBindings.length || 1} 个</span>
             )}
@@ -650,11 +924,9 @@ function OverviewPage({
 
         <div className="failure-policy-panel">
           <label htmlFor="overview-failure-policy">
-            <span>
-              <strong>子 Agent 失败策略</strong>
-              <small>
-                Strict Stop 在委派失败后停止；Primary Fallback 会先警告，再由 Primary 接管。
-              </small>
+            <span className="failure-policy-label">
+              <strong>失败策略</strong>
+              <InfoTip label="Strict Stop 在委派失败后停止；Primary Fallback 会先显式警告，再由 Primary 接管。" />
             </span>
             <select
               disabled={policySaving}
@@ -743,16 +1015,23 @@ function OverviewPage({
         />
       )}
 
-      <section className="configuration-card snapshot-card">
-        <div className="configuration-heading">
-          <div>
-            <span className="eyebrow">Snapshots</span>
-            <h2>最近备份</h2>
-          </div>
-        </div>
-        {snapshots.length === 0 ? (
-          <p className="empty-copy">首次切换模式前会自动生成 Snapshot。</p>
-        ) : (
+      {!latestSnapshot ? (
+        <section className="snapshot-strip snapshot-empty">
+          <strong>最近备份</strong>
+          <small>首次切换模式前会自动生成 Snapshot。</small>
+        </section>
+      ) : (
+        <details className="snapshot-strip snapshot-disclosure">
+          <summary>
+            <span className="snapshot-summary-copy">
+              <strong>最近备份</strong>
+              <small>{latestSnapshot.createdAt} · {latestSnapshot.resourceCount} files</small>
+            </span>
+            <span className="snapshot-summary-state">
+              查看 {snapshots.length} 条
+              <UiIcon name="chevron-down" />
+            </span>
+          </summary>
           <div className="snapshot-list">
             {snapshots.map((snapshot) => (
               <div className="snapshot-row" key={snapshot.id}>
@@ -771,8 +1050,8 @@ function OverviewPage({
               </div>
             ))}
           </div>
-        )}
-      </section>
+        </details>
+      )}
     </>
   );
 }
@@ -829,14 +1108,22 @@ function ConfigurationConflictDialog({
                 : "当前 CODEX_HOME 已存在 CAS 准备管理的配置，但本机 CAS 尚未登记这些资源的所有权。同步已暂停，磁盘内容尚未改变。"}
             </p>
           </div>
-          <button className="ghost-button" disabled={busy} onClick={onClose} type="button">
-            取消同步
-          </button>
+          <IconButton
+            disabled={busy}
+            icon="close"
+            label="取消同步并关闭"
+            onClick={onClose}
+          />
         </header>
 
         <div className="conflict-home">
           <span>CODEX_HOME</span>
-          <code title={conflict.codexHome}>{conflict.codexHome}</code>
+          <div className="copyable-code">
+            <Tooltip content={conflict.codexHome} focusable label={`CODEX_HOME：${conflict.codexHome}`}>
+              <code>{conflict.codexHome}</code>
+            </Tooltip>
+            <CopyIconButton label="复制 CODEX_HOME" value={conflict.codexHome} />
+          </div>
         </div>
 
         <div className="configuration-conflict-list">
@@ -851,7 +1138,12 @@ function ConfigurationConflictDialog({
                 </span>
               </div>
               <small>{resource.resourceType}</small>
-              <code title={resource.path}>{resource.path}</code>
+              <div className="copyable-code">
+                <Tooltip content={resource.path} focusable label={`资源路径：${resource.path}`}>
+                  <code>{resource.path}</code>
+                </Tooltip>
+                <CopyIconButton label={`复制 ${resource.logicalKey} 路径`} value={resource.path} />
+              </div>
               <p>
                 {resource.matchesDesired
                   ? "磁盘语义与 CAS 当前期望一致。"
@@ -874,15 +1166,20 @@ function ConfigurationConflictDialog({
           <button className="secondary-button" disabled={busy} onClick={onClose} type="button">
             取消同步
           </button>
-          <button
-            className="secondary-button"
-            disabled={busy || !conflict.canAdopt}
-            onClick={onAdopt}
-            title={conflict.canAdopt ? undefined : "现有配置与 CAS 期望不完全一致"}
-            type="button"
+          <Tooltip
+            content={conflict.canAdopt ? "接管与 CAS 期望一致的现有配置" : "现有配置与 CAS 期望不完全一致"}
+            focusable={!conflict.canAdopt}
+            label="接管一致配置说明"
           >
-            {busy ? "处理中…" : "接管一致配置"}
-          </button>
+            <button
+              className="secondary-button"
+              disabled={busy || !conflict.canAdopt}
+              onClick={onAdopt}
+              type="button"
+            >
+              {busy ? "处理中…" : "接管一致配置"}
+            </button>
+          </Tooltip>
           <button
             className="danger-button"
             disabled={busy || conflict.resources.some((resource) => !resource.replaceable)}
@@ -939,9 +1236,7 @@ function AgentConfigurationDialog({
             <h2 id="agent-config-title">配置子 Agent</h2>
             <p>不同 Role 可以同时运行；同一 Role 只能启用一个 Agent。</p>
           </div>
-          <button className="ghost-button" onClick={onClose} type="button" aria-label="关闭子 Agent 配置">
-            关闭
-          </button>
+          <IconButton icon="close" label="关闭子 Agent 配置" onClick={onClose} />
         </header>
 
         <div className="role-agent-selectors">
@@ -1034,24 +1329,51 @@ function DiagnosticsPage() {
       {result && (
         <section className="diagnostics-result">
           <div className="diagnostics-summary">
-            <span className={`result ${result.overall.toLowerCase()}`}>{result.overall}</span>
+            <StatusBadge
+              className={`result ${result.overall.toLowerCase()}`}
+              description={
+                result.overall === "HEALTHY"
+                  ? "全部只读检查均未发现需要处理的问题。"
+                  : result.overall === "WARNING"
+                    ? "存在不会立即阻断 CAS、但建议检查的项目。"
+                    : "存在会影响 CAS 或 Codex 配置正常工作的错误。"
+              }
+              label={result.overall === "HEALTHY" ? "正常" : result.overall === "WARNING" ? "需注意" : "错误"}
+            />
             <small>{result.checkedAt}</small>
           </div>
           {result.sections.map((section) => (
             <article className="diagnostic-section" key={section.key}>
               <h2>{section.title}</h2>
               <ul>
-                {section.issues.map((issue) => (
-                  <li key={`${issue.code}-${issue.message}`}>
-                    <span aria-hidden="true" className={`diagnostic-icon ${issue.severity.toLowerCase()}`}>
-                      {issue.severity === "ERROR" ? "✕" : issue.severity === "WARNING" ? "⚠" : "ⓘ"}
-                    </span>
-                    <div>
-                      <strong>{issue.message}</strong>
-                      <small>{issue.code}</small>
-                    </div>
-                  </li>
-                ))}
+                {section.issues.map((issue) => {
+                  const firstLine = issue.message.split(/\r?\n/, 1)[0];
+                  const hasDetails = issue.message.length > 140 || firstLine !== issue.message;
+                  const preview = firstLine.length > 140 ? `${firstLine.slice(0, 137)}…` : firstLine;
+                  const severityLabel = issue.severity === "ERROR" ? "错误" : issue.severity === "WARNING" ? "警告" : "信息";
+                  const severityIcon: IconName = issue.severity === "ERROR" ? "x-circle" : issue.severity === "WARNING" ? "alert" : "info";
+                  return (
+                    <li key={`${issue.code}-${issue.message}`}>
+                      <span className={`diagnostic-icon ${issue.severity.toLowerCase()}`}>
+                        <UiIcon name={severityIcon} />
+                        <span className="sr-only">{severityLabel}</span>
+                      </span>
+                      <div className="diagnostic-issue-copy">
+                        <strong>{preview}</strong>
+                        <span className="diagnostic-issue-meta">
+                          <code>{issue.code}</code>
+                          <CopyIconButton label={`复制诊断代码 ${issue.code}`} value={issue.code} />
+                        </span>
+                        {hasDetails && (
+                          <details className="diagnostic-details">
+                            <summary>查看完整说明</summary>
+                            <p>{issue.message}</p>
+                          </details>
+                        )}
+                      </div>
+                    </li>
+                  );
+                })}
               </ul>
             </article>
           ))}
@@ -1225,25 +1547,48 @@ function SettingsPage({
             </div>
             {environment && (
               <dl className="settings-environment">
-                <div><dt>Executable</dt><dd>{environment.executablePath ?? "未检测到"}</dd></div>
-                <div><dt>CODEX_HOME</dt><dd>{environment.codexHome ?? "未定位"}</dd></div>
-                <div><dt>Version</dt><dd>{environment.version ?? "未知"}</dd></div>
+                {[
+                  { label: "Executable", value: environment.executablePath, fallback: "未检测到" },
+                  { label: "CODEX_HOME", value: environment.codexHome, fallback: "未定位" },
+                  { label: "Version", value: environment.version, fallback: "未知" },
+                ].map(({ label, value, fallback }) => (
+                  <div key={label}>
+                    <dt>{label}</dt>
+                    <dd className="settings-environment-value">
+                      {value ? (
+                        <>
+                          <Tooltip content={value} focusable label={`${label}：${value}`}>
+                            <code>{value}</code>
+                          </Tooltip>
+                          <CopyIconButton label={`复制 ${label}`} value={value} />
+                        </>
+                      ) : (
+                        <span>{fallback}</span>
+                      )}
+                    </dd>
+                  </div>
+                ))}
               </dl>
             )}
             <label className="field">
-              <span>自定义 CODEX_HOME</span>
+              <span className="field-label-with-info">
+                自定义 CODEX_HOME
+                <InfoTip label="填写已经存在的绝对目录；留空会恢复为环境变量或用户目录自动检测。" />
+              </span>
               <input
                 onChange={(event) => setCustomCodexHome(event.target.value)}
                 placeholder="留空以自动检测"
                 value={customCodexHome}
               />
-              <small>必须填写已经存在的绝对目录；留空恢复自动检测。</small>
             </label>
           </section>
 
           <section className="settings-card settings-grid">
             <label className="field">
-              <span>Appearance</span>
+              <span className="field-label-with-info">
+                Appearance
+                <InfoTip label="控制 CAS 界面主题；跟随系统会响应 Windows 的浅色或深色设置。" />
+              </span>
               <select
                 onChange={(event) => {
                   const value = event.target.value as Appearance;
@@ -1258,7 +1603,10 @@ function SettingsPage({
               </select>
             </label>
             <label className="field">
-              <span>Update Channel</span>
+              <span className="field-label-with-info">
+                Update Channel
+                <InfoTip label="Stable 优先稳定版本；Beta 可接收测试版本。" />
+              </span>
               <select
                 onChange={(event) => setSettings({ ...settings, updateChannel: event.target.value })}
                 value={settings.updateChannel}
@@ -1268,20 +1616,22 @@ function SettingsPage({
               </select>
             </label>
             <label className="field full-width">
-              <span>界面字体</span>
+              <span className="field-label-with-info">
+                界面字体
+                <InfoTip label="输入系统中已安装字体的准确名称；找不到时自动回退到系统默认字体。" />
+              </span>
               <input
                 maxLength={160}
                 onChange={(event) => setCustomFontFamily(event.target.value)}
                 placeholder="留空使用系统默认字体"
                 value={customFontFamily}
               />
-              <small>输入系统中已安装字体的准确名称；若系统找不到该字体，将自动回退。</small>
             </label>
             <label className="enabled-field full-width">
               <input checked disabled type="checkbox" />
-              <span>
+              <span className="field-label-with-info">
                 模式切换前自动备份
-                <small>V0.1 安全约束，保持启用，确保失败时可回滚。</small>
+                <InfoTip label="当前版本固定启用：切换失败时可恢复 CAS 接管的配置资源。" />
               </span>
             </label>
           </section>
@@ -1297,7 +1647,10 @@ function SettingsPage({
 
             <div className="project-exclusion-add">
               <label className="field">
-                <span>项目绝对路径</span>
+                <span className="field-label-with-info">
+                  项目绝对路径
+                  <InfoTip label="CAS 会保留式修改该项目的 .codex/config.toml，并在移除排除项时恢复由 CAS 接管的字段。" />
+                </span>
                 <input
                   aria-invalid={Boolean(projectPathError)}
                   onChange={(event) => {
@@ -1310,9 +1663,7 @@ function SettingsPage({
                 {projectPathError ? (
                   <small className="field-error">{projectPathError}</small>
                 ) : (
-                  <small>
-                    CAS 会保留式修改该项目的 .codex/config.toml，并在移除时恢复接管字段。
-                  </small>
+                  <small>排除仅对该目录及其子目录中的新会话生效。</small>
                 )}
               </label>
               <button
@@ -1337,18 +1688,23 @@ function SettingsPage({
               ) : (
                 projectExclusions.map((exclusion) => (
                   <div className="project-exclusion-entry" key={exclusion.id}>
-                    <span>
-                      <strong>{exclusion.projectPath}</strong>
+                    <span className="project-exclusion-copy">
+                      <span className="project-exclusion-path">
+                        <Tooltip content={exclusion.projectPath} focusable label={`排除路径：${exclusion.projectPath}`}>
+                          <strong>{exclusion.projectPath}</strong>
+                        </Tooltip>
+                        <CopyIconButton label="复制排除路径" value={exclusion.projectPath} />
+                      </span>
                       <small>仅匹配该目录及其子目录</small>
                     </span>
-                    <button
-                      className="danger-button"
+                    <IconButton
                       disabled={exclusionBusy !== null}
+                      icon="trash"
+                      label={exclusionBusy === exclusion.id ? "正在移除项目排除" : `移除项目排除 ${exclusion.projectPath}`}
+                      loading={exclusionBusy === exclusion.id}
                       onClick={() => removeExclusion(exclusion)}
-                      type="button"
-                    >
-                      {exclusionBusy === exclusion.id ? "移除中…" : "移除"}
-                    </button>
+                      tone="danger"
+                    />
                   </div>
                 ))
               )}
@@ -1367,24 +1723,20 @@ function SettingsPage({
                 <article>
                   <code>CAS:OFF</code>
                   <span>发送后运行 /permissions，选择 Auto 或 Workspace。</span>
-                  <button
-                    className="ghost-button"
-                    onClick={() => copyConversationMarker("CAS:OFF")}
-                    type="button"
-                  >
-                    复制
-                  </button>
+                  <IconButton
+                    icon="copy"
+                    label="复制 CAS:OFF"
+                    onClick={() => void copyConversationMarker("CAS:OFF")}
+                  />
                 </article>
                 <article>
                   <code>CAS:ON</code>
                   <span>恢复编排后继续保持 Auto 或 Workspace。</span>
-                  <button
-                    className="ghost-button"
-                    onClick={() => copyConversationMarker("CAS:ON")}
-                    type="button"
-                  >
-                    复制
-                  </button>
+                  <IconButton
+                    icon="copy"
+                    label="复制 CAS:ON"
+                    onClick={() => void copyConversationMarker("CAS:ON")}
+                  />
                 </article>
               </div>
               {copyStatus && <small role="status">{copyStatus}</small>}
@@ -1542,34 +1894,50 @@ function AgentRow({
   isActive: boolean;
   onOpen: (id: string) => void;
 }) {
+  const bindingSummary = agent.model
+    ? `${agent.model.providerKey} / ${agent.model.displayName}`
+    : "未绑定供应商 / 模型";
+  const orchestrationSummary = agent.roleKey && agent.orchestrationPhase
+    ? `${agent.roleKey} / ${agent.orchestrationPhase}`
+    : "未分类";
   return (
     <article className="agent-row">
       <div className="agent-main">
         <div className="provider-name-line">
           <h2>{agent.name}</h2>
-          <span
+          <StatusBadge
             className={`agent-state ${agent.availability.toLowerCase()}`}
-            title={availabilityDescription(agent.availability)}
-          >
-            {availabilityLabel(agent.availability)}
-          </span>
-          {isActive && <span className="agent-state current">当前使用</span>}
+            description={availabilityDescription(agent.availability)}
+            icon={agent.availability === "READY" ? "check" : agent.availability === "INCOMPATIBLE_MODEL" ? "x-circle" : "alert"}
+            label={availabilityLabel(agent.availability)}
+          />
+          {isActive && <span className="agent-state current"><UiIcon name="check" />当前使用</span>}
         </div>
-        <p>{agent.description}</p>
-        <code>
-          {agent.model
-            ? `${agent.model.providerKey} / ${agent.model.displayName}`
-            : "未绑定供应商 / 模型"}
-          {agent.roleKey && agent.orchestrationPhase
-            ? ` · ${agent.roleKey} / ${agent.orchestrationPhase}`
-            : " · 未分类"}
-        </code>
+        <Tooltip content={agent.description} focusable label={`Agent 描述：${agent.description}`}>
+          <p>{agent.description}</p>
+        </Tooltip>
+        <span className="agent-technical-line">
+          <Tooltip
+            content={`${bindingSummary} · ${orchestrationSummary}`}
+            focusable
+            label={`Agent 绑定：${bindingSummary}；${orchestrationSummary}`}
+          >
+            <code>{bindingSummary} · {orchestrationSummary}</code>
+          </Tooltip>
+          <CopyIconButton
+            label={`复制 ${agent.name} 的绑定信息`}
+            value={`${bindingSummary} · ${orchestrationSummary}`}
+          />
+        </span>
       </div>
       <div className="agent-binding">
-        <strong>Agent Key</strong>
+        <span className="agent-binding-heading">
+          <strong>Agent Key</strong>
+          <CopyIconButton label={`复制 Agent Key ${agent.agentKey}`} value={agent.agentKey} />
+        </span>
         <span>{agent.agentKey} · {agent.reasoningPolicy}</span>
       </div>
-      <button className="secondary-button" onClick={() => onOpen(agent.id)}>管理</button>
+      <IconButton icon="edit" label={`管理 Agent ${agent.name}`} onClick={() => onOpen(agent.id)} />
     </article>
   );
 }
@@ -1614,6 +1982,22 @@ function scheduleDecisionSourceLabel(source: string): string {
     DESKTOP_PREVIEW: "界面预览",
     DESKTOP_EXECUTE: "界面执行",
   }[source] ?? source;
+}
+
+function ExpandableMessage({ className, text }: { className?: string; text: string }) {
+  const firstLine = text.split(/\r?\n/, 1)[0];
+  const hasDetails = text.length > 160 || firstLine !== text;
+  if (!hasDetails) return <small className={className}>{text}</small>;
+  const preview = firstLine.length > 160 ? `${firstLine.slice(0, 157)}…` : firstLine;
+  return (
+    <div className={`expandable-message ${className ?? ""}`}>
+      <small>{preview}</small>
+      <details>
+        <summary>查看完整信息</summary>
+        <p>{text}</p>
+      </details>
+    </div>
+  );
 }
 
 function ScheduleDecisionsPanel() {
@@ -1663,7 +2047,6 @@ function ScheduleDecisionsPanel() {
             <article
               className={`reuse-recommendation ${decision.decision.toLowerCase()}`}
               key={decision.id}
-              title={`Primary：${decision.parentThreadId ?? "未知"}\n候选：${decision.candidateThreadId ?? "—"}\n指纹：${decision.runtimeFingerprint ?? "未知"}`}
             >
               <strong>{decision.decision}</strong>
               <span>{decision.reasonCode}</span>
@@ -1681,6 +2064,17 @@ function ScheduleDecisionsPanel() {
                 {decision.claimed ? " · 已锁定" : ""}
                 {decision.taskScopeKey ? ` · Task ${decision.taskScopeKey}` : ""}
                 {" · "}Cache {decision.cacheHint}
+              </span>
+              <span className="schedule-decision-actions">
+                {decision.parentThreadId && (
+                  <CopyIconButton label="复制 Primary Thread ID" value={decision.parentThreadId} />
+                )}
+                {decision.candidateThreadId && (
+                  <CopyIconButton label="复制候选 Thread ID" value={decision.candidateThreadId} />
+                )}
+                <InfoTip
+                  label={`Primary：${decision.parentThreadId ?? "未知"}\n候选：${decision.candidateThreadId ?? "—"}\n指纹：${decision.runtimeFingerprint ?? "未知"}`}
+                />
               </span>
             </article>
           ))}
@@ -1771,8 +2165,8 @@ function UsageMonitorCard() {
           ），恢复前不得当作当前事实。
         </small>
       )}
-      {monitor?.lastError && <small className="runtime-monitor-warning">{monitor.lastError}</small>}
-      {error && <small className="runtime-monitor-warning">{error}</small>}
+      {monitor?.lastError && <ExpandableMessage className="runtime-monitor-warning" text={monitor.lastError} />}
+      {error && <ExpandableMessage className="runtime-monitor-warning" text={error} />}
       <small className="runtime-monitor-note">
         独立启动的 Codex Desktop / CLI 不会被旁路监听；异常退出后需显式恢复原 Thread，
         CAS 不会自动重放上一个 Turn。
@@ -1782,13 +2176,21 @@ function UsageMonitorCard() {
 }
 
 function AgentThreadInstancesPanel() {
-  const [instances, setInstances] = useState<AgentThreadInstanceResponse[]>([]);
+  const [selectedProject, setSelectedProject] =
+    useState<AgentThreadProjectSummaryResponse | null>(null);
+
+  return selectedProject
+    ? <AgentThreadProjectDetail project={selectedProject} onBack={() => setSelectedProject(null)} />
+    : <AgentThreadProjectOverview onOpen={setSelectedProject} />;
+}
+
+function AgentThreadProjectOverview({
+  onOpen,
+}: {
+  onOpen: (project: AgentThreadProjectSummaryResponse) => void;
+}) {
+  const [projects, setProjects] = useState<AgentThreadProjectSummaryResponse[]>([]);
   const [nativeSync, setNativeSync] = useState<NativeSubagentSyncResponse | null>(null);
-  const [scopeDrafts, setScopeDrafts] = useState<Record<string, string>>({});
-  const [recommendations, setRecommendations] =
-    useState<Record<string, AgentThreadInstanceRecommendation>>({});
-  const [savingScope, setSavingScope] = useState<string | null>(null);
-  const [checkingRecommendation, setCheckingRecommendation] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -1796,15 +2198,9 @@ function AgentThreadInstancesPanel() {
     if (!silent) setLoading(true);
     setError(null);
     try {
-      const loaded = await listAgentThreadInstances({ limit: 50 });
-      setInstances(loaded.items);
+      const loaded = await listAgentThreadProjects();
+      setProjects(loaded.items);
       setNativeSync(loaded.sync);
-      setScopeDrafts((current) => Object.fromEntries(
-        loaded.items.map((instance) => [
-          instance.id,
-          current[instance.id] ?? instance.workspaceScopeKey ?? "",
-        ]),
-      ));
     } catch (reason: unknown) {
       setError(errorMessage(reason));
     } finally {
@@ -1818,6 +2214,172 @@ function AgentThreadInstancesPanel() {
     return () => window.clearInterval(timer);
   }, [load]);
 
+  return (
+    <section className="agent-instance-card" aria-labelledby="agent-instance-title">
+      <header>
+        <div>
+          <span className="eyebrow">Subagent Threads</span>
+          <h2 id="agent-instance-title">子 Agent 项目</h2>
+          <p>按 Workspace Scope 汇总子 Agent Thread；项目概览每 5 秒同步一次。</p>
+        </div>
+        <div className="runtime-monitor-actions">
+          {nativeSync && (
+            <StatusBadge
+              className={`result ${nativeSync.capability === "SUPPORTED" ? "ready" : "blocked"}`}
+              description={nativeSync.message}
+              icon={nativeSync.capability === "SUPPORTED" ? "check" : "alert"}
+              label={`Native ${nativeSync.capability}`}
+            />
+          )}
+          <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
+            {loading ? "同步中…" : "同步原生状态"}
+          </button>
+        </div>
+      </header>
+
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {nativeSync && (
+        <span
+          className={nativeSync.capability === "SUPPORTED"
+            ? "native-sync-note runtime-monitor-note"
+            : "native-sync-note runtime-monitor-warning"}
+        >
+          <ExpandableMessage
+            text={`${nativeSync.message}${nativeSync.capability === "SUPPORTED"
+              ? ` 已识别 ${nativeSync.discoveredCount} 个，映射 ${nativeSync.syncedCount} 个，未映射 ${nativeSync.unmappedCount} 个。`
+              : ""}`}
+          />
+          {nativeSync.sourcePath && (
+            <CopyIconButton label={`复制原生状态来源路径 ${nativeSync.sourcePath}`} value={nativeSync.sourcePath} />
+          )}
+        </span>
+      )}
+      {!loading && !error && projects.length === 0 && (
+        <div className="usage-empty">尚未识别到可映射的 Primary 原生子 Agent Thread。</div>
+      )}
+      {!error && projects.length > 0 && (
+        <div className="agent-project-list">
+          {projects.map((project) => (
+            <Tooltip
+              content={project.workspaceScopeKey ?? "尚未识别 Workspace Scope"}
+              key={project.workspaceScopeKey ?? "__unscoped__"}
+            >
+              <button
+                aria-label={`${project.workspaceScopeKey ?? "未归属项目"}：${project.agentCount} 个 Agents，${project.instanceCount} 个 Threads，${formatTokenCount(project.totalTokens)} Tokens，最近活动 ${formatDataAge(project.lastUsedAt)}`}
+                className="agent-project-row"
+                onClick={() => onOpen(project)}
+                type="button"
+              >
+                <span className="agent-project-main">
+                  <strong>{workspaceProjectName(project.workspaceScopeKey)}</strong>
+                  <code>
+                    {project.workspaceScopeKey ?? "未归属项目，可进入后修正 Scope"}
+                  </code>
+                  <span className="agent-project-badges">
+                    {project.runningCount > 0 && (
+                      <span className="agent-instance-status running">{project.runningCount} 运行中</span>
+                    )}
+                    {project.recoveryRequiredCount > 0 && (
+                      <span className="agent-instance-status recovery_required">
+                        {project.recoveryRequiredCount} 待恢复
+                      </span>
+                    )}
+                  </span>
+                </span>
+                <span className="agent-project-metrics">
+                  <ProjectMetric icon="users" label="Agents" value={String(project.agentCount)} />
+                  <ProjectMetric icon="threads" label="Threads" value={String(project.instanceCount)} />
+                  <ProjectMetric icon="tokens" label="Tokens" value={formatTokenCount(project.totalTokens)} />
+                  <ProjectMetric icon="clock" label="最近活动" value={formatDataAge(project.lastUsedAt)} />
+                </span>
+                <span className="agent-project-open" aria-hidden="true"><UiIcon name="chevron-right" /></span>
+              </button>
+            </Tooltip>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ProjectMetric({ icon, label, value }: { icon: IconName; label: string; value: string }) {
+  return (
+    <span className="agent-project-metric">
+      <Tooltip content={`${label}：${value}`}>
+        <span className="agent-project-metric-icon"><UiIcon name={icon} /></span>
+      </Tooltip>
+      <strong>{value}</strong>
+    </span>
+  );
+}
+
+interface AgentThreadGroup {
+  key: string;
+  name: string;
+  instances: AgentThreadInstanceResponse[];
+  totalTokens: number;
+  runningCount: number;
+  recoveryRequiredCount: number;
+  lastUsedAt: string;
+}
+
+function AgentThreadProjectDetail({
+  project,
+  onBack,
+}: {
+  project: AgentThreadProjectSummaryResponse;
+  onBack: () => void;
+}) {
+  const [instances, setInstances] = useState<AgentThreadInstanceResponse[]>([]);
+  const [nativeSync, setNativeSync] = useState<NativeSubagentSyncResponse | null>(null);
+  const [scopeDrafts, setScopeDrafts] = useState<Record<string, string>>({});
+  const [recommendations, setRecommendations] =
+    useState<Record<string, AgentThreadInstanceRecommendation>>({});
+  const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
+  const [expandedInstance, setExpandedInstance] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [savingScope, setSavingScope] = useState<string | null>(null);
+  const [checkingRecommendation, setCheckingRecommendation] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (cursor: string | null = null, append = false) => {
+    if (append) setLoadingMore(true);
+    else setLoading(true);
+    setError(null);
+    try {
+      const loaded = await listAgentThreadInstances({
+        ...(project.workspaceScopeKey === null
+          ? { unscoped: true }
+          : { workspaceScopeKey: project.workspaceScopeKey }),
+        limit: 50,
+        cursor,
+      });
+      setInstances((current) => append
+        ? [...current, ...loaded.items.filter((item) => !current.some((value) => value.id === item.id))]
+        : loaded.items);
+      setNextCursor(loaded.nextCursor);
+      setNativeSync(loaded.sync);
+      setScopeDrafts((current) => ({
+        ...current,
+        ...Object.fromEntries(loaded.items.map((instance) => [
+          instance.id,
+          current[instance.id] ?? instance.workspaceScopeKey ?? "",
+        ])),
+      }));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setLoading(false);
+      setLoadingMore(false);
+    }
+  }, [project.workspaceScopeKey]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
   async function saveWorkspaceScope(instance: AgentThreadInstanceResponse) {
     setSavingScope(instance.id);
     setError(null);
@@ -1826,7 +2388,9 @@ function AgentThreadInstancesPanel() {
         instance.codexThreadId,
         scopeDrafts[instance.id]?.trim() || null,
       );
-      setInstances((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setInstances((current) => updated.workspaceScopeKey === project.workspaceScopeKey
+        ? current.map((item) => item.id === updated.id ? updated : item)
+        : current.filter((item) => item.id !== updated.id));
       setScopeDrafts((current) => ({
         ...current,
         [updated.id]: updated.workspaceScopeKey ?? "",
@@ -1860,163 +2424,240 @@ function AgentThreadInstancesPanel() {
     }
   }
 
+  const groups = groupAgentThreadInstances(instances);
+
   return (
     <section className="agent-instance-card" aria-labelledby="agent-instance-title">
       <header>
         <div>
           <span className="eyebrow">Subagent Threads</span>
-          <h2 id="agent-instance-title">子 Agent 实例</h2>
+          <h2 id="agent-instance-title">{workspaceProjectName(project.workspaceScopeKey)}</h2>
           <p>
-            查看 Primary 原生委派产生的子 Agent 生命周期、Token 使用并维护复用 Workspace Scope。
-            数据在本页打开时每 5 秒同步一次，离开本页后不会自动同步。
+            <Tooltip
+              content={project.workspaceScopeKey ?? "未归属项目"}
+              focusable
+              label={`Workspace Scope：${project.workspaceScopeKey ?? "未归属项目"}`}
+            >
+              <span>{project.workspaceScopeKey ?? "未归属项目"}</span>
+            </Tooltip>
+            {" · "}已加载 {instances.length}/{project.instanceCount} 个 Thread，详情按需展开。
           </p>
         </div>
         <div className="runtime-monitor-actions">
           {nativeSync && (
-            <span
+            <StatusBadge
               className={`result ${nativeSync.capability === "SUPPORTED" ? "ready" : "blocked"}`}
-              title={nativeSync.message}
-            >
-              Native {nativeSync.capability}
-            </span>
+              description={nativeSync.message}
+              icon={nativeSync.capability === "SUPPORTED" ? "check" : "alert"}
+              label={`Native ${nativeSync.capability}`}
+            />
           )}
-          <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
-            {loading ? "同步中…" : "同步原生状态"}
-          </button>
+          <button className="secondary-button" onClick={onBack} type="button">返回项目</button>
+          <IconButton
+            disabled={loading}
+            icon="refresh"
+            label={loading ? "正在刷新项目详情" : "刷新项目详情"}
+            loading={loading}
+            onClick={() => void load()}
+          />
         </div>
       </header>
 
       {error && <div className="inline-error" role="alert">{error}</div>}
       {nativeSync && (
-        <small
+        <span
           className={nativeSync.capability === "SUPPORTED"
-            ? "runtime-monitor-note"
-            : "runtime-monitor-warning"}
-          title={nativeSync.sourcePath ?? undefined}
+            ? "native-sync-note runtime-monitor-note"
+            : "native-sync-note runtime-monitor-warning"}
         >
-          {nativeSync.message}
-          {nativeSync.capability === "SUPPORTED"
-            ? ` 已识别 ${nativeSync.discoveredCount} 个，映射 ${nativeSync.syncedCount} 个，未映射 ${nativeSync.unmappedCount} 个。`
-            : ""}
-        </small>
+          <ExpandableMessage
+            text={`${nativeSync.message}${nativeSync.capability === "SUPPORTED"
+              ? ` 已识别 ${nativeSync.discoveredCount} 个，映射 ${nativeSync.syncedCount} 个，未映射 ${nativeSync.unmappedCount} 个。`
+              : ""}`}
+          />
+          {nativeSync.sourcePath && (
+            <CopyIconButton label={`复制原生状态来源路径 ${nativeSync.sourcePath}`} value={nativeSync.sourcePath} />
+          )}
+        </span>
       )}
       {!loading && !error && instances.length === 0 && (
-        <div className="usage-empty">尚未识别到可映射的 Primary 原生子 Agent Thread。</div>
+        <div className="usage-empty">该项目下暂无子 Agent Thread。</div>
       )}
       {!error && instances.length > 0 && (
-        <div className="agent-instance-list">
-          {instances.map((instance) => (
-            <article className="agent-instance-row" key={instance.id}>
-              <div className="agent-instance-main">
-                <div>
-                  <strong>{instance.agentNameSnapshot ?? "Unknown Agent"}</strong>
-                  <span
-                    className={`agent-instance-status ${instance.status.toLowerCase()}`}
-                    title={agentInstanceStatusDescription(instance.status)}
-                  >
-                    {agentInstanceStatusLabel(instance.status)}
+        <div className="agent-project-agent-list">
+          {groups.map((group) => (
+            <article className="agent-project-agent" key={group.key}>
+              <button
+                aria-expanded={expandedAgent === group.key}
+                className="agent-project-agent-toggle"
+                onClick={() => setExpandedAgent((current) => current === group.key ? null : group.key)}
+                type="button"
+              >
+                <span>
+                  <strong>{group.name}</strong>
+                  <small>{group.instances.length} Threads · 最近 {formatDataAge(group.lastUsedAt)}</small>
+                </span>
+                <span className="agent-project-agent-summary">
+                  {group.runningCount > 0 && <em>{group.runningCount} 运行中</em>}
+                  {group.recoveryRequiredCount > 0 && <em>{group.recoveryRequiredCount} 待恢复</em>}
+                  <strong>{formatTokenCount(group.totalTokens)} Tokens</strong>
+                  <span aria-hidden="true">
+                    <UiIcon name={expandedAgent === group.key ? "chevron-up" : "chevron-down"} />
                   </span>
+                </span>
+              </button>
+              {expandedAgent === group.key && (
+                <div className="agent-thread-compact-list">
+                  {group.instances.map((instance) => (
+                    <article className="agent-thread-compact-row" key={instance.id}>
+                      <div className="agent-thread-compact-header">
+                        <span>
+                          <Tooltip content={instance.codexThreadId} focusable label={`Thread ID：${instance.codexThreadId}`}>
+                            <code>Thread {shortThreadId(instance.codexThreadId)}</code>
+                          </Tooltip>
+                          <CopyIconButton label="复制 Thread ID" value={instance.codexThreadId} />
+                          <StatusBadge
+                            className={`agent-instance-status ${instance.status.toLowerCase()}`}
+                            description={agentInstanceStatusDescription(instance.status)}
+                            icon={instance.status === "IDLE" ? "check" : instance.status === "RUNNING" ? "clock" : instance.status === "CLOSED" ? "x-circle" : "alert"}
+                            label={agentInstanceStatusLabel(instance.status)}
+                          />
+                        </span>
+                        <span>
+                          <strong>{formatTokenCount(instance.totalTokens)} Tokens</strong>
+                          <small>{formatDataAge(instance.lastUsedAt)}</small>
+                          <IconButton
+                            icon={expandedInstance === instance.id ? "chevron-up" : "chevron-down"}
+                            label={expandedInstance === instance.id ? "收起 Thread 详情" : "展开 Thread 详情"}
+                            onClick={() => setExpandedInstance((current) => current === instance.id ? null : instance.id)}
+                          />
+                        </span>
+                      </div>
+                      {expandedInstance === instance.id && (
+                        <div className="agent-thread-details">
+                          <div className="agent-thread-identifiers">
+                            <span>
+                              <Tooltip content={instance.codexThreadId} focusable label={`Child Thread ID：${instance.codexThreadId}`}>
+                                <code>Child {instance.codexThreadId}</code>
+                              </Tooltip>
+                              <CopyIconButton label="复制 Child Thread ID" value={instance.codexThreadId} />
+                            </span>
+                            {instance.parentThreadId && (
+                              <span>
+                                <Tooltip content={instance.parentThreadId} focusable label={`Primary Thread ID：${instance.parentThreadId}`}>
+                                  <code>Primary {instance.parentThreadId}</code>
+                                </Tooltip>
+                                <CopyIconButton label="复制 Primary Thread ID" value={instance.parentThreadId} />
+                              </span>
+                            )}
+                            {instance.taskScopeKey && (
+                              <span>
+                                <Tooltip content={instance.taskScopeKey} focusable label={`Task Scope：${instance.taskScopeKey}`}>
+                                  <code>Task {instance.taskScopeKey}</code>
+                                </Tooltip>
+                                <CopyIconButton label="复制 Task Scope" value={instance.taskScopeKey} />
+                              </span>
+                            )}
+                            <span className="thread-observation">
+                              <small>数据 {formatDataAge(instance.lastObservedAt)} · 模型使用 {formatDataAge(instance.lastModelUsageAt)}</small>
+                              <InfoTip label={`最近观察：${formatUsageDate(instance.lastObservedAt ?? instance.lastUsedAt)}\n最近模型使用：${instance.lastModelUsageAt ? formatUsageDate(instance.lastModelUsageAt) : "未知，缓存判定按未知处理"}`} />
+                            </span>
+                          </div>
+                          <dl>
+                            <UsageRecordMetric label="Total" value={instance.totalTokens} />
+                            <UsageRecordMetric label="Context" value={instance.currentContextTokens} />
+                            <UsageRecordMetric label="Cached" value={hasDetailedInstanceUsage(instance) ? instance.cachedInputTokens : null} />
+                            <UsageRecordMetric label="Input" value={hasDetailedInstanceUsage(instance) ? instance.inputTokens : null} />
+                            <UsageRecordMetric label="Output" value={hasDetailedInstanceUsage(instance) ? instance.outputTokens : null} />
+                          </dl>
+                          <div className="agent-instance-scope">
+                            <input
+                              aria-label={`${instance.agentNameSnapshot ?? "Agent"} Workspace Scope`}
+                              onChange={(event) => {
+                                setScopeDrafts((current) => ({ ...current, [instance.id]: event.target.value }));
+                                setRecommendations((current) => {
+                                  const next = { ...current };
+                                  delete next[instance.id];
+                                  return next;
+                                });
+                              }}
+                              placeholder="Workspace Scope，例如 c:/workspace/project"
+                              value={scopeDrafts[instance.id] ?? ""}
+                            />
+                            <button className="ghost-button" disabled={savingScope === instance.id} onClick={() => void saveWorkspaceScope(instance)} type="button">
+                              {savingScope === instance.id ? "保存中…" : "保存 Scope"}
+                            </button>
+                            <button className="ghost-button" disabled={checkingRecommendation === instance.id} onClick={() => void checkRecommendation(instance)} type="button">
+                              {checkingRecommendation === instance.id ? "评估中…" : "评估复用"}
+                            </button>
+                          </div>
+                          {recommendations[instance.id] && (
+                            <div
+                              className={`reuse-recommendation ${recommendations[instance.id].decision.toLowerCase()}`}
+                            >
+                              <strong>{recommendations[instance.id].decision}</strong>
+                              <span>{recommendations[instance.id].message}</span>
+                              <span className="reuse-recommendation-meta">
+                                {recommendations[instance.id].reasonCode}
+                                {" · "}Context {recommendations[instance.id].contextPressurePercent ?? "—"}
+                                /{recommendations[instance.id].contextPressureLimitPercent}%
+                                {" · "}Cache {recommendations[instance.id].cacheHint}
+                              </span>
+                              <InfoTip label="该结果基于当前 CAS 数据的预览；实际委派前 cas-helper 会重新读取 Codex 原生状态并按租约重新决策，结果可能变化。" />
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </article>
+                  ))}
                 </div>
-                <code
-                  title={`Child：${instance.codexThreadId}\nParent：${instance.parentThreadId ?? "未知"}`}
-                >
-                  {`Thread ${shortThreadId(instance.codexThreadId)}`}
-                </code>
-                {instance.parentThreadId && (
-                  <code title={instance.parentThreadId}>
-                    {`Primary ${shortThreadId(instance.parentThreadId)}`}
-                  </code>
-                )}
-                {instance.taskScopeKey && (
-                  <code title={`Task Scope：${instance.taskScopeKey}`}>
-                    {`Task ${instance.taskScopeKey}`}
-                  </code>
-                )}
-                <small
-                  title={`最近观察：${formatUsageDate(instance.lastObservedAt ?? instance.lastUsedAt)}\n最近模型使用：${instance.lastModelUsageAt ? formatUsageDate(instance.lastModelUsageAt) : "未知，缓存判定按未知处理"}`}
-                >
-                  {`数据 ${formatDataAge(instance.lastObservedAt)} · 模型使用 ${formatDataAge(instance.lastModelUsageAt)}`}
-                </small>
-              </div>
-              <dl>
-                <UsageRecordMetric label="Total" value={instance.totalTokens} />
-                <UsageRecordMetric label="Context" value={instance.currentContextTokens} />
-                <UsageRecordMetric
-                  label="Cached"
-                  value={hasDetailedInstanceUsage(instance) ? instance.cachedInputTokens : null}
-                />
-                <UsageRecordMetric
-                  label="Input"
-                  value={hasDetailedInstanceUsage(instance) ? instance.inputTokens : null}
-                />
-                <UsageRecordMetric
-                  label="Output"
-                  value={hasDetailedInstanceUsage(instance) ? instance.outputTokens : null}
-                />
-              </dl>
-              <div className="agent-instance-scope">
-                <input
-                  aria-label={`${instance.agentNameSnapshot ?? "Agent"} Workspace Scope`}
-                  onChange={(event) => {
-                    setScopeDrafts((current) => ({
-                      ...current,
-                      [instance.id]: event.target.value,
-                    }));
-                    setRecommendations((current) => {
-                      const next = { ...current };
-                      delete next[instance.id];
-                      return next;
-                    });
-                  }}
-                  placeholder="Workspace Scope，例如 c:/workspace/project"
-                  value={scopeDrafts[instance.id] ?? ""}
-                />
-                <button
-                  className="ghost-button"
-                  disabled={savingScope === instance.id}
-                  onClick={() => void saveWorkspaceScope(instance)}
-                  type="button"
-                >
-                  {savingScope === instance.id ? "保存中…" : "保存 Workspace Scope"}
-                </button>
-                <button
-                  className="ghost-button"
-                  disabled={checkingRecommendation === instance.id}
-                  onClick={() => void checkRecommendation(instance)}
-                  type="button"
-                >
-                  {checkingRecommendation === instance.id ? "评估中…" : "评估复用"}
-                </button>
-              </div>
-              {(() => {
-                const recommendation = recommendations[instance.id];
-                return recommendation && (
-                  <div
-                    className={`reuse-recommendation ${recommendation.decision.toLowerCase()}`}
-                    title="该结果基于当前 CAS 数据的预览；实际委派前 cas-helper 会重新读取 Codex 原生状态并按租约重新决策，结果可能变化。"
-                  >
-                    <strong>{recommendation.decision}</strong>
-                    <span>{recommendation.message}</span>
-                    <span className="reuse-recommendation-meta">
-                      {recommendation.reasonCode}
-                      {" · "}Context {recommendation.contextPressurePercent ?? "—"}
-                      /{recommendation.contextPressureLimitPercent}%
-                      {" · "}Cache {recommendation.cacheHint}
-                    </span>
-                    {recommendation.candidateThreadId && (
-                      <code title={recommendation.candidateThreadId}>
-                        {shortThreadId(recommendation.candidateThreadId)}
-                      </code>
-                    )}
-                  </div>
-                );
-              })()}
+              )}
             </article>
           ))}
         </div>
       )}
+      {nextCursor && (
+        <button
+          className="secondary-button agent-thread-load-more"
+          disabled={loadingMore}
+          onClick={() => void load(nextCursor, true)}
+          type="button"
+        >
+          {loadingMore ? "加载中…" : "加载更多 Thread"}
+        </button>
+      )}
     </section>
   );
+}
+
+function workspaceProjectName(scope: string | null): string {
+  if (!scope) return "未归属项目";
+  const normalized = scope.replace(/[\\/]+$/, "");
+  return normalized.split(/[\\/]/).pop() || scope;
+}
+
+function groupAgentThreadInstances(instances: AgentThreadInstanceResponse[]): AgentThreadGroup[] {
+  const groups = new Map<string, AgentThreadGroup>();
+  for (const instance of instances) {
+    const name = instance.agentNameSnapshot ?? "Unknown Agent";
+    const key = instance.agentId ?? `snapshot:${name}`;
+    const group = groups.get(key) ?? {
+      key,
+      name,
+      instances: [],
+      totalTokens: 0,
+      runningCount: 0,
+      recoveryRequiredCount: 0,
+      lastUsedAt: instance.lastUsedAt,
+    };
+    group.instances.push(instance);
+    group.totalTokens += instance.totalTokens;
+    group.runningCount += instance.status === "RUNNING" ? 1 : 0;
+    group.recoveryRequiredCount += instance.status === "RECOVERY_REQUIRED" ? 1 : 0;
+    if (instance.lastUsedAt > group.lastUsedAt) group.lastUsedAt = instance.lastUsedAt;
+    groups.set(key, group);
+  }
+  return [...groups.values()].sort((left, right) => right.lastUsedAt.localeCompare(left.lastUsedAt));
 }
 
 function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
@@ -2064,14 +2705,13 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
           <h2 id="agent-usage-title">Token 使用</h2>
           <p>统计 CAS Runtime Bridge 已确认的累计 Usage，不包含费用估算。</p>
         </div>
-        <button
-          className="secondary-button"
+        <IconButton
           disabled={loading}
+          icon="refresh"
+          label={loading ? "正在刷新 Token 使用" : "刷新 Token 使用"}
+          loading={loading}
           onClick={() => void loadUsage()}
-          type="button"
-        >
-          {loading ? "刷新中…" : "刷新"}
-        </button>
+        />
       </header>
 
       <div className="agent-usage-filters">
@@ -2143,10 +2783,13 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
 
       <div className="usage-status-legend" aria-label="Usage 状态说明">
         {(["LIVE", "FINAL", "PARTIAL", "UNKNOWN"] as UsageStatus[]).map((status) => (
-          <span key={status} title={usageStatusDescription(status)}>
-            <i className={`usage-status ${status.toLowerCase()}`}>{status}</i>
-            {usageStatusShortDescription(status)}
-          </span>
+          <StatusBadge
+            className={`usage-status ${status.toLowerCase()}`}
+            description={`${usageStatusShortDescription(status)} ${usageStatusDescription(status)}`}
+            icon={status === "FINAL" ? "check" : status === "LIVE" ? "clock" : status === "PARTIAL" ? "alert" : "info"}
+            key={status}
+            label={status}
+          />
         ))}
       </div>
 
@@ -2171,12 +2814,12 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
                     {formatUsageDate(record.updatedAt)}
                   </small>
                 </div>
-                <span
+                <StatusBadge
                   className={`usage-status ${record.usageStatus.toLowerCase()}`}
-                  title={usageStatusDescription(record.usageStatus)}
-                >
-                  {record.usageStatus}
-                </span>
+                  description={usageStatusDescription(record.usageStatus)}
+                  icon={record.usageStatus === "FINAL" ? "check" : record.usageStatus === "LIVE" ? "clock" : record.usageStatus === "PARTIAL" ? "alert" : "info"}
+                  label={record.usageStatus}
+                />
               </header>
               <dl>
                 <UsageRecordMetric label="Total" value={record.totalTokens} />
@@ -2186,9 +2829,12 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
                 <UsageRecordMetric label="Reasoning" value={record.reasoningOutputTokens} />
               </dl>
               <footer>
-                <code title={record.codexThreadId}>
-                  Thread {shortThreadId(record.codexThreadId)}
-                </code>
+                <span className="usage-thread-id">
+                  <Tooltip content={record.codexThreadId} focusable label={`Thread ID：${record.codexThreadId}`}>
+                    <code>Thread {shortThreadId(record.codexThreadId)}</code>
+                  </Tooltip>
+                  <CopyIconButton label="复制 Thread ID" value={record.codexThreadId} />
+                </span>
                 <span>{record.parentThreadId ? "Subagent" : "Primary"}</span>
                 <span>{record.source.replaceAll("_", " ")}</span>
               </footer>
@@ -2202,9 +2848,15 @@ function AgentUsagePanel({ agents }: { agents: AgentSummary[] }) {
 
 function UsageMetric({ label, value }: { label: string; value: number }) {
   return (
-    <article title={new Intl.NumberFormat("en-US").format(value)}>
+    <article>
       <span>{label}</span>
-      <strong>{formatTokenCount(value)}</strong>
+      <Tooltip
+        content={new Intl.NumberFormat("en-US").format(value)}
+        focusable
+        label={`${label}：${new Intl.NumberFormat("en-US").format(value)}`}
+      >
+        <strong>{formatTokenCount(value)}</strong>
+      </Tooltip>
     </article>
   );
 }
@@ -2213,8 +2865,14 @@ function UsageRecordMetric({ label, value }: { label: string; value: number | nu
   return (
     <div>
       <dt>{label}</dt>
-      <dd title={value === null ? "当前数据源不提供该 Token 明细" : new Intl.NumberFormat("en-US").format(value)}>
-        {value === null ? "—" : formatTokenCount(value)}
+      <dd>
+        <Tooltip
+          content={value === null ? "当前数据源不提供该 Token 明细" : new Intl.NumberFormat("en-US").format(value)}
+          focusable
+          label={`${label}：${value === null ? "当前数据源不提供该 Token 明细" : new Intl.NumberFormat("en-US").format(value)}`}
+        >
+          <span>{value === null ? "—" : formatTokenCount(value)}</span>
+        </Tooltip>
       </dd>
     </div>
   );
@@ -2484,7 +3142,10 @@ function CreateAgentPanel({
         </label>
 
         <label className="field">
-          <span>Role</span>
+          <span className="field-label-with-info">
+            Role
+            <InfoTip label="Role 表示编排职责；运行时同一 Role 最多启用一个 Agent。" />
+          </span>
           <input
             aria-invalid={invalidField === "roleKey"}
             maxLength={64}
@@ -2496,15 +3157,16 @@ function CreateAgentPanel({
             required
             value={roleKey}
           />
-          <small className={invalidField === "roleKey" ? "field-error" : undefined}>
-            {invalidField === "roleKey"
-              ? "Role 必须以小写字母开头，只能包含小写字母、数字、-、_。"
-              : "同一 Role 在运行时最多启用一个 Agent。"}
-          </small>
+          {invalidField === "roleKey" && (
+            <small className="field-error">Role 必须以小写字母开头，只能包含小写字母、数字、-、_。</small>
+          )}
         </label>
 
         <label className="field">
-          <span>Phase</span>
+          <span className="field-label-with-info">
+            Phase
+            <InfoTip label="决定 Primary 在 Discovery、Execution、Verification 或 Review 的哪个阶段委派该 Agent。" />
+          </span>
           <select
             onChange={(event) => setOrchestrationPhase(event.target.value as OrchestrationPhase)}
             value={orchestrationPhase}
@@ -2514,7 +3176,6 @@ function CreateAgentPanel({
             <option value="VERIFICATION">Verification</option>
             <option value="REVIEW">Review</option>
           </select>
-          <small>决定 Primary 在什么阶段委派该 Agent。</small>
         </label>
 
         <ReuseStrategyField value={reuseStrategy} onChange={setReuseStrategy} />
@@ -2528,7 +3189,10 @@ function CreateAgentPanel({
         />
 
         <label className="field full-width">
-          <span>Description</span>
+          <span className="field-label-with-info">
+            Description
+            <InfoTip label="用于 Agent 列表和选择界面中的简短职责说明，最多 2000 个字符。" />
+          </span>
           <textarea
             aria-invalid={invalidField === "description"}
             maxLength={2000}
@@ -2544,7 +3208,10 @@ function CreateAgentPanel({
         </label>
 
         <label className="field full-width">
-          <span>Instructions {templateKey && <em>Optional override</em>}</span>
+          <span className="field-label-with-info">
+            Instructions {templateKey && <em>Optional override</em>}
+            <InfoTip label={templateKey ? "留空时使用 CAS 后端正式模板；填写后覆盖模板指令。" : "写明该 Agent 的职责、边界与必须遵守的行为约束。"} />
+          </span>
           <textarea
             aria-invalid={invalidField === "instruction"}
             maxLength={100000}
@@ -2747,13 +3414,21 @@ function AgentDetailPanel({
         </label>
 
         <label className="field">
-          <span>Agent Key（内部标识）</span>
-          <div className="static-value">{agent.agentKey}</div>
-          <small>身份字段不可在普通编辑中修改。</small>
+          <span className="field-label-with-info">
+            Agent Key（内部标识）
+            <InfoTip label="Agent Key 是不可变身份字段，不能在普通编辑中修改。" />
+          </span>
+          <div className="static-value static-value-with-action">
+            <code>{agent.agentKey}</code>
+            <CopyIconButton label={`复制 Agent Key ${agent.agentKey}`} value={agent.agentKey} />
+          </div>
         </label>
 
         <label className="field">
-          <span>Role</span>
+          <span className="field-label-with-info">
+            Role
+            <InfoTip label="Role 表示编排职责；运行时同一 Role 最多启用一个 Agent。" />
+          </span>
           <input
             aria-invalid={invalidField === "roleKey"}
             disabled={isActive}
@@ -2765,15 +3440,18 @@ function AgentDetailPanel({
             required
             value={agent.roleKey ?? ""}
           />
-          <small className={invalidField === "roleKey" ? "field-error" : undefined}>
-            {invalidField === "roleKey"
-              ? "Role 格式无效。"
-              : isActive ? "当前启用时不可修改 Role。" : "同一 Role 在运行时最多启用一个 Agent。"}
-          </small>
+          {(invalidField === "roleKey" || isActive) && (
+            <small className={invalidField === "roleKey" ? "field-error" : undefined}>
+              {invalidField === "roleKey" ? "Role 格式无效。" : "当前启用时不可修改 Role。"}
+            </small>
+          )}
         </label>
 
         <label className="field">
-          <span>Phase</span>
+          <span className="field-label-with-info">
+            Phase
+            <InfoTip label="决定 Primary 在 Discovery、Execution、Verification 或 Review 的哪个阶段委派该 Agent。" />
+          </span>
           <select
             disabled={isActive}
             onChange={(event) => setAgent({
@@ -2787,7 +3465,7 @@ function AgentDetailPanel({
             <option value="VERIFICATION">Verification</option>
             <option value="REVIEW">Review</option>
           </select>
-          <small>{isActive ? "当前启用时不可修改 Phase。" : "Primary 据此决定委派阶段。"}</small>
+          {isActive && <small>当前启用时不可修改 Phase。</small>}
         </label>
 
         <ReuseStrategyField
@@ -2804,7 +3482,10 @@ function AgentDetailPanel({
         />
 
         <label className="field full-width">
-          <span>Description</span>
+          <span className="field-label-with-info">
+            Description
+            <InfoTip label="用于 Agent 列表和选择界面中的简短职责说明，最多 2000 个字符。" />
+          </span>
           <textarea
             aria-invalid={invalidField === "description"}
             maxLength={2000}
@@ -2820,7 +3501,10 @@ function AgentDetailPanel({
         </label>
 
         <label className="field full-width">
-          <span>Instructions</span>
+          <span className="field-label-with-info">
+            Instructions
+            <InfoTip label="写明该 Agent 的职责、边界与必须遵守的行为约束。" />
+          </span>
           <textarea
             aria-invalid={invalidField === "instruction"}
             maxLength={100000}
@@ -2880,15 +3564,20 @@ function AgentDetailPanel({
         {error && <div className="inline-error full-width" role="alert"><strong>Agent 保存失败</strong><span>{error}</span></div>}
 
         <div className="form-actions agent-actions full-width">
-          <button
-            className="danger-button"
-            disabled={saving || isActive}
-            onClick={() => void remove()}
-            title={isActive ? "请先在概览切换到 Default 或其他 Agent" : undefined}
-            type="button"
+          <Tooltip
+            content={isActive ? "请先在概览切换到 Default 或其他 Agent" : "删除该 Agent"}
+            focusable={isActive}
+            label="删除 Agent 可用性说明"
           >
-            删除 Agent
-          </button>
+            <button
+              className="danger-button"
+              disabled={saving || isActive}
+              onClick={() => void remove()}
+              type="button"
+            >
+              删除 Agent
+            </button>
+          </Tooltip>
           <button className="primary-button" disabled={saving} type="submit">{saving ? "保存中…" : "保存更改"}</button>
         </div>
       </form>
@@ -2915,7 +3604,10 @@ function PolicyFields({
   return (
     <>
       <label className="field">
-        <span>Sandbox</span>
+        <span className="field-label-with-info">
+          Sandbox
+          <InfoTip label="限制子 Agent 可读取或修改的文件范围；Inherit 会沿用 Primary 当前策略。" />
+        </span>
         <select onChange={(event) => setSandboxPolicy(event.target.value as SandboxPolicy)} value={sandboxPolicy}>
           <option value="READ_ONLY">Read only</option>
           <option value="WORKSPACE_WRITE">Workspace write</option>
@@ -2924,7 +3616,10 @@ function PolicyFields({
         </select>
       </label>
       <label className="field">
-        <span>Reasoning</span>
+        <span className="field-label-with-info">
+          Reasoning
+          <InfoTip label="控制子 Agent 的推理强度；CAS 会按所选 Model 的已知能力限制可选等级。" />
+        </span>
         <select
           aria-invalid={reasoningInvalid}
           onChange={(event) => setReasoningPolicy(event.target.value as ReasoningPolicy)}
@@ -2957,7 +3652,10 @@ function ReuseStrategyField({
 }) {
   return (
     <label className="field">
-      <span>Thread 复用策略</span>
+      <span className="field-label-with-info">
+        Thread 复用策略
+        <InfoTip label="这是缓存感知调度偏好；Workspace Scope、运行状态与 Context 健康始终优先。" />
+      </span>
       <select
         onChange={(event) => onChange(event.target.value as AgentReuseStrategy)}
         value={value}
@@ -2966,7 +3664,6 @@ function ReuseStrategyField({
         <option value="HOT">偏热</option>
         <option value="COLD">偏冷</option>
       </select>
-      <small>这是调度偏好；Workspace Scope、运行状态与 Context 健康仍优先。</small>
     </label>
   );
 }
@@ -2998,7 +3695,8 @@ function AgentCacheRetentionField({
       <div className="field">
         <div className="cache-retention-heading">
           <button className="reference-link" onClick={() => setReferenceOpen(true)} type="button">
-            各厂商缓存时长参考
+            <UiIcon name="book" />
+            缓存参考
           </button>
           <label htmlFor={inputId}>缓存复用窗口（分钟）<em>Optional</em></label>
         </div>
@@ -3106,6 +3804,7 @@ function ProvidersPage() {
   const [error, setError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [credentialWarning, setCredentialWarning] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -3125,12 +3824,14 @@ function ProvidersPage() {
 
   function handleCreated() {
     setAdding(false);
+    setCredentialWarning(null);
     setSuccess("Provider 已保存；Codex Native 复用当前登录，其余 Credential 不会在界面中回显。");
     void load();
   }
 
   function handleUpdated() {
     setEditing(null);
+    setCredentialWarning(null);
     setSuccess("Provider 已更新；Credential 保持不变。");
     void load();
   }
@@ -3152,9 +3853,16 @@ function ProvidersPage() {
     setDeletingId(provider.id);
     setActionError(null);
     setSuccess(null);
+    setCredentialWarning(null);
     try {
-      await deleteProvider(provider.id);
-      setSuccess("Provider 及其关联 Credential（如有）已删除。");
+      const result = await deleteProvider(provider.id);
+      if (result.credentialCleanupPending) {
+        setCredentialWarning(
+          "Provider 已删除，但 Windows Credential 清理暂未完成。CAS 已记录待办，将在启动或刷新 Provider 时自动重试。",
+        );
+      } else {
+        setSuccess("Provider 及其关联 Credential（如有）已删除。");
+      }
       await load();
     } catch (reason: unknown) {
       setActionError(errorMessage(reason));
@@ -3187,6 +3895,7 @@ function ProvidersPage() {
       </header>
 
       {success && <div className="success-banner" role="status">{success}</div>}
+      {credentialWarning && <div className="warning-banner" role="status">{credentialWarning}</div>}
       {actionError && (
         <div className="inline-error provider-notice" role="alert">
           <strong>Provider 操作失败</strong>
@@ -3292,10 +4001,15 @@ function ProviderRow({
         <span>Models</span>
       </div>
       <div className="row-actions">
-        <button className="ghost-button" disabled={deleting} onClick={onEdit}>编辑</button>
-        <button className="danger-button" disabled={deleting} onClick={onDelete}>
-          {deleting ? "删除中…" : "删除"}
-        </button>
+        <IconButton disabled={deleting} icon="edit" label={`编辑 Provider ${provider.name}`} onClick={onEdit} />
+        <IconButton
+          disabled={deleting}
+          icon="trash"
+          label={deleting ? `正在删除 Provider ${provider.name}` : `删除 Provider ${provider.name}`}
+          loading={deleting}
+          onClick={onDelete}
+          tone="danger"
+        />
       </div>
     </article>
   );
@@ -3508,10 +4222,30 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
               <tr>
                 <th>Provider</th>
                 <th>Model</th>
-                <th>Compatibility</th>
-                <th>Context</th>
-                <th>Lifecycle</th>
-                <th>Verification</th>
+                <th>
+                  <span className="table-heading-with-info">
+                    Compatibility
+                    <InfoTip label="CAS 对模型接入方式与 Codex 工具调用兼容性的判断；聚焦具体状态可查看原因。" />
+                  </span>
+                </th>
+                <th>
+                  <span className="table-heading-with-info">
+                    Context
+                    <InfoTip label="模型可供 Codex 使用的上下文窗口；Unknown 表示尚未配置。" />
+                  </span>
+                </th>
+                <th>
+                  <span className="table-heading-with-info">
+                    Lifecycle
+                    <InfoTip label="模型当前是否允许用于新 Agent 配置；Disabled 不影响已有历史记录。" />
+                  </span>
+                </th>
+                <th>
+                  <span className="table-heading-with-info">
+                    Verification
+                    <InfoTip label="最近一次 Responses API 与 Function Calling 工具闭环测试结果。" />
+                  </span>
+                </th>
                 <th aria-label="操作" />
               </tr>
             </thead>
@@ -3590,95 +4324,93 @@ function ModelRow({
       </td>
       <td>
         <strong>{model.displayName}</strong>
-        <code>{model.modelId}</code>
+        <span className="model-id-line">
+          <Tooltip content={model.modelId} focusable label={`Model ID：${model.modelId}`}>
+            <code>{model.modelId}</code>
+          </Tooltip>
+          <CopyIconButton label={`复制 Model ID ${model.modelId}`} value={model.modelId} />
+        </span>
       </td>
       <td>
-        <ModelStatusBadge
+        <StatusBadge
           className={`compatibility ${model.compatibility.toLowerCase()}`}
           description={compatibilityDescription(model.compatibility)}
+          icon={model.compatibility === "UNKNOWN" ? "alert" : model.compatibility === "UNSUPPORTED" || model.compatibility === "GATEWAY_REQUIRED" ? "x-circle" : "check"}
           label={compatibilityLabel(model.compatibility)}
         />
       </td>
       <td>{model.contextWindow ? formatTokenCount(model.contextWindow) : "Unknown"}</td>
       <td>
-        <ModelStatusBadge
+        <StatusBadge
           className={lifecycle === "Active" ? "status-text ready" : "status-text"}
           description={lifecycleTitle}
+          icon={lifecycle === "Active" ? "check" : "alert"}
           label={lifecycle}
         />
       </td>
       <td>
-        <ModelStatusBadge
+        <StatusBadge
           className={`status-text ${verificationClass}`}
           description={verificationTitle}
+          icon={verificationClass === "passed" ? "check" : verificationClass === "failed" ? "x-circle" : "alert"}
           label={verification}
         />
       </td>
       <td>
         <div className="row-actions">
-          <button
-            className="secondary-button"
-            disabled={deleting || testing || model.providerPresetId === "codex-native"}
-            onClick={onTest}
-            title={model.providerPresetId === "codex-native" ? "Codex 原生模型无需第三方 Responses API 测试" : undefined}
+          <Tooltip
+            content={model.providerPresetId === "codex-native"
+              ? "Codex 原生模型复用当前登录会话，无需第三方 Responses API 测试。"
+              : "验证 Responses API 与 Function Calling 工具闭环。"}
+            focusable={model.providerPresetId === "codex-native"}
+            label="Model 测试说明"
           >
-            {model.providerPresetId === "codex-native" ? "原生" : testing ? "测试中…" : "测试"}
-          </button>
-          <button className="ghost-button" disabled={deleting || testing} onClick={onEdit}>编辑</button>
-          <button className="danger-button" disabled={deleting || testing} onClick={onDelete}>
-            {deleting ? "删除中…" : "删除"}
-          </button>
+            <button
+              className="secondary-button"
+              disabled={deleting || testing || model.providerPresetId === "codex-native"}
+              onClick={onTest}
+            >
+              {model.providerPresetId === "codex-native" ? "原生" : testing ? "测试中…" : "测试"}
+            </button>
+          </Tooltip>
+          <IconButton
+            disabled={deleting || testing}
+            icon="edit"
+            label={`编辑 Model ${model.displayName}`}
+            onClick={onEdit}
+          />
+          <IconButton
+            disabled={deleting || testing}
+            icon="trash"
+            label={deleting ? `正在删除 Model ${model.displayName}` : `删除 Model ${model.displayName}`}
+            loading={deleting}
+            onClick={onDelete}
+            tone="danger"
+          />
         </div>
       </td>
     </tr>
   );
 }
 
-function ModelStatusBadge({
+function StatusBadge({
   className,
   description,
+  icon,
   label,
 }: {
   className: string;
   description: string;
+  icon?: IconName;
   label: string;
 }) {
-  const [position, setPosition] = useState<{ above: boolean; left: number; top: number } | null>(null);
-
-  function show(target: HTMLElement) {
-    const bounds = target.getBoundingClientRect();
-    const above = bounds.bottom + 110 > window.innerHeight;
-    setPosition({
-      above,
-      left: Math.min(window.innerWidth - 170, Math.max(170, bounds.left + bounds.width / 2)),
-      top: above ? bounds.top - 8 : bounds.bottom + 8,
-    });
-  }
-
   return (
-    <>
-      <span
-        aria-label={`${label}：${description}`}
-        className={className}
-        onBlur={() => setPosition(null)}
-        onFocus={(event) => show(event.currentTarget)}
-        onMouseEnter={(event) => show(event.currentTarget)}
-        onMouseLeave={() => setPosition(null)}
-        tabIndex={0}
-      >
-        {label}
+    <Tooltip content={description} focusable label={`${label}：${description}`}>
+      <span className={className}>
+        {icon && <UiIcon name={icon} />}
+        <span>{label}</span>
       </span>
-      {position && createPortal(
-        <span
-          className={`model-status-tooltip ${position.above ? "above" : ""}`}
-          role="tooltip"
-          style={{ left: position.left, top: position.top }}
-        >
-          {description}
-        </span>,
-        document.body,
-      )}
-    </>
+    </Tooltip>
   );
 }
 
@@ -4457,7 +5189,8 @@ function AddProviderPanel({
           <div className="preset-helper-row">
             <small>Codex 原生登录 · 自定义 · 官方预设。</small>
             <button className="reference-link" onClick={() => setReferenceOpen(true)} type="button">
-              供应商 Responses API 支持参考
+              <UiIcon name="book" />
+              API 支持参考
             </button>
           </div>
         </fieldset>
@@ -4664,9 +5397,7 @@ function DocumentationReferenceDialog({
             <h2 id={titleId}>{title}</h2>
             <p>{description}</p>
           </div>
-          <button aria-label="关闭" autoFocus className="ghost-button" onClick={onClose} type="button">
-            关闭
-          </button>
+          <IconButton icon="close" label={`关闭${title}`} onClick={onClose} />
         </header>
 
         <ul className="responses-reference-list">
@@ -4689,7 +5420,8 @@ function DocumentationReferenceDialog({
                     onClick={() => void openReference(link.url)}
                     type="button"
                   >
-                    {link.label} ↗
+                    <span>{link.label}</span>
+                    <UiIcon name="external-link" />
                   </button>
                 ))}
               </div>
@@ -4721,16 +5453,30 @@ function EnvironmentDetails({
   return (
     <section className="environment-card overview-environment-card">
       <div className="baseline-status">
-        <span
-          aria-hidden="true"
-          className={`baseline-indicator ${environment.supported ? "ready" : "blocked"}`}
-        />
+        <span className={`baseline-indicator ${environment.supported ? "ready" : "blocked"}`}>
+          <UiIcon name={environment.supported ? "check" : "x-circle"} />
+          <span className="sr-only">{environment.supported ? "正常" : "需要处理"}</span>
+        </span>
         <strong>{environment.supported ? "客户端满足当前基线" : "客户端需要处理"}</strong>
+        <InfoTip
+          label={environment.supported
+            ? "Codex 版本、Multi-Agent 能力与配置目录访问均满足 CAS 当前基线。"
+            : "至少一项 Codex 版本、Multi-Agent 能力或配置目录访问检查未通过；请查看下方问题。"}
+        />
         <small>{configAccess}</small>
       </div>
-      <div className="baseline-home" title={environment.codexHome ?? undefined}>
+      <div className="baseline-home">
         <span>CODEX_HOME</span>
-        <code>{environment.codexHome ?? "未知"}</code>
+        {environment.codexHome ? (
+          <>
+            <Tooltip content={environment.codexHome} focusable label={`CODEX_HOME：${environment.codexHome}`}>
+              <code>{environment.codexHome}</code>
+            </Tooltip>
+            <CopyIconButton label="复制 CODEX_HOME" value={environment.codexHome} />
+          </>
+        ) : (
+          <code>未知</code>
+        )}
       </div>
       <div className="baseline-actions">
         <small>目录或显示异常时重新检测</small>
@@ -4756,7 +5502,18 @@ function EnvironmentField({ label, value }: { label: string; value: string | nul
   return (
     <div>
       <dt>{label}</dt>
-      <dd title={value ?? undefined}>{value ?? "未知"}</dd>
+      <dd className="environment-field-value">
+        <Tooltip
+          content={value ?? "当前数据源未提供该字段"}
+          focusable
+          label={`${label}：${value ?? "未知"}`}
+        >
+          <span>{value ?? "未知"}</span>
+        </Tooltip>
+        {label === "Bound Thread" && value && (
+          <CopyIconButton label="复制 Bound Thread ID" value={value} />
+        )}
+      </dd>
     </div>
   );
 }

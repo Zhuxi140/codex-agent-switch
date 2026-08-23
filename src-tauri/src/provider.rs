@@ -23,9 +23,18 @@ pub(crate) struct ProviderService {
 
 impl ProviderService {
     pub(crate) fn open(database_path: &Path) -> Result<Self, ProviderServiceError> {
-        Ok(Self {
+        let service = Self {
             repository: Mutex::new(SqliteProviderRepository::open(database_path)?),
-        })
+        };
+        if let Ok(remaining) = service
+            .retry_pending_credential_deletions_with_secret_store(delete_secret, secret_exists)
+            && remaining > 0
+        {
+            eprintln!(
+                "仍有 {remaining} 个 Windows Credential 等待删除，将在后续 Provider 刷新时重试。"
+            );
+        }
+        Ok(service)
     }
 
     pub(crate) fn create(
@@ -41,6 +50,8 @@ impl ProviderService {
         &self,
         request: ProviderListRequest,
     ) -> Result<Vec<ProviderSummary>, ApiError> {
+        let _ =
+            self.retry_pending_credential_deletions_with_secret_store(delete_secret, secret_exists);
         let search = request.search.as_deref().map(str::trim);
         let search = search.filter(|value| !value.is_empty());
         self.repository()?
@@ -143,25 +154,70 @@ impl ProviderService {
     fn delete_with_secret_store<Delete, Exists>(
         &self,
         request: ProviderDeleteRequest,
-        delete: Delete,
-        exists: Exists,
+        mut delete: Delete,
+        mut exists: Exists,
     ) -> Result<DeleteResult, ProviderServiceError>
     where
-        Delete: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
-        Exists: FnOnce(CredentialId) -> Result<bool, SecretStoreError>,
+        Delete: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
+        Exists: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
     {
         let id = parse_uuid(&request.provider_id, "providerId")?;
-        let credential_id = self.repository()?.prepare_delete(&id)?;
-        if let Some(credential_id) = credential_id {
-            let credential_id = CredentialId::from_str(&credential_id)
-                .map_err(|_| ProviderServiceError::Unexpected)?;
-            delete(credential_id).map_err(ProviderServiceError::SecretStore)?;
-            if exists(credential_id).map_err(ProviderServiceError::SecretStore)? {
-                return Err(ProviderServiceError::CredentialCleanupFailed(credential_id));
+        let credential_id = self.repository()?.stage_delete(&id)?;
+        let credential_cleanup_pending = credential_id.is_some_and(|credential_id| {
+            CredentialId::from_str(&credential_id).map_or(true, |credential_id| {
+                self.finish_pending_credential_deletion(credential_id, &mut delete, &mut exists)
+                    .is_err()
+            })
+        });
+        Ok(DeleteResult {
+            deleted: true,
+            credential_cleanup_pending,
+        })
+    }
+
+    fn retry_pending_credential_deletions_with_secret_store<Delete, Exists>(
+        &self,
+        mut delete: Delete,
+        mut exists: Exists,
+    ) -> Result<usize, ProviderServiceError>
+    where
+        Delete: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
+        Exists: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
+    {
+        let pending = self.repository()?.pending_credential_deletions()?;
+        let mut remaining = 0;
+        for credential_id in pending {
+            let Ok(credential_id) = CredentialId::from_str(&credential_id) else {
+                remaining += 1;
+                continue;
+            };
+            if self
+                .finish_pending_credential_deletion(credential_id, &mut delete, &mut exists)
+                .is_err()
+            {
+                remaining += 1;
             }
         }
-        self.repository()?.delete(&id)?;
-        Ok(DeleteResult { deleted: true })
+        Ok(remaining)
+    }
+
+    fn finish_pending_credential_deletion<Delete, Exists>(
+        &self,
+        credential_id: CredentialId,
+        delete: &mut Delete,
+        exists: &mut Exists,
+    ) -> Result<(), ProviderServiceError>
+    where
+        Delete: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
+        Exists: FnMut(CredentialId) -> Result<bool, SecretStoreError>,
+    {
+        let _ = delete(credential_id);
+        if exists(credential_id).map_err(ProviderServiceError::SecretStore)? {
+            return Err(ProviderServiceError::CredentialCleanupFailed(credential_id));
+        }
+        self.repository()?
+            .complete_credential_deletion(&credential_id.to_string())?;
+        Ok(())
     }
 
     fn repository(
@@ -353,9 +409,11 @@ impl SqliteProviderRepository {
         self.find_by_id(&provider.id)
     }
 
-    fn prepare_delete(&self, id: &str) -> Result<Option<String>, RepositoryError> {
-        let (credential_id, model_count) = self
+    fn stage_delete(&mut self, id: &str) -> Result<Option<String>, RepositoryError> {
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (credential_id, model_count) = transaction
             .query_row(
                 "SELECT c.id, (SELECT COUNT(*) FROM models m WHERE m.provider_id = p.id)
                  FROM providers p
@@ -369,28 +427,33 @@ impl SqliteProviderRepository {
         if model_count > 0 {
             return Err(RepositoryError::InUse);
         }
-        Ok(credential_id)
-    }
-
-    fn delete(&mut self, id: &str) -> Result<(), RepositoryError> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let model_count = transaction
-            .query_row(
-                "SELECT (SELECT COUNT(*) FROM models WHERE provider_id = p.id)
-                 FROM providers p WHERE p.id = ?1",
-                [id],
-                |row| row.get::<_, u32>(0),
-            )
-            .optional()?
-            .ok_or(RepositoryError::NotFound)?;
-        if model_count > 0 {
-            return Err(RepositoryError::InUse);
+        if let Some(credential_id) = credential_id.as_deref() {
+            transaction.execute(
+                "INSERT OR IGNORE INTO pending_credential_deletions (credential_id, created_at)
+                 VALUES (?1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+                [credential_id],
+            )?;
         }
         transaction.execute("DELETE FROM credentials WHERE provider_id = ?1", [id])?;
         transaction.execute("DELETE FROM providers WHERE id = ?1", [id])?;
         transaction.commit()?;
+        Ok(credential_id)
+    }
+
+    fn pending_credential_deletions(&self) -> Result<Vec<String>, RepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT credential_id FROM pending_credential_deletions ORDER BY created_at, credential_id",
+        )?;
+        Ok(statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn complete_credential_deletion(&mut self, credential_id: &str) -> Result<(), RepositoryError> {
+        self.connection.execute(
+            "DELETE FROM pending_credential_deletions WHERE credential_id = ?1",
+            [credential_id],
+        )?;
         Ok(())
     }
 }
@@ -741,6 +804,7 @@ pub(crate) struct ProviderDeleteRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeleteResult {
     deleted: bool,
+    credential_cleanup_pending: bool,
 }
 
 #[derive(Deserialize, PartialEq, Eq)]
@@ -1029,7 +1093,7 @@ impl From<ProviderServiceError> for ApiError {
                 details = Some(BTreeMap::from([("credentialId", id.to_string())]));
                 (
                     "CREDENTIAL_CLEANUP_FAILED",
-                    "Windows Credential 删除后仍然存在，Provider 未删除；请重试或手动清理该 Credential。",
+                    "Provider 已删除，但 Windows Credential 清理仍在排队；CAS 将自动重试。",
                     true,
                 )
             }
@@ -1410,6 +1474,7 @@ mod tests {
             |_| Ok(false),
         );
         assert!(result.is_ok());
+        assert!(!result.unwrap().credential_cleanup_pending);
         assert!(deleted.get());
         assert!(matches!(
             service.repository().unwrap().find_by_id(&provider.id),
@@ -1435,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_delete_keeps_database_row_when_credential_cleanup_is_unverified() {
+    fn provider_delete_queues_unverified_credential_cleanup_and_recovers() {
         let service = ProviderService::in_memory();
         let provider = service
             .create_with_secret_store(request("provider-one"), |_, _| Ok(()), |_| Ok(true))
@@ -1449,16 +1514,34 @@ mod tests {
             |_| Ok(true),
         );
 
+        let result = result.unwrap();
+        assert!(result.deleted);
+        assert!(result.credential_cleanup_pending);
         assert!(matches!(
-            result,
-            Err(ProviderServiceError::CredentialCleanupFailed(_))
+            service.repository().unwrap().find_by_id(&provider.id),
+            Err(RepositoryError::NotFound)
         ));
+        assert_eq!(
+            service
+                .repository()
+                .unwrap()
+                .pending_credential_deletions()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let remaining = service
+            .retry_pending_credential_deletions_with_secret_store(|_| Ok(true), |_| Ok(false))
+            .unwrap();
+        assert_eq!(remaining, 0);
         assert!(
             service
                 .repository()
                 .unwrap()
-                .find_by_id(&provider.id)
-                .is_ok()
+                .pending_credential_deletions()
+                .unwrap()
+                .is_empty()
         );
     }
 }

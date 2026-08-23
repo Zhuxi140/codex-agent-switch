@@ -310,6 +310,7 @@ export interface ProviderUpdateRequest {
 
 export interface DeleteResult {
   deleted: boolean;
+  credentialCleanupPending: boolean;
 }
 
 export interface ProviderListRequest {
@@ -706,6 +707,22 @@ export interface NativeSubagentSyncResponse {
 
 export interface AgentThreadInstanceListResponse {
   items: AgentThreadInstanceResponse[];
+  nextCursor: string | null;
+  sync: NativeSubagentSyncResponse;
+}
+
+export interface AgentThreadProjectSummaryResponse {
+  workspaceScopeKey: string | null;
+  instanceCount: number;
+  agentCount: number;
+  runningCount: number;
+  recoveryRequiredCount: number;
+  totalTokens: number;
+  lastUsedAt: string;
+}
+
+export interface AgentThreadProjectListResponse {
+  items: AgentThreadProjectSummaryResponse[];
   sync: NativeSubagentSyncResponse;
 }
 
@@ -765,9 +782,19 @@ export function listUsageRecords(
 }
 
 export function listAgentThreadInstances(
-  request: { agentId?: string | null; limit?: number } = {},
+  request: {
+    agentId?: string | null;
+    workspaceScopeKey?: string | null;
+    unscoped?: boolean;
+    limit?: number;
+    cursor?: string | null;
+  } = {},
 ): Promise<AgentThreadInstanceListResponse> {
   return invoke<AgentThreadInstanceListResponse>("agent_thread_instance_list", { request });
+}
+
+export function listAgentThreadProjects(): Promise<AgentThreadProjectListResponse> {
+  return invoke<AgentThreadProjectListResponse>("agent_thread_project_list");
 }
 
 export interface ScheduleDecisionResponse {

@@ -29,7 +29,7 @@ CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provide
 
 - **轻量、可定制**：子 Agent 是一层「角色 + 职责 + 模型绑定」，按需创建、随时调换，不堆砌全能 Agent。
 - **主脑做精、手脚做量**：把编排、规划、审查交给旗舰模型（贵，但决定成败）；把执行、测试、探索交给高性价比模型（便宜，但量大管饱）。
-- **编排、调度、复用三位一体**：多 Agent 按阶段自动委派；Thread 复用（REUSE / SPAWN）按运行时指纹、Workspace Scope 与当前上下文健康度客观判定，避免重复烧钱。
+- **编排、调度、复用三位一体**：多 Agent 按阶段自动委派；Thread 调度（REUSE / SPAWN / WAIT）按运行时指纹、Primary、Workspace Scope、Task Scope 与当前上下文健康度客观判定，避免错误复用和重复创建。
 - **结果**：以更合理的价格，实现更好的效果。
 
 一句话：**用旗舰模型的判断力，配上高性价比模型的执行力。**
@@ -71,7 +71,18 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 ## 测试状态与客观数据
 
-以下结果对应 v0.4.1 发布前的实际验证，可用仓库中的验证命令复查。
+以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
+
+### 当前主分支开发验证（2026-08-23）
+
+| 验证项 | 真实结果 |
+| --- | --- |
+| Rust Workspace 测试 | 166 passed、0 failed、2 ignored |
+| 前端生产构建 | 通过 |
+| Diff 检查 | 通过 |
+| 真实 Primary → Child → REUSE/SPAWN/WAIT E2E | 待 RC 阶段完成 |
+
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化和紧凑编排提示词。它仍是开发快照，不应当作新的 Release 安装包分发。
 
 ### v0.4.1 发布验证
 
@@ -122,13 +133,14 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 ## 调度与 Thread 复用
 
-每次独立任务在委派前由 `cas-helper schedule <agent-key>` 预检，输出唯一的 `CAS1|SPAWN|...` 或 `CAS1|REUSE|...` 决策。`SPAWN` 创建新原生子 Agent Thread；`REUSE` 将完整任务交给既有 Thread。
+每次独立任务在委派前由 `cas-helper schedule <agent-key> [task-key]` 预检，输出唯一的 `CAS1|REUSE|...`、`CAS1|SPAWN|...` 或 `CAS1|WAIT|...`。`REUSE` 将完整任务交给既有 Thread；`SPAWN` 创建并绑定新 Thread；`WAIT` 表示同一任务已有未完成的 SPAWN Reservation，Primary 必须等待并重试，不能重复创建。
 
 0.4.0 起，调度直接感知 Codex 原生运行时，不再依赖用量页面是否打开：
 
 - **原生状态直读**：`schedule` 在决策前以只读方式重新打开 Codex 的 `state_*.sqlite`，合并原生候选线程后再计算，新 Spawn 的子 Agent 无需经过 CAS 同步即可进入候选。
 - **生命周期以 rollout 为准**：线程状态由 Codex rollout 尾部最后一个明确事件判定（`task_complete`/`turn_aborted` 为 `IDLE`，`task_started` 为 `RUNNING`，无法证明为 `UNKNOWN`）；writer lock 文件存在不等于线程正在运行，残留锁不会永久阻断复用。
 - **SPAWN 后必须 bind**：`spawn_agent` 成功返回 child Thread ID 后，Primary 须立即执行 `cas-helper bind <agent-key> <child-thread-id>` 固化线程归属与运行时指纹；bind 只读核验原生身份后才事务写入，身份缺失或指纹冲突拒绝覆盖。
+- **并发去重**：带 `task-key` 的 SPAWN 使用 CAS 数据库中的可过期 Reservation 原子预留；相同 Agent、Primary、Workspace 和 Task Scope 的重复预检返回 `WAIT`，避免断流或模型重试制造重复 Thread。
 
 复用是一个客观判定：**同一 Agent（含运行时指纹）、同一 Primary、Exact Workspace Scope、IDLE 状态且上下文健康**。
 
@@ -147,20 +159,23 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 - **Codex Native**：可将当前 Codex 登录中的原生 Provider/Model 绑定为子 Agent，包括 gpt-5.6 Terra 等可用模型。
 - **第三方 Provider**：支持 Responses API Provider、模型发现和能力校验；凭据不写入 Codex 配置文件。
 - **原生 Thread 同步**：同步子 Agent Thread 及其生命周期状态（基于 rollout 事实，而非 writer lock），便于确认运行、完成和空闲状态。
-- **Token 监控**：采集输入、缓存输入、输出、推理输出与总 Token，并单独记录当前上下文 Token（`current_context_tokens`）；CAS 只统计 Token，不计算或展示费用，也不保存 Prompt、Response 正文或 API Key。
+- **Token 监控**：采集输入、缓存输入、输出、推理输出与总 Token，并单独记录当前上下文 Token（`current_context_tokens`）；页面按项目进入二层查看其子 Agent、Thread 与调度决策。CAS 只统计 Token，不计算或展示费用，也不保存 Prompt、Response 正文或 API Key。
 - **重启提示**：配置同步后，只要检测到新的 Codex 实例，红色重启提示即可自动清除。
 
 ## 配置与安全
 
-配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。
+配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。删除 Provider 时先在 CAS 数据库记录待清理凭据，再删除并回查 Windows 凭据；清理未完成会保留队列并在后续启动重试。
 
 编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段与全局 `AGENTS.md`，并删除 `agents/cas-*.toml` 等 CAS 托管资源（不触碰用户自有内容）；关闭应用时自动执行同一清理路径。
 
-## Roadmap（按可发布门槛排序）
+## Roadmap（下一阶段：v0.5 RC）
 
-- **并发正确性**：SPAWN 幂等去重——在显式 Task Key 基础上补齐「同任务重复预检返回既有结果」的回写与重试语义。
-- **配置与版本防线**：禁止停用活动 Agent 造成双重事实源；Codex 兼容性由最低版本判断升级为能力级探测，无法证明能力时 Fail Closed。
-- **证据与回归**：UI 展示状态来源、数据新鲜度、父子 Thread 与真实决策日志；补齐真实 Primary 委派 → 复用 → 上下文决策的端到端回归。
+- **真实编排闭环**：固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token、Context 与决策日志。
+- **并发与失配矩阵**：验证同任务并发返回 SPAWN / WAIT，Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定创建新 Thread。
+- **恢复能力**：覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和 Runtime Bridge 断流恢复。
+- **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
+
+在上述门槛通过前，不继续增加 Reuse Score、AI 任务分类、Thread Pool 或费用估算。
 
 ## 开发验证
 

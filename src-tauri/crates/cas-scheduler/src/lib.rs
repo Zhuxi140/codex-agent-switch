@@ -1,6 +1,20 @@
 /// REUSE 短租约时长：覆盖「预检返回 REUSE」到「follow-up 使 Thread 进入 RUNNING」的窗口。
 // ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
 pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;
+pub const SPAWN_RESERVATION_TTL_SECONDS: i64 = 120;
+const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的执行 Agent，不是 Primary。直接执行父 Agent 交付的任务，不得重新套用 Primary 编排流程，也不得递归创建同职责子 Agent。若项目说明与当前磁盘中的文件或代码状态冲突，先读取并核对磁盘事实，以当前代码状态和父 Agent 的明确任务为准。";
+
+pub fn render_delegated_agent_instructions(instructions: &str) -> String {
+    if instructions.trim().is_empty() {
+        DELEGATED_AGENT_INSTRUCTIONS.to_owned()
+    } else {
+        format!(
+            "{}\n\n{}",
+            instructions.trim_end(),
+            DELEGATED_AGENT_INSTRUCTIONS
+        )
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
@@ -108,6 +122,109 @@ pub fn normalize_workspace_scope_key(value: &str) -> Option<String> {
         && !value.chars().any(char::is_control)
         && !value.contains("//"))
     .then_some(value)
+}
+
+pub fn normalize_task_scope_key(value: &str) -> Option<String> {
+    let value = value.trim();
+    let mut bytes = value.bytes();
+    let valid = !value.is_empty()
+        && value.len() <= 64
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        });
+    valid.then(|| value.to_owned())
+}
+
+pub fn effective_model_reasoning_efforts(
+    reasoning_supported: Option<bool>,
+    model_default_reasoning: Option<&str>,
+    configured_efforts: &[String],
+) -> Vec<String> {
+    if reasoning_supported == Some(false) {
+        return Vec::new();
+    }
+    if !configured_efforts.is_empty() {
+        return configured_efforts.to_vec();
+    }
+    if reasoning_supported == Some(true) {
+        return ["low", "medium", "high"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+    }
+    vec![model_default_reasoning.unwrap_or("medium").to_owned()]
+}
+
+pub fn effective_model_default_reasoning<'a>(
+    model_default_reasoning: Option<&str>,
+    supported_efforts: &'a [String],
+) -> Option<&'a str> {
+    model_default_reasoning
+        .and_then(|default| {
+            supported_efforts
+                .iter()
+                .find(|effort| effort.as_str() == default)
+        })
+        .or_else(|| {
+            supported_efforts
+                .iter()
+                .find(|effort| effort.as_str() == "medium")
+        })
+        .or_else(|| supported_efforts.first())
+        .map(String::as_str)
+}
+
+pub fn resolve_agent_reasoning_effort(
+    reasoning_policy: &str,
+    model_default_reasoning: Option<&str>,
+    supported_efforts: &[String],
+) -> Option<String> {
+    let requested_effort = match reasoning_policy {
+        "LOW" => Some("low"),
+        "MEDIUM" => Some("medium"),
+        "HIGH" => Some("high"),
+        _ => None,
+    };
+    let Some(requested_effort) = requested_effort else {
+        return matches!(reasoning_policy, "MODEL_DEFAULT" | "INHERIT")
+            .then(|| {
+                effective_model_default_reasoning(model_default_reasoning, supported_efforts)
+                    .map(str::to_owned)
+            })
+            .flatten();
+    };
+    if supported_efforts
+        .iter()
+        .any(|effort| effort == requested_effort)
+    {
+        return Some(requested_effort.to_owned());
+    }
+    let requested_rank = reasoning_effort_rank(requested_effort)?;
+    supported_efforts
+        .iter()
+        .filter_map(|effort| {
+            reasoning_effort_rank(effort)
+                .filter(|rank| *rank <= requested_rank)
+                .map(|rank| (rank, effort))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, effort)| effort.clone())
+}
+
+fn reasoning_effort_rank(effort: &str) -> Option<u8> {
+    match effort {
+        "minimal" => Some(0),
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        "xhigh" => Some(4),
+        "max" => Some(5),
+        "ultra" => Some(6),
+        _ => None,
+    }
 }
 
 pub fn recommend(
@@ -540,6 +657,26 @@ mod tests {
             normalize_workspace_scope_key("/work/foo")
         );
         assert_eq!(normalize_workspace_scope_key("order/refund"), None);
+    }
+
+    #[test]
+    fn task_scope_keys_are_shell_safe_and_reasoning_downgrades_are_shared() {
+        assert_eq!(
+            normalize_task_scope_key("auth-oauth2"),
+            Some("auth-oauth2".to_owned())
+        );
+        for invalid in ["Auth", "order/refund", "a b", "a;whoami", ""] {
+            assert_eq!(normalize_task_scope_key(invalid), None);
+        }
+        assert_eq!(
+            resolve_agent_reasoning_effort(
+                "HIGH",
+                Some("medium"),
+                &["low".to_owned(), "medium".to_owned()]
+            )
+            .as_deref(),
+            Some("medium")
+        );
     }
 }
 use sha2::{Digest, Sha256};

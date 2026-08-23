@@ -10,8 +10,10 @@ use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
 };
 use cas_scheduler::{
-    Candidate, Profile, REUSE_CLAIM_TTL_SECONDS, Recommendation, normalize_workspace_scope_key,
-    recommend, runtime_fingerprint as shared_runtime_fingerprint,
+    Candidate, Profile, REUSE_CLAIM_TTL_SECONDS, Recommendation, SPAWN_RESERVATION_TTL_SECONDS,
+    effective_model_reasoning_efforts, normalize_task_scope_key, normalize_workspace_scope_key,
+    recommend, render_delegated_agent_instructions, resolve_agent_reasoning_effort,
+    runtime_fingerprint as shared_runtime_fingerprint,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -81,7 +83,7 @@ fn main() -> ExitCode {
         Err(()) => {
             eprintln!(
                 "Usage:\n  cas-helper token <credential-id>\n  \
-                 cas-helper schedule <agent-key>\n  \
+                 cas-helper schedule <agent-key> [task-key]\n  \
                  cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
                  cas-helper bind <agent-key> <child-thread-id> [task-key]"
             );
@@ -105,12 +107,6 @@ enum Command {
     },
 }
 
-fn valid_task_key(value: &str) -> Option<String> {
-    let value = value.trim();
-    (!value.is_empty() && value.len() <= 200 && !value.chars().any(char::is_control))
-        .then(|| value.to_owned())
-}
-
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
     let mut args = args.into_iter();
     let _program = args.next();
@@ -125,28 +121,34 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             .map_err(|_| ());
     }
     if command == OsStr::new("schedule") {
-        let first = args.next().ok_or(())?;
-        let second = args.next();
-        if second.is_none() {
-            if args.next().is_some() {
-                return Err(());
-            }
+        let remaining = args.collect::<Vec<_>>();
+        if matches!(remaining.len(), 1 | 2) {
             return Ok(Command::Schedule {
                 database_path: None,
-                agent_key: valid_argument(first)?,
+                agent_key: valid_argument(remaining[0].clone())?,
                 scope_key: None,
-                task_scope_key: None,
+                task_scope_key: remaining
+                    .get(1)
+                    .map(|value| valid_argument(value.clone()))
+                    .transpose()?
+                    .map(|value| normalize_task_scope_key(&value).ok_or(()))
+                    .transpose()?,
             });
         }
-        let database_path = PathBuf::from(first);
-        let agent_key = valid_argument(second.expect("checked above"))?;
+        if !matches!(remaining.len(), 3 | 4) {
+            return Err(());
+        }
+        let database_path = PathBuf::from(&remaining[0]);
+        let agent_key = valid_argument(remaining[1].clone())?;
         let scope_key =
-            normalize_workspace_scope_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
-        let task_scope_key = match args.next() {
-            Some(value) => Some(valid_task_key(&valid_argument(value)?).ok_or(())?),
-            None => None,
-        };
-        if args.next().is_some() || database_path.as_os_str().is_empty() {
+            normalize_workspace_scope_key(&valid_argument(remaining[2].clone())?).ok_or(())?;
+        let task_scope_key = remaining
+            .get(3)
+            .map(|value| valid_argument(value.clone()))
+            .transpose()?
+            .map(|value| normalize_task_scope_key(&value).ok_or(()))
+            .transpose()?;
+        if database_path.as_os_str().is_empty() {
             return Err(());
         }
         return Ok(Command::Schedule {
@@ -161,7 +163,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         let child_thread_id =
             valid_runtime_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
         let task_scope_key = match args.next() {
-            Some(value) => Some(valid_task_key(&valid_argument(value)?).ok_or(())?),
+            Some(value) => Some(normalize_task_scope_key(&valid_argument(value)?).ok_or(())?),
             None => None,
         };
         if args.next().is_some() {
@@ -522,6 +524,40 @@ fn load_recommendation(
             return Err(ScheduleError::Database);
         }
     }
+    if recommendation.decision == "SPAWN"
+        && let Some(task_scope_key) = task_scope_key
+    {
+        let changed = transaction.execute(
+            "INSERT INTO agent_spawn_reservations (
+                agent_id, parent_thread_id, workspace_scope_key, task_scope_key,
+                reserved_until, created_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )
+             ON CONFLICT(agent_id, parent_thread_id, workspace_scope_key, task_scope_key)
+             DO UPDATE SET
+                reserved_until = excluded.reserved_until,
+                created_at = excluded.created_at
+             WHERE agent_spawn_reservations.reserved_until <=
+                   strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
+            params![
+                active.agent_id,
+                parent_thread_id,
+                scope_key,
+                task_scope_key,
+                format!("+{SPAWN_RESERVATION_TTL_SECONDS} seconds"),
+            ],
+        )?;
+        if changed != 1 {
+            recommendation.decision = "WAIT";
+            recommendation.reason_code = "SPAWN_RESERVED";
+            recommendation.message = "同一任务已有子 Agent 创建流程正在进行，请稍后重试预检。";
+            recommendation.candidate_instance_id = None;
+            recommendation.candidate_thread_id = None;
+        }
+    }
     // F-13：与决策同事务写入只追加审计记录，UI 预览不能冒充实际执行日志。
     transaction.execute(
         "INSERT INTO agent_schedule_decisions (
@@ -575,7 +611,8 @@ fn load_active_agent_profile(
                     COALESCE(p.cache_retention_type, 'UNKNOWN'),
                     p.cache_retention_hint_seconds, a.instruction, a.sandbox_policy,
                     a.reasoning_policy, m.id, m.model_id, p.provider_key, p.preset_id,
-                    p.base_url, p.protocol, p.custom_headers_json
+                    p.base_url, p.protocol, p.custom_headers_json,
+                    m.default_reasoning, m.reasoning_supported
              FROM active_agent_bindings active
              JOIN agents a ON a.id = active.agent_id AND a.enabled = 1
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
@@ -602,6 +639,8 @@ fn load_active_agent_profile(
                     row.get::<_, String>(14)?,
                     row.get::<_, String>(15)?,
                     row.get::<_, Option<String>>(16)?,
+                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
                 ))
             },
         )
@@ -624,10 +663,27 @@ fn load_active_agent_profile(
         base_url,
         protocol,
         custom_headers_json,
+        model_default_reasoning,
+        reasoning_supported,
     )) = profile
     else {
         return Ok(None);
     };
+    let configured_efforts = fingerprint_values(
+        connection,
+        "SELECT effort FROM model_reasoning_efforts WHERE model_id = ?1",
+        &model_id,
+    )?;
+    let supported_efforts = effective_model_reasoning_efforts(
+        reasoning_supported,
+        model_default_reasoning.as_deref(),
+        &configured_efforts,
+    );
+    let reasoning_effort = resolve_agent_reasoning_effort(
+        &reasoning_policy,
+        model_default_reasoning.as_deref(),
+        &supported_efforts,
+    );
     Ok(Some(ActiveAgentProfile {
         agent_id: agent_id.clone(),
         role_key,
@@ -647,7 +703,7 @@ fn load_active_agent_profile(
                 &protocol,
                 custom_headers_json.as_deref(),
                 &model_slug,
-                &reasoning_policy,
+                reasoning_effort.as_deref().unwrap_or_default(),
                 &sandbox_policy,
                 &instruction,
             )?),
@@ -790,7 +846,7 @@ fn bind_native_thread(
     let transaction = connection.transaction()?;
     let existing = transaction
         .query_row(
-            "SELECT agent_id, parent_thread_id, scope_key, runtime_fingerprint
+            "SELECT agent_id, parent_thread_id, scope_key, runtime_fingerprint, task_scope_key
              FROM agent_thread_instances WHERE codex_thread_id = ?1",
             [child_thread_id],
             |row| {
@@ -799,12 +855,18 @@ fn bind_native_thread(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    if let Some((existing_agent_id, existing_parent_thread_id, existing_scope_key, existing)) =
-        existing
+    if let Some((
+        existing_agent_id,
+        existing_parent_thread_id,
+        existing_scope_key,
+        existing,
+        existing_task_scope_key,
+    )) = existing
         && (existing_agent_id
             .as_deref()
             .is_some_and(|existing| existing != active.agent_id)
@@ -816,7 +878,11 @@ fn bind_native_thread(
                 .is_some_and(|existing| existing != scope_key)
             || existing
                 .as_deref()
-                .is_some_and(|existing| existing != fingerprint))
+                .is_some_and(|existing| existing != fingerprint)
+            || existing_task_scope_key
+                .as_deref()
+                .zip(task_scope_key)
+                .is_some_and(|(existing, requested)| existing != requested))
     {
         return Err(ScheduleError::BindRejected);
     }
@@ -856,6 +922,14 @@ fn bind_native_thread(
             task_scope_key,
         ],
     )?;
+    if let Some(task_scope_key) = task_scope_key {
+        transaction.execute(
+            "DELETE FROM agent_spawn_reservations
+             WHERE agent_id = ?1 AND parent_thread_id = ?2
+               AND workspace_scope_key = ?3 AND task_scope_key = ?4",
+            params![active.agent_id, parent_thread_id, scope_key, task_scope_key],
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -993,7 +1067,7 @@ fn native_record_matches_agent(
 fn protocol_line(recommendation: &Recommendation) -> Option<String> {
     let thread_id = match recommendation.decision {
         "REUSE" => protocol_field(recommendation.candidate_thread_id.as_deref())?,
-        "SPAWN" => "-",
+        "SPAWN" | "WAIT" => "-",
         _ => return None,
     };
     let reason_code = protocol_field(Some(recommendation.reason_code))?;
@@ -1032,7 +1106,10 @@ fn runtime_fingerprint(
         ("model", vec![model_slug.to_owned()]),
         ("reasoning", vec![reasoning_policy.to_owned()]),
         ("sandbox", vec![sandbox_policy.to_owned()]),
-        ("instruction", vec![instruction.to_owned()]),
+        (
+            "instruction",
+            vec![render_delegated_agent_instructions(instruction)],
+        ),
         (
             "required_capabilities",
             fingerprint_values(
@@ -1139,7 +1216,7 @@ mod tests {
     }
 
     #[test]
-    fn short_schedule_needs_only_agent_key() {
+    fn short_schedule_accepts_optional_safe_task_key() {
         let args = [
             OsString::from("cas-helper"),
             OsString::from("schedule"),
@@ -1158,6 +1235,32 @@ mod tests {
         assert_eq!(agent_key, "executor");
         assert_eq!(scope_key, None);
         assert_eq!(task_scope_key, None);
+
+        assert!(matches!(
+            parse_args([
+                OsString::from("cas-helper"),
+                OsString::from("schedule"),
+                OsString::from("executor"),
+                OsString::from("auth-oauth2"),
+            ]),
+            Ok(Command::Schedule {
+                database_path: None,
+                agent_key,
+                scope_key: None,
+                task_scope_key: Some(task_scope_key),
+            }) if agent_key == "executor" && task_scope_key == "auth-oauth2"
+        ));
+        for unsafe_key in ["Auth", "order/refund", "a b", "a;whoami"] {
+            assert!(
+                parse_args([
+                    OsString::from("cas-helper"),
+                    OsString::from("schedule"),
+                    OsString::from("executor"),
+                    OsString::from(unsafe_key),
+                ])
+                .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1325,6 +1428,14 @@ mod tests {
             protocol_line(&recommendation),
             Some("CAS1|REUSE|thread-child|EXACT_WORKSPACE_SCOPE_IDLE".to_owned())
         );
+        let mut waiting = recommendation.clone();
+        waiting.decision = "WAIT";
+        waiting.reason_code = "SPAWN_RESERVED";
+        waiting.candidate_thread_id = None;
+        assert_eq!(
+            protocol_line(&waiting),
+            Some("CAS1|WAIT|-|SPAWN_RESERVED".to_owned())
+        );
         let mut invalid = recommendation;
         invalid.candidate_thread_id = Some("thread|injected".to_owned());
         assert_eq!(protocol_line(&invalid), None);
@@ -1484,7 +1595,7 @@ mod tests {
                     "RESPONSES",
                     None,
                     "deepseek-v4",
-                    "HIGH",
+                    "high",
                     "WORKSPACE_WRITE",
                     "",
                 )
@@ -1721,7 +1832,7 @@ mod tests {
                 "RESPONSES",
                 None,
                 "deepseek-v4",
-                "HIGH",
+                "high",
                 "WORKSPACE_WRITE",
                 "",
             )
@@ -1746,7 +1857,7 @@ mod tests {
             "RESPONSES",
             Some("{\"x-cas\":\"one\"}"),
             "deepseek-v4",
-            "HIGH",
+            "high",
             "WORKSPACE_WRITE",
             "",
         )
@@ -1771,7 +1882,7 @@ mod tests {
             "RESPONSES",
             Some("{\"x-cas\":\"one\"}"),
             "deepseek-v4",
-            "HIGH",
+            "high",
             "WORKSPACE_WRITE",
             "",
         )
@@ -1801,7 +1912,7 @@ mod tests {
                 "RESPONSES",
                 Some("{\"x-cas\":\"one\"}"),
                 "deepseek-v4",
-                "HIGH",
+                "high",
                 "WORKSPACE_WRITE",
                 "",
             )
@@ -1823,7 +1934,7 @@ mod tests {
             "RESPONSES",
             None,
             "deepseek-v4",
-            "HIGH",
+            "high",
             "WORKSPACE_WRITE",
             "",
         )
@@ -1893,7 +2004,7 @@ mod tests {
             "RESPONSES",
             None,
             "deepseek-v4",
-            "HIGH",
+            "high",
             "WORKSPACE_WRITE",
             "",
         )
@@ -1998,7 +2109,7 @@ mod tests {
             "RESPONSES",
             None,
             "deepseek-v4",
-            "HIGH",
+            "high",
             "WORKSPACE_WRITE",
             "",
         )
@@ -2063,18 +2174,21 @@ mod tests {
         assert_eq!(other_task.reason_code, "NO_WORKSPACE_SCOPE_MATCH");
         assert_eq!(other_task.candidate_thread_id, None);
 
-        // bind 固化任务键，既有键不被后续 bind 覆盖。
-        insert_native_child(&home, "thread-native", "thread-root", 10, "open");
-        bind_native_thread(
+        let duplicate_spawn = load_recommendation(
             &mut connection,
             &home,
             "executor",
-            "thread-native",
             "c:/workspace/project",
             "thread-root",
-            Some("auth-oauth2"),
+            Some("payments"),
         )
+        .unwrap()
         .unwrap();
+        assert_eq!(duplicate_spawn.decision, "WAIT");
+        assert_eq!(duplicate_spawn.reason_code, "SPAWN_RESERVED");
+
+        // bind 固化任务键并释放对应 SPAWN 预留；后续异键 bind 被拒绝。
+        insert_native_child(&home, "thread-native", "thread-root", 10, "open");
         bind_native_thread(
             &mut connection,
             &home,
@@ -2085,6 +2199,18 @@ mod tests {
             Some("payments"),
         )
         .unwrap();
+        assert!(matches!(
+            bind_native_thread(
+                &mut connection,
+                &home,
+                "executor",
+                "thread-native",
+                "c:/workspace/project",
+                "thread-root",
+                Some("auth-oauth2"),
+            ),
+            Err(ScheduleError::BindRejected)
+        ));
         let bound_key = connection
             .query_row(
                 "SELECT task_scope_key FROM agent_thread_instances
@@ -2093,7 +2219,16 @@ mod tests {
                 |row| row.get::<_, Option<String>>(0),
             )
             .unwrap();
-        assert_eq!(bound_key.as_deref(), Some("auth-oauth2"));
+        assert_eq!(bound_key.as_deref(), Some("payments"));
+        let reservation_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_spawn_reservations
+                 WHERE task_scope_key = 'payments'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(reservation_count, 0);
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -2281,7 +2416,9 @@ mod tests {
                     provider_id TEXT NOT NULL,
                     model_id TEXT NOT NULL,
                     enabled INTEGER NOT NULL,
-                    context_window INTEGER
+                    context_window INTEGER,
+                    default_reasoning TEXT,
+                    reasoning_supported INTEGER
                  );
                  CREATE TABLE providers (
                     id TEXT PRIMARY KEY,
@@ -2307,6 +2444,10 @@ mod tests {
                     model_id TEXT NOT NULL,
                     capability TEXT NOT NULL,
                     status TEXT NOT NULL
+                 );
+                 CREATE TABLE model_reasoning_efforts (
+                    model_id TEXT NOT NULL,
+                    effort TEXT NOT NULL
                  );
                  CREATE TABLE agent_thread_instances (
                     id TEXT PRIMARY KEY,
@@ -2348,6 +2489,17 @@ mod tests {
                     claimed INTEGER NOT NULL DEFAULT 0,
                     task_scope_key TEXT
                  );
+                 CREATE TABLE agent_spawn_reservations (
+                    agent_id TEXT NOT NULL,
+                    parent_thread_id TEXT NOT NULL,
+                    workspace_scope_key TEXT NOT NULL,
+                    task_scope_key TEXT NOT NULL,
+                    reserved_until TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        agent_id, parent_thread_id, workspace_scope_key, task_scope_key
+                    )
+                 );
                  INSERT INTO agents (
                     id, agent_key, role_key, enabled, reuse_strategy, cache_retention_override_seconds
                  ) VALUES ('agent-1', 'executor', 'executor', 1, 'AUTO', NULL);
@@ -2360,7 +2512,12 @@ mod tests {
                     'provider-1', 'deepseek', NULL, 1, 'SUPPORTED', 'APPROXIMATE', 300,
                     'https://api.deepseek.example/v1', 'RESPONSES', NULL
                  );
-                 INSERT INTO models VALUES ('model-1', 'provider-1', 'deepseek-v4', 1, 100);
+                 INSERT INTO models VALUES (
+                    'model-1', 'provider-1', 'deepseek-v4', 1, 100, 'high', 1
+                 );
+                 INSERT INTO model_reasoning_efforts VALUES ('model-1', 'low');
+                 INSERT INTO model_reasoning_efforts VALUES ('model-1', 'medium');
+                 INSERT INTO model_reasoning_efforts VALUES ('model-1', 'high');
                  INSERT INTO agent_model_bindings VALUES ('agent-1', 'model-1', 1);",
             )
             .unwrap();

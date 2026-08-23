@@ -9,7 +9,9 @@ use cas_native_lifecycle::{
 };
 use cas_scheduler::{
     Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile, REUSE_CLAIM_TTL_SECONDS,
+    effective_model_reasoning_efforts, normalize_task_scope_key,
     normalize_workspace_scope_key as canonical_workspace_scope_key, recommend as schedule_instance,
+    render_delegated_agent_instructions, resolve_agent_reasoning_effort,
     runtime_fingerprint as shared_runtime_fingerprint,
 };
 #[cfg(test)]
@@ -60,7 +62,7 @@ impl UsageService {
     pub(crate) fn list_agent_instances(
         &self,
         request: AgentThreadInstanceListRequest,
-    ) -> Result<Vec<AgentThreadInstanceResponse>, ApiError> {
+    ) -> Result<AgentThreadInstancePage, ApiError> {
         if request
             .agent_id
             .as_deref()
@@ -68,12 +70,44 @@ impl UsageService {
         {
             return Err(UsageServiceError::InvalidField("agentId").into());
         }
+        if request.unscoped && request.workspace_scope_key.is_some() {
+            return Err(UsageServiceError::InvalidField("workspaceScopeKey").into());
+        }
+        let workspace_scope_key = request
+            .workspace_scope_key
+            .as_deref()
+            .map(normalize_workspace_scope_key)
+            .transpose()?;
         let limit = request.limit.unwrap_or(50);
         if !(1..=200).contains(&limit) {
             return Err(UsageServiceError::InvalidField("limit").into());
         }
+        let offset = request
+            .cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u32>()
+            .map_err(|_| UsageServiceError::InvalidField("cursor"))?;
+        let mut items = self.repository()?.list_agent_instances(
+            request.agent_id.as_deref(),
+            workspace_scope_key.as_deref(),
+            request.unscoped,
+            limit + 1,
+            offset,
+        )?;
+        let has_more = items.len() > limit as usize;
+        items.truncate(limit as usize);
+        Ok(AgentThreadInstancePage {
+            items,
+            next_cursor: has_more.then(|| (offset + limit).to_string()),
+        })
+    }
+
+    pub(crate) fn list_agent_thread_projects(
+        &self,
+    ) -> Result<Vec<AgentThreadProjectSummaryResponse>, ApiError> {
         self.repository()?
-            .list_agent_instances(request.agent_id.as_deref(), limit)
+            .list_agent_thread_projects()
             .map_err(ApiError::from)
     }
 
@@ -263,6 +297,7 @@ impl UsageService {
             cwd: request.cwd,
             input: request.input,
             workspace_scope_key: scope_key,
+            task_scope_key,
         })
     }
 
@@ -271,9 +306,15 @@ impl UsageService {
         profile: &AgentRuntimeProfile,
         thread_id: &str,
         scope_key: &str,
+        task_scope_key: Option<&str>,
     ) -> Result<(), UsageServiceError> {
-        self.repository()?
-            .register_agent_execution_thread(profile, thread_id, scope_key, "IDLE")
+        self.repository()?.register_agent_execution_thread(
+            profile,
+            thread_id,
+            scope_key,
+            task_scope_key,
+            "IDLE",
+        )
     }
 
     pub(crate) fn mark_agent_execution_running(
@@ -388,7 +429,11 @@ pub(crate) struct UsageListRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentThreadInstanceListRequest {
     agent_id: Option<String>,
+    workspace_scope_key: Option<String>,
+    #[serde(default)]
+    unscoped: bool,
     limit: Option<u32>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -445,12 +490,47 @@ impl NativeSubagentSyncResponse {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentThreadInstanceListResponse {
     items: Vec<AgentThreadInstanceResponse>,
+    next_cursor: Option<String>,
     sync: NativeSubagentSyncResponse,
 }
 
 impl AgentThreadInstanceListResponse {
+    pub(crate) fn new(page: AgentThreadInstancePage, sync: NativeSubagentSyncResponse) -> Self {
+        Self {
+            items: page.items,
+            next_cursor: page.next_cursor,
+            sync,
+        }
+    }
+}
+
+pub(crate) struct AgentThreadInstancePage {
+    items: Vec<AgentThreadInstanceResponse>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadProjectSummaryResponse {
+    workspace_scope_key: Option<String>,
+    instance_count: i64,
+    agent_count: i64,
+    running_count: i64,
+    recovery_required_count: i64,
+    total_tokens: i64,
+    last_used_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadProjectListResponse {
+    items: Vec<AgentThreadProjectSummaryResponse>,
+    sync: NativeSubagentSyncResponse,
+}
+
+impl AgentThreadProjectListResponse {
     pub(crate) fn new(
-        items: Vec<AgentThreadInstanceResponse>,
+        items: Vec<AgentThreadProjectSummaryResponse>,
         sync: NativeSubagentSyncResponse,
     ) -> Self {
         Self { items, sync }
@@ -540,6 +620,7 @@ pub(crate) struct AgentThreadExecutionPlan {
     pub(crate) cwd: String,
     pub(crate) input: String,
     pub(crate) workspace_scope_key: String,
+    pub(crate) task_scope_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -549,7 +630,7 @@ pub(crate) struct AgentRuntimeProfile {
     pub(crate) agent_name: String,
     pub(crate) instruction: String,
     pub(crate) sandbox_policy: String,
-    pub(crate) reasoning_policy: String,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) model_slug: String,
     pub(crate) model_provider: Option<String>,
     pub(crate) runtime_fingerprint: String,
@@ -949,7 +1030,10 @@ impl SqliteUsageRepository {
     fn list_agent_instances(
         &self,
         agent_id: Option<&str>,
+        workspace_scope_key: Option<&str>,
+        unscoped: bool,
         limit: u32,
+        offset: u32,
     ) -> Result<Vec<AgentThreadInstanceResponse>, UsageRepositoryError> {
         let mut statement = self.connection.prepare(
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
@@ -958,11 +1042,52 @@ impl SqliteUsageRepository {
                     last_model_usage_at, last_observed_at, task_scope_key
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
+               AND (
+                    (?2 IS NOT NULL AND scope_key = ?2)
+                    OR (?2 IS NULL AND (?3 = 0 OR scope_key IS NULL OR TRIM(scope_key) = ''))
+               )
              ORDER BY last_used_at DESC, codex_thread_id ASC
-             LIMIT ?2",
+             LIMIT ?4 OFFSET ?5",
         )?;
         statement
-            .query_map(params![agent_id, limit], map_agent_thread_instance)?
+            .query_map(
+                params![agent_id, workspace_scope_key, unscoped, limit, offset],
+                map_agent_thread_instance,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(UsageRepositoryError::from)
+    }
+
+    fn list_agent_thread_projects(
+        &self,
+    ) -> Result<Vec<AgentThreadProjectSummaryResponse>, UsageRepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT CASE WHEN TRIM(COALESCE(scope_key, '')) = '' THEN NULL ELSE scope_key END,
+                    COUNT(*),
+                    COUNT(DISTINCT COALESCE(
+                        agent_id,
+                        'snapshot:' || COALESCE(agent_name_snapshot, 'Unknown Agent')
+                    )),
+                    SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'RECOVERY_REQUIRED' THEN 1 ELSE 0 END),
+                    COALESCE(SUM(total_tokens), 0),
+                    MAX(last_used_at)
+             FROM agent_thread_instances
+             GROUP BY CASE WHEN TRIM(COALESCE(scope_key, '')) = '' THEN NULL ELSE scope_key END
+             ORDER BY MAX(last_used_at) DESC, COALESCE(scope_key, '') ASC",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok(AgentThreadProjectSummaryResponse {
+                    workspace_scope_key: row.get(0)?,
+                    instance_count: row.get(1)?,
+                    agent_count: row.get(2)?,
+                    running_count: row.get(3)?,
+                    recovery_required_count: row.get(4)?,
+                    total_tokens: row.get(5)?,
+                    last_used_at: row.get(6)?,
+                })
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(UsageRepositoryError::from)
     }
@@ -1066,7 +1191,8 @@ impl SqliteUsageRepository {
                         COALESCE(p.cache_retention_type, 'UNKNOWN'),
                         p.cache_retention_hint_seconds, a.reasoning_policy, a.sandbox_policy,
                         a.instruction, m.id, m.model_id, p.provider_key, p.preset_id,
-                        p.base_url, p.protocol, p.custom_headers_json
+                        p.base_url, p.protocol, p.custom_headers_json,
+                        m.default_reasoning, m.reasoning_supported
                  FROM agents a
                  LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
                  LEFT JOIN models m ON m.id = b.model_id
@@ -1090,6 +1216,8 @@ impl SqliteUsageRepository {
                         row.get::<_, String>(12)?,
                         row.get::<_, String>(13)?,
                         row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<String>>(15)?,
+                        row.get::<_, Option<i64>>(16)?.map(|value| value != 0),
                     ))
                 },
             )
@@ -1110,10 +1238,27 @@ impl SqliteUsageRepository {
             base_url,
             protocol,
             custom_headers_json,
+            model_default_reasoning,
+            reasoning_supported,
         )) = profile
         else {
             return Ok(AgentSchedulingProfile::default());
         };
+        let configured_efforts = fingerprint_values(
+            &self.connection,
+            "SELECT effort FROM model_reasoning_efforts WHERE model_id = ?1",
+            &model_id,
+        )?;
+        let supported_efforts = effective_model_reasoning_efforts(
+            reasoning_supported,
+            model_default_reasoning.as_deref(),
+            &configured_efforts,
+        );
+        let reasoning_effort = resolve_agent_reasoning_effort(
+            &reasoning_policy,
+            model_default_reasoning.as_deref(),
+            &supported_efforts,
+        );
         Ok(AgentSchedulingProfile {
             reuse_strategy,
             agent_cache_retention_override_seconds,
@@ -1129,7 +1274,7 @@ impl SqliteUsageRepository {
                 &protocol,
                 custom_headers_json.as_deref(),
                 &model_slug,
-                &reasoning_policy,
+                reasoning_effort.as_deref().unwrap_or_default(),
                 &sandbox_policy,
                 &instruction,
             )?),
@@ -1145,7 +1290,8 @@ impl SqliteUsageRepository {
             .query_row(
                 "SELECT a.id, a.agent_key, a.name, a.instruction, a.sandbox_policy,
                         a.reasoning_policy, m.id, m.model_id, p.provider_key, p.preset_id,
-                        p.base_url, p.protocol, p.custom_headers_json
+                        p.base_url, p.protocol, p.custom_headers_json,
+                        m.default_reasoning, m.reasoning_supported
                  FROM active_agent_bindings active
                  JOIN agents a ON a.id = active.agent_id AND a.enabled = 1
                  JOIN agent_model_bindings binding
@@ -1169,6 +1315,8 @@ impl SqliteUsageRepository {
                         row.get::<_, String>(10)?,
                         row.get::<_, String>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
                     ))
                 },
             )
@@ -1187,12 +1335,29 @@ impl SqliteUsageRepository {
             base_url,
             protocol,
             custom_headers_json,
+            model_default_reasoning,
+            reasoning_supported,
         )) = profile
         else {
             return Ok(None);
         };
         let model_provider =
             (preset_id.as_deref() != Some("codex-native")).then(|| format!("cas_{provider_key}"));
+        let configured_efforts = fingerprint_values(
+            &self.connection,
+            "SELECT effort FROM model_reasoning_efforts WHERE model_id = ?1",
+            &model_id,
+        )?;
+        let supported_efforts = effective_model_reasoning_efforts(
+            reasoning_supported,
+            model_default_reasoning.as_deref(),
+            &configured_efforts,
+        );
+        let reasoning_effort = resolve_agent_reasoning_effort(
+            &reasoning_policy,
+            model_default_reasoning.as_deref(),
+            &supported_efforts,
+        );
         Ok(Some(AgentRuntimeProfile {
             runtime_fingerprint: self.runtime_fingerprint(
                 &agent_id,
@@ -1203,7 +1368,7 @@ impl SqliteUsageRepository {
                 &protocol,
                 custom_headers_json.as_deref(),
                 &model_slug,
-                &reasoning_policy,
+                reasoning_effort.as_deref().unwrap_or_default(),
                 &sandbox_policy,
                 &instruction,
             )?,
@@ -1212,7 +1377,7 @@ impl SqliteUsageRepository {
             agent_name,
             instruction,
             sandbox_policy,
-            reasoning_policy,
+            reasoning_effort,
             model_slug,
             model_provider,
         }))
@@ -1247,7 +1412,10 @@ impl SqliteUsageRepository {
             ("model", vec![model_slug.to_owned()]),
             ("reasoning", vec![reasoning_policy.to_owned()]),
             ("sandbox", vec![sandbox_policy.to_owned()]),
-            ("instruction", vec![instruction.to_owned()]),
+            (
+                "instruction",
+                vec![render_delegated_agent_instructions(instruction)],
+            ),
             (
                 "required_capabilities",
                 fingerprint_values(
@@ -1281,21 +1449,41 @@ impl SqliteUsageRepository {
         profile: &AgentRuntimeProfile,
         thread_id: &str,
         scope_key: &str,
+        task_scope_key: Option<&str>,
         status: &str,
     ) -> Result<(), UsageServiceError> {
-        let existing_agent_id = self
+        let existing_identity = self
             .connection
             .query_row(
-                "SELECT agent_id FROM agent_thread_instances WHERE codex_thread_id = ?1",
+                "SELECT agent_id, scope_key, task_scope_key, runtime_fingerprint
+                 FROM agent_thread_instances WHERE codex_thread_id = ?1",
                 [thread_id],
-                |row| row.get::<_, Option<String>>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
             )
-            .optional()?
-            .flatten();
-        if existing_agent_id
-            .as_deref()
-            .is_some_and(|existing| existing != profile.agent_id)
-        {
+            .optional()?;
+        if existing_identity.is_some_and(
+            |(existing_agent_id, existing_scope_key, existing_task_scope_key, fingerprint)| {
+                existing_agent_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != profile.agent_id)
+                    || existing_scope_key
+                        .as_deref()
+                        .is_some_and(|existing| existing != scope_key)
+                    || existing_task_scope_key.as_deref().is_some_and(|existing| {
+                        task_scope_key.is_none_or(|requested| requested != existing)
+                    })
+                    || fingerprint
+                        .as_deref()
+                        .is_some_and(|existing| existing != profile.runtime_fingerprint)
+            },
+        ) {
             return Err(UsageServiceError::ThreadIdentityConflict);
         }
         self.connection.execute(
@@ -1303,17 +1491,18 @@ impl SqliteUsageRepository {
                 id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                 scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                 total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                last_model_usage_at, last_observed_at
+                last_model_usage_at, last_observed_at, task_scope_key
              ) VALUES (
                 ?1, ?2, ?3, ?4, NULL, ?5, ?6, 0, 0, 0, 0, NULL, NULL, ?7,
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL,
-                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?8
              )
              ON CONFLICT(codex_thread_id) DO UPDATE SET
                 scope_key = excluded.scope_key,
                 status = excluded.status,
                 runtime_fingerprint = COALESCE(agent_thread_instances.runtime_fingerprint, excluded.runtime_fingerprint),
+                task_scope_key = COALESCE(agent_thread_instances.task_scope_key, excluded.task_scope_key),
                 last_used_at = excluded.last_used_at,
                 last_observed_at = excluded.last_observed_at",
             params![
@@ -1324,6 +1513,7 @@ impl SqliteUsageRepository {
                 scope_key,
                 status,
                 profile.runtime_fingerprint,
+                task_scope_key,
             ],
         )?;
         Ok(())
@@ -2107,11 +2297,7 @@ fn validate_runtime_key(value: &str, field: &'static str) -> Result<String, Usag
 }
 
 fn validate_task_scope_key(value: &str) -> Result<String, UsageServiceError> {
-    let value = value.trim();
-    if value.is_empty() || value.len() > 200 || value.chars().any(char::is_control) {
-        return Err(UsageServiceError::InvalidField("taskScopeKey"));
-    }
-    Ok(value.to_owned())
+    normalize_task_scope_key(value).ok_or(UsageServiceError::InvalidField("taskScopeKey"))
 }
 
 fn normalize_workspace_scope_key(value: &str) -> Result<String, UsageServiceError> {
@@ -2362,7 +2548,8 @@ mod tests {
 
         let instances = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].codex_thread_id, "thread-child-native");
         assert_eq!(
@@ -2386,6 +2573,7 @@ mod tests {
             service
                 .list_agent_instances(AgentThreadInstanceListRequest::default())
                 .unwrap()
+                .items
                 .len(),
             1
         );
@@ -2418,7 +2606,8 @@ mod tests {
 
         let instances = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(
             instances[0].last_model_usage_at.as_deref(),
             Some("2026-08-11T10:01:00Z")
@@ -2431,7 +2620,8 @@ mod tests {
             .unwrap();
         let instances = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(
             instances[0].last_model_usage_at.as_deref(),
             Some("2026-08-11T10:01:00Z")
@@ -2455,7 +2645,8 @@ mod tests {
         assert_eq!(updated.record.usage_status, "FINAL");
         let idle = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(idle.len(), 1);
         assert_eq!(idle[0].status, "IDLE");
 
@@ -2474,7 +2665,8 @@ mod tests {
         assert_eq!(summary.total_tokens, 200);
         let running = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(running[0].status, "RUNNING");
         assert_eq!(running[0].total_tokens, 200);
         assert_eq!(running[0].codex_thread_id, "thread-child-1");
@@ -2489,8 +2681,10 @@ mod tests {
             .list_agent_instances(AgentThreadInstanceListRequest {
                 agent_id: Some("agent-1".to_owned()),
                 limit: Some(10),
+                ..AgentThreadInstanceListRequest::default()
             })
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].status, "RECOVERY_REQUIRED");
         assert_eq!(
@@ -3061,6 +3255,67 @@ mod tests {
     }
 
     #[test]
+    fn runtime_plan_uses_effective_reasoning_and_persists_task_scope() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO active_agent_bindings (
+                    role_key, agent_id, created_at, updated_at
+                 ) VALUES ('executor', 'agent-1', '2026-08-11T10:00:00Z', '2026-08-11T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+
+        let plan = service
+            .prepare_agent_execution(AgentThreadExecutionRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                cwd: "C:\\workspace\\project".to_owned(),
+                input: "执行任务".to_owned(),
+                expected_decision: "SPAWN".to_owned(),
+                expected_candidate_thread_id: None,
+                task_scope_key: Some("auth-oauth2".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(plan.profile.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(plan.task_scope_key.as_deref(), Some("auth-oauth2"));
+
+        service
+            .register_agent_execution_thread(
+                &plan.profile,
+                "thread-runtime",
+                &plan.workspace_scope_key,
+                plan.task_scope_key.as_deref(),
+            )
+            .unwrap();
+        let task_scope_key = service
+            .repository()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT task_scope_key FROM agent_thread_instances
+                 WHERE codex_thread_id = 'thread-runtime'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .unwrap();
+        assert_eq!(task_scope_key.as_deref(), Some("auth-oauth2"));
+        assert!(matches!(
+            service.register_agent_execution_thread(
+                &plan.profile,
+                "thread-runtime",
+                &plan.workspace_scope_key,
+                Some("payments"),
+            ),
+            Err(UsageServiceError::ThreadIdentityConflict)
+        ));
+    }
+
+    #[test]
     fn context_pressure_prevents_reuse() {
         let service = UsageService::in_memory();
         let mut pressured = snapshot(100, "FINAL");
@@ -3135,7 +3390,8 @@ mod tests {
             .unwrap();
         let instances = service
             .list_agent_instances(AgentThreadInstanceListRequest::default())
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(records[0].model_context_window, Some(258_400));
         assert_eq!(instances[0].context_window, Some(258_400));
     }
@@ -3212,6 +3468,115 @@ mod tests {
             service.upsert_snapshot(conflicting),
             Err(UsageServiceError::ThreadIdentityConflict)
         ));
+    }
+
+    #[test]
+    fn project_summary_and_filtered_pagination_use_all_thread_instances() {
+        let service = UsageService::in_memory();
+        let repository = service.repository().unwrap();
+        for (id, agent_id, agent_name, scope, status, tokens, last_used_at) in [
+            (
+                "instance-a-1",
+                "agent-1",
+                "Executor",
+                Some("c:/workspace/a"),
+                "RUNNING",
+                100,
+                "2026-08-11T10:04:00Z",
+            ),
+            (
+                "instance-a-2",
+                "agent-2",
+                "Reviewer",
+                Some("c:/workspace/a"),
+                "IDLE",
+                200,
+                "2026-08-11T10:03:00Z",
+            ),
+            (
+                "instance-b-1",
+                "agent-1",
+                "Executor",
+                Some("c:/workspace/b"),
+                "RECOVERY_REQUIRED",
+                50,
+                "2026-08-11T10:02:00Z",
+            ),
+            (
+                "instance-unscoped",
+                "agent-3",
+                "Explorer",
+                None,
+                "UNKNOWN",
+                25,
+                "2026-08-11T10:01:00Z",
+            ),
+        ] {
+            repository
+                .connection
+                .execute(
+                    "INSERT INTO agent_thread_instances (
+                        id, agent_id, agent_name_snapshot, codex_thread_id, scope_key, status,
+                        total_tokens, created_at, last_used_at
+                     ) VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7, ?7)",
+                    params![
+                        id,
+                        agent_id,
+                        agent_name,
+                        scope,
+                        status,
+                        tokens,
+                        last_used_at
+                    ],
+                )
+                .unwrap();
+        }
+        drop(repository);
+
+        let projects = service.list_agent_thread_projects().unwrap();
+        assert_eq!(projects.len(), 3);
+        let project_a = projects
+            .iter()
+            .find(|project| project.workspace_scope_key.as_deref() == Some("c:/workspace/a"))
+            .unwrap();
+        assert_eq!(project_a.instance_count, 2);
+        assert_eq!(project_a.agent_count, 2);
+        assert_eq!(project_a.running_count, 1);
+        assert_eq!(project_a.total_tokens, 300);
+        assert!(
+            projects
+                .iter()
+                .any(|project| project.workspace_scope_key.is_none())
+        );
+
+        let first_page = service
+            .list_agent_instances(AgentThreadInstanceListRequest {
+                workspace_scope_key: Some("C:\\Workspace\\A".to_owned()),
+                limit: Some(1),
+                ..AgentThreadInstanceListRequest::default()
+            })
+            .unwrap();
+        assert_eq!(first_page.items.len(), 1);
+        assert_eq!(first_page.next_cursor.as_deref(), Some("1"));
+        let second_page = service
+            .list_agent_instances(AgentThreadInstanceListRequest {
+                workspace_scope_key: Some("c:/workspace/a".to_owned()),
+                limit: Some(1),
+                cursor: first_page.next_cursor,
+                ..AgentThreadInstanceListRequest::default()
+            })
+            .unwrap();
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.next_cursor, None);
+
+        let unscoped = service
+            .list_agent_instances(AgentThreadInstanceListRequest {
+                unscoped: true,
+                ..AgentThreadInstanceListRequest::default()
+            })
+            .unwrap();
+        assert_eq!(unscoped.items.len(), 1);
+        assert_eq!(unscoped.items[0].codex_thread_id, "instance-unscoped");
     }
 
     fn seed_agent(service: &UsageService) {

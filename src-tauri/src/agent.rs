@@ -208,31 +208,8 @@ impl SqliteAgentRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let active = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM active_agent_bindings WHERE agent_id = ?1
-                UNION ALL
-                SELECT 1 FROM configuration_state WHERE id = 1 AND active_agent_id = ?1
-             )",
-            [&changes.id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if active {
-            let current = transaction.query_row(
-                "SELECT role_key, orchestration_phase FROM agents WHERE id = ?1",
-                [&changes.id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                },
-            )?;
-            if current.0.as_deref() != Some(changes.role_key.as_str())
-                || current.1.as_deref() != Some(changes.orchestration_phase)
-            {
-                return Err(AgentRepositoryError::Active);
-            }
+        if agent_is_active(&transaction, &changes.id)? {
+            return Err(AgentRepositoryError::Active);
         }
         let current =
             load_agent(&transaction, &changes.id)?.ok_or(AgentRepositoryError::NotFound)?;
@@ -300,13 +277,20 @@ impl SqliteAgentRepository {
         id: &str,
         enabled: bool,
     ) -> Result<AgentRecord, AgentRepositoryError> {
-        let changed = self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !enabled && agent_is_active(&transaction, id)? {
+            return Err(AgentRepositoryError::Active);
+        }
+        let changed = transaction.execute(
             "UPDATE agents
              SET enabled = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE id = ?1",
             params![id, enabled],
         )?;
         ensure_changed(changed)?;
+        transaction.commit()?;
         self.find_by_id(id)
     }
 
@@ -318,6 +302,9 @@ impl SqliteAgentRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if agent_is_active(&transaction, agent_id)? {
+            return Err(AgentRepositoryError::Active);
+        }
         let agent = load_agent(&transaction, agent_id)?.ok_or(AgentRepositoryError::NotFound)?;
         let model =
             load_model(&transaction, model_id)?.ok_or(AgentRepositoryError::ModelNotFound)?;
@@ -351,6 +338,9 @@ impl SqliteAgentRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if agent_is_active(&transaction, id)? {
+            return Err(AgentRepositoryError::Active);
+        }
         let exists = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agents WHERE id = ?1)",
             [id],
@@ -370,22 +360,15 @@ impl SqliteAgentRepository {
     }
 
     fn delete(&mut self, id: &str) -> Result<(), AgentRepositoryError> {
-        let active = self.connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM active_agent_bindings WHERE agent_id = ?1
-                UNION ALL
-                SELECT 1 FROM configuration_state WHERE id = 1 AND active_agent_id = ?1
-             )",
-            [id],
-            |row| row.get::<_, bool>(0),
-        )?;
-        if active {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if agent_is_active(&transaction, id)? {
             return Err(AgentRepositoryError::Active);
         }
-        ensure_changed(
-            self.connection
-                .execute("DELETE FROM agents WHERE id = ?1", [id])?,
-        )
+        ensure_changed(transaction.execute("DELETE FROM agents WHERE id = ?1", [id])?)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     fn find_by_id(&self, id: &str) -> Result<AgentRecord, AgentRepositoryError> {
@@ -414,6 +397,18 @@ impl SqliteAgentRepository {
             .map(|id| self.find_by_id(id))
             .collect::<Result<Vec<_>, _>>()
     }
+}
+
+fn agent_is_active(connection: &Connection, id: &str) -> Result<bool, rusqlite::Error> {
+    connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM active_agent_bindings WHERE agent_id = ?1
+            UNION ALL
+            SELECT 1 FROM configuration_state WHERE id = 1 AND active_agent_id = ?1
+         )",
+        [id],
+        |row| row.get::<_, bool>(0),
+    )
 }
 
 fn load_agent(
@@ -1897,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn active_agent_cannot_be_deleted() {
+    fn active_agent_cannot_be_mutated_disabled_unbound_or_deleted() {
         let service = AgentService::in_memory();
         let agent = service.create(request(Some("executor"), None)).unwrap();
         let mut repository = service.repository().unwrap();
@@ -1909,6 +1904,35 @@ mod tests {
             )
             .unwrap();
 
+        let changes = AgentChanges {
+            id: agent.id.clone(),
+            name: agent.name.clone(),
+            description: agent.description.clone(),
+            instruction: agent.instruction.clone(),
+            sandbox_policy: "WORKSPACE_WRITE",
+            reasoning_policy: "HIGH",
+            model_id: None,
+            role_key: "executor".to_owned(),
+            orchestration_phase: "EXECUTION",
+            reuse_strategy: Some("AUTO"),
+            cache_retention_override_seconds: None,
+        };
+        assert!(matches!(
+            repository.update(&changes),
+            Err(AgentRepositoryError::Active)
+        ));
+        assert!(matches!(
+            repository.set_enabled(&agent.id, false),
+            Err(AgentRepositoryError::Active)
+        ));
+        assert!(matches!(
+            repository.set_model_binding(&agent.id, &Uuid::new_v4().to_string()),
+            Err(AgentRepositoryError::Active)
+        ));
+        assert!(matches!(
+            repository.remove_model_binding(&agent.id),
+            Err(AgentRepositoryError::Active)
+        ));
         assert!(matches!(
             repository.delete(&agent.id),
             Err(AgentRepositoryError::Active)
