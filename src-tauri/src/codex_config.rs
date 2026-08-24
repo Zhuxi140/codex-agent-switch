@@ -1,11 +1,12 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, DocumentMut, Item, Table, Value as TomlValue, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value as TomlValue, value};
 
-pub(crate) use cas_scheduler::render_delegated_agent_instructions;
+pub(crate) use cas_scheduler::render_delegated_agent_instructions_for_phase;
 
+use crate::agent::AgentMcpToolPolicy;
 use crate::domain::{Agent, BaseBinding, Model, ResponsesProvider};
 
 const AUTH_TIMEOUT_MS: i64 = 5_000;
@@ -67,7 +68,12 @@ pub(crate) struct AgentProjection<'a> {
     pub(crate) reasoning_effort: Option<&'a str>,
     pub(crate) sandbox_mode: Option<&'a str>,
     pub(crate) developer_instructions: &'a str,
+    pub(crate) orchestration_phase: Option<&'a str>,
     pub(crate) model_catalog_path: Option<&'a Path>,
+    pub(crate) skill_keys: &'a [String],
+    pub(crate) skill_paths: &'a [PathBuf],
+    pub(crate) disabled_mcp_server_ids: &'a [String],
+    pub(crate) mcp_tool_policies: &'a [AgentMcpToolPolicy],
 }
 
 pub(crate) fn upsert_provider_projection(
@@ -516,6 +522,7 @@ pub(crate) fn orchestration_projection_semantic(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn upsert_global_orchestration_projection(
     existing: &str,
     instructions: &str,
@@ -754,10 +761,68 @@ pub(crate) fn render_agent_projection(agent: &AgentProjection<'_>) -> Result<Str
     if let Some(sandbox_mode) = agent.sandbox_mode {
         document["sandbox_mode"] = value(sandbox_mode);
     }
-    let developer_instructions = render_delegated_agent_instructions(agent.developer_instructions);
+    let mut developer_instructions = render_delegated_agent_instructions_for_phase(
+        agent.developer_instructions,
+        agent.orchestration_phase,
+    );
+    if agent.skill_keys.iter().any(|key| key == "caveman") {
+        developer_instructions.push_str(
+            "\n\n必须使用 caveman full 压缩进度与最终汇报；安全警告、不可逆操作确认和验收证据保持完整清晰。",
+        );
+    }
+    if agent.skill_keys.iter().any(|key| key == "ponytail") {
+        developer_instructions.push_str(
+            "\n必须使用 ponytail full 处理编码、修复和技术设计；不得削弱输入校验、数据安全、无障碍或明确验收要求。",
+        );
+    }
+    if agent.skill_keys.iter().any(|key| key == "caveman-slim") {
+        developer_instructions.push_str(
+            "\n\n必须使用 caveman-slim 压缩进度与最终汇报；保留技术事实、验收证据和安全信息。",
+        );
+    }
+    if agent.skill_keys.iter().any(|key| key == "ponytail-slim") {
+        developer_instructions.push_str(
+            "\n必须使用 ponytail-slim 完成任务所需的最小改动；不得扩展范围或削弱明确验收要求。",
+        );
+    }
     document["developer_instructions"] = value(developer_instructions);
     if let Some(path) = agent.model_catalog_path {
         document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+    }
+    if !agent.skill_paths.is_empty() {
+        let mut configs = ArrayOfTables::new();
+        for path in agent.skill_paths {
+            let mut config = Table::new();
+            config["path"] = value(path.to_string_lossy().into_owned());
+            config["enabled"] = value(true);
+            configs.push(config);
+        }
+        let mut skills = Table::new();
+        skills["config"] = Item::ArrayOfTables(configs);
+        document["skills"] = Item::Table(skills);
+    }
+    if !agent.disabled_mcp_server_ids.is_empty() || !agent.mcp_tool_policies.is_empty() {
+        let mut servers = Table::new();
+        for policy in agent.mcp_tool_policies {
+            let mut server = Table::new();
+            let mut tool_names = Array::new();
+            for tool_name in &policy.tool_names {
+                tool_names.push(tool_name.as_str());
+            }
+            let key = match policy.mode.as_str() {
+                "ALLOW_ONLY" => "enabled_tools",
+                "DENY" => "disabled_tools",
+                _ => return Err(ConfigError::InvalidStructure("mcp tool policy mode")),
+            };
+            server[key] = Item::Value(TomlValue::Array(tool_names));
+            servers.insert(&policy.server_id, Item::Table(server));
+        }
+        for server_id in agent.disabled_mcp_server_ids {
+            let mut server = Table::new();
+            server["enabled"] = value(false);
+            servers.insert(server_id, Item::Table(server));
+        }
+        document["mcp_servers"] = Item::Table(servers);
     }
     let rendered = document.to_string();
     rendered.parse::<DocumentMut>()?;
@@ -1152,7 +1217,26 @@ multi_agent_v2 = true
             reasoning_effort: Some("medium"),
             sandbox_mode: Some("workspace-write"),
             developer_instructions: "保留用户规则。",
+            orchestration_phase: Some("EXECUTION"),
             model_catalog_path: None,
+            skill_keys: &["caveman".to_owned(), "ponytail".to_owned()],
+            skill_paths: &[
+                PathBuf::from("C:/codex/cas/bundled-skills/caveman/SKILL.md"),
+                PathBuf::from("C:/codex/cas/bundled-skills/ponytail/SKILL.md"),
+            ],
+            disabled_mcp_server_ids: &["browser".to_owned(), "github.readonly".to_owned()],
+            mcp_tool_policies: &[
+                AgentMcpToolPolicy {
+                    server_id: "filesystem".to_owned(),
+                    mode: "ALLOW_ONLY".to_owned(),
+                    tool_names: vec!["read_file".to_owned(), "list_directory".to_owned()],
+                },
+                AgentMcpToolPolicy {
+                    server_id: "git".to_owned(),
+                    mode: "DENY".to_owned(),
+                    tool_names: vec!["force_push".to_owned()],
+                },
+            ],
         };
 
         let rendered = render_agent_projection(&projection).unwrap();
@@ -1160,9 +1244,49 @@ multi_agent_v2 = true
         let instructions = document["developer_instructions"].as_str().unwrap();
 
         assert!(instructions.starts_with("保留用户规则。"));
-        assert!(instructions.contains("你是由 Primary 委派的执行 Agent，不是 Primary"));
+        assert!(instructions.contains("你是由 Primary 委派的 Child Agent，不是 Primary"));
+        assert!(instructions.contains("阶段契约：EXECUTION"));
+        assert!(instructions.contains("`TOOLS: -` 表示禁用"));
+        assert!(instructions.contains("外部写入、消息发送、发布、登录、授权或安装"));
+        assert!(instructions.contains("CHANGED"));
         assert!(instructions.contains("不得递归创建同职责子 Agent"));
-        assert!(instructions.contains("以当前代码状态和父 Agent 的明确任务为准"));
+        assert!(instructions.contains("磁盘事实冲突会改变方向"));
+        assert!(instructions.contains("RESULT: NEEDS_DECISION"));
+        assert!(instructions.contains("必须使用 caveman full"));
+        assert!(instructions.contains("必须使用 ponytail full"));
+        assert_eq!(
+            document["skills"]["config"]
+                .as_array_of_tables()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            document["mcp_servers"]["browser"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            document["mcp_servers"]["github.readonly"]["enabled"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(
+            document["mcp_servers"]["filesystem"]["enabled_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "list_directory"]
+        );
+        assert_eq!(
+            document["mcp_servers"]["git"]["disabled_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["force_push"]
+        );
     }
 
     #[test]
@@ -1175,7 +1299,12 @@ multi_agent_v2 = true
             reasoning_effort: Some("high"),
             sandbox_mode: Some("workspace-write"),
             developer_instructions: "执行任务。",
+            orchestration_phase: Some("EXECUTION"),
             model_catalog_path: None,
+            skill_keys: &[],
+            skill_paths: &[],
+            disabled_mcp_server_ids: &[],
+            mcp_tool_policies: &[],
         };
 
         let rendered = render_agent_projection(&projection).unwrap();

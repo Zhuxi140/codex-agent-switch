@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 24;
+const LATEST_SCHEMA_VERSION: i64 = 28;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -118,6 +118,26 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         24,
         "agent_spawn_reservations",
         include_str!("../migrations/0024_agent_spawn_reservations.sql"),
+    ),
+    (
+        25,
+        "agent_thread_reuse_pool",
+        include_str!("../migrations/0025_agent_thread_reuse_pool.sql"),
+    ),
+    (
+        26,
+        "agent_skills",
+        include_str!("../migrations/0026_agent_skills.sql"),
+    ),
+    (
+        27,
+        "agent_mcp_denylist",
+        include_str!("../migrations/0027_agent_mcp_denylist.sql"),
+    ),
+    (
+        28,
+        "agent_mcp_tool_policies",
+        include_str!("../migrations/0028_agent_mcp_tool_policies.sql"),
     ),
 ];
 
@@ -238,8 +258,8 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO schema_migrations (version, name, applied_at)
-                VALUES (25, 'future', '2026-01-01T00:00:00Z')",
-                [],
+                VALUES (?1, 'future', '2026-01-01T00:00:00Z')",
+                [LATEST_SCHEMA_VERSION + 1],
             )
             .unwrap();
         assert!(matches!(

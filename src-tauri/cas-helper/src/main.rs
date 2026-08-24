@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
@@ -12,8 +12,8 @@ use cas_native_lifecycle::{
 use cas_scheduler::{
     Candidate, Profile, REUSE_CLAIM_TTL_SECONDS, Recommendation, SPAWN_RESERVATION_TTL_SECONDS,
     effective_model_reasoning_efforts, normalize_task_scope_key, normalize_workspace_scope_key,
-    recommend, render_delegated_agent_instructions, resolve_agent_reasoning_effort,
-    runtime_fingerprint as shared_runtime_fingerprint,
+    recommend, render_delegated_agent_instructions_for_phase, resolve_agent_reasoning_effort,
+    runtime_fingerprint as shared_runtime_fingerprint, skill_fingerprint_values,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -436,7 +436,7 @@ fn load_recommendation(
         None => ("AND task_scope_key IS NULL", None),
     };
     let mut statement = transaction.prepare(&format!(
-        "SELECT id, codex_thread_id, status, input_tokens, cached_input_tokens,
+        "SELECT id, codex_thread_id, status, reuse_state, input_tokens, cached_input_tokens,
                 output_tokens, total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                 CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                 CASE WHEN claimed_until IS NOT NULL
@@ -460,15 +460,16 @@ fn load_recommendation(
                 instance_id: row.get(0)?,
                 thread_id: row.get(1)?,
                 status: row.get(2)?,
-                input_tokens: row.get(3)?,
-                cached_input_tokens: row.get(4)?,
-                output_tokens: row.get(5)?,
-                total_tokens: row.get(6)?,
-                current_context_tokens: row.get(7)?,
-                context_window: row.get(8)?,
-                runtime_fingerprint: row.get(9)?,
-                age_seconds: row.get(10)?,
-                claimed: row.get(11)?,
+                reuse_state: row.get(3)?,
+                input_tokens: row.get(4)?,
+                cached_input_tokens: row.get(5)?,
+                output_tokens: row.get(6)?,
+                total_tokens: row.get(7)?,
+                current_context_tokens: row.get(8)?,
+                context_window: row.get(9)?,
+                runtime_fingerprint: row.get(10)?,
+                age_seconds: row.get(11)?,
+                claimed: row.get(12)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -493,6 +494,7 @@ fn load_recommendation(
             candidate.age_seconds = existing.age_seconds;
             candidate.claimed = existing.claimed;
             candidate.instance_id = existing.instance_id.clone();
+            candidate.reuse_state = existing.reuse_state.clone();
         }
         candidates.insert(candidate.thread_id.clone(), candidate);
     }
@@ -505,6 +507,20 @@ fn load_recommendation(
     });
     let runtime_fingerprint = active.profile.runtime_fingerprint.clone();
     let mut recommendation = recommend(scope_key.to_owned(), candidates, active.profile);
+    if recommendation.decision == "SPAWN"
+        && matches!(
+            recommendation.reason_code,
+            "RUNTIME_FINGERPRINT_MISMATCH" | "CONTEXT_PRESSURE" | "CACHE_HINT_PRESSURE"
+        )
+        && let Some(instance_id) = recommendation.candidate_instance_id.as_deref()
+    {
+        transaction.execute(
+            "UPDATE agent_thread_instances
+             SET reuse_state = 'RETIRED', reuse_state_reason = ?2, claimed_until = NULL
+             WHERE id = ?1 AND reuse_state = 'ACTIVE'",
+            params![instance_id, recommendation.reason_code],
+        )?;
+    }
     if recommendation.decision == "REUSE"
         && let Some(instance_id) = recommendation.candidate_instance_id.clone()
     {
@@ -514,6 +530,7 @@ fn load_recommendation(
             "UPDATE agent_thread_instances
              SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
              WHERE id = ?1
+               AND reuse_state = 'ACTIVE'
                AND (
                    claimed_until IS NULL
                    OR claimed_until <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
@@ -612,7 +629,7 @@ fn load_active_agent_profile(
                     p.cache_retention_hint_seconds, a.instruction, a.sandbox_policy,
                     a.reasoning_policy, m.id, m.model_id, p.provider_key, p.preset_id,
                     p.base_url, p.protocol, p.custom_headers_json,
-                    m.default_reasoning, m.reasoning_supported
+                    m.default_reasoning, m.reasoning_supported, a.orchestration_phase
              FROM active_agent_bindings active
              JOIN agents a ON a.id = active.agent_id AND a.enabled = 1
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
@@ -641,6 +658,7 @@ fn load_active_agent_profile(
                     row.get::<_, Option<String>>(16)?,
                     row.get::<_, Option<String>>(17)?,
                     row.get::<_, Option<i64>>(18)?.map(|value| value != 0),
+                    row.get::<_, Option<String>>(19)?,
                 ))
             },
         )
@@ -665,6 +683,7 @@ fn load_active_agent_profile(
         custom_headers_json,
         model_default_reasoning,
         reasoning_supported,
+        orchestration_phase,
     )) = profile
     else {
         return Ok(None);
@@ -689,6 +708,7 @@ fn load_active_agent_profile(
         role_key,
         profile: Profile {
             reuse_strategy,
+            orchestration_phase,
             agent_cache_retention_override_seconds,
             cache_support,
             cache_retention_type,
@@ -776,6 +796,7 @@ fn load_native_candidates(
             instance_id: format!("native-{}", record.thread_id),
             thread_id: record.thread_id,
             status: status.to_owned(),
+            reuse_state: "ACTIVE".to_owned(),
             input_tokens: 0,
             cached_input_tokens: 0,
             output_tokens: 0,
@@ -1091,6 +1112,11 @@ fn runtime_fingerprint(
     sandbox_policy: &str,
     instruction: &str,
 ) -> Result<String, rusqlite::Error> {
+    let orchestration_phase = connection.query_row(
+        "SELECT COALESCE(orchestration_phase, '') FROM agents WHERE id = ?1",
+        [agent_id],
+        |row| row.get::<_, String>(0),
+    )?;
     Ok(shared_runtime_fingerprint(&[
         ("provider_key", vec![provider_key.to_owned()]),
         (
@@ -1106,9 +1132,13 @@ fn runtime_fingerprint(
         ("model", vec![model_slug.to_owned()]),
         ("reasoning", vec![reasoning_policy.to_owned()]),
         ("sandbox", vec![sandbox_policy.to_owned()]),
+        ("orchestration_phase", vec![orchestration_phase.clone()]),
         (
             "instruction",
-            vec![render_delegated_agent_instructions(instruction)],
+            vec![render_delegated_agent_instructions_for_phase(
+                instruction,
+                Some(&orchestration_phase),
+            )],
         ),
         (
             "required_capabilities",
@@ -1123,6 +1153,31 @@ fn runtime_fingerprint(
             fingerprint_values(
                 connection,
                 "SELECT capability FROM agent_preferred_capabilities WHERE agent_id = ?1",
+                agent_id,
+            )?,
+        ),
+        (
+            "skills",
+            skill_fingerprint_values(fingerprint_values(
+                connection,
+                "SELECT skill_key FROM agent_skill_bindings WHERE agent_id = ?1",
+                agent_id,
+            )?),
+        ),
+        (
+            "disabled_mcp_servers",
+            fingerprint_values(
+                connection,
+                "SELECT server_id FROM agent_disabled_mcp_servers WHERE agent_id = ?1",
+                agent_id,
+            )?,
+        ),
+        (
+            "mcp_tool_policies",
+            fingerprint_values(
+                connection,
+                "SELECT server_id || '=' || mode || '=' || tool_name
+                 FROM agent_mcp_tool_policies WHERE agent_id = ?1",
                 agent_id,
             )?,
         ),
@@ -1167,7 +1222,10 @@ fn valid_runtime_key(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::UNIX_EPOCH;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn accepts_only_token_and_uuid() {
@@ -1417,6 +1475,7 @@ mod tests {
             context_pressure_percent: Some(20),
             context_pressure_limit_percent: 80,
             reuse_strategy: "AUTO".to_owned(),
+            effective_reuse_strategy: "AUTO".to_owned(),
             cache_support: "SUPPORTED".to_owned(),
             cache_retention_type: "APPROXIMATE".to_owned(),
             cache_retention_hint_seconds: Some(300),
@@ -1451,7 +1510,7 @@ mod tests {
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 20, 0, 5, 25, 100,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 25, NULL, NULL, NULL, NULL,
-                    NULL
+                    NULL, 'ACTIVE', NULL
                  )",
                 [],
             )
@@ -1544,7 +1603,7 @@ mod tests {
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'RUNNING', 5, 0, 0, 5, 100,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, NULL, NULL, NULL, NULL,
-                    NULL
+                    NULL, 'ACTIVE', NULL
                  )",
                 [],
             )
@@ -1583,7 +1642,7 @@ mod tests {
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
-                    NULL
+                    NULL, 'ACTIVE', NULL
                  )",
                 [&runtime_fingerprint(
                     &connection,
@@ -1702,6 +1761,17 @@ mod tests {
         .unwrap();
         assert_eq!(changed.decision, "SPAWN");
         assert_eq!(changed.reason_code, "RUNTIME_FINGERPRINT_MISMATCH");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT reuse_state FROM agent_thread_instances
+                     WHERE codex_thread_id = 'thread-native'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RETIRED"
+        );
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -1787,7 +1857,7 @@ mod tests {
                     'instance-old', 'agent-1', 'thread-native', 'thread-root',
                     'c:/workspace/project', 'UNKNOWN', 0, 0, 0, 0, NULL,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', NULL, 'old-fingerprint',
-                    NULL, NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL, 'ACTIVE', NULL
                  )",
                 [],
             )
@@ -1820,7 +1890,7 @@ mod tests {
 
     #[test]
     fn runtime_fingerprint_reads_runtime_rows_and_ignores_insert_order() {
-        let mut connection = scheduling_connection();
+        let connection = scheduling_connection();
         let fingerprint = || {
             runtime_fingerprint(
                 &connection,
@@ -1890,6 +1960,85 @@ mod tests {
         assert_ne!(provider_changed, ordered);
 
         connection
+            .execute(
+                "INSERT INTO agent_skill_bindings VALUES ('agent-1', 'caveman')",
+                [],
+            )
+            .unwrap();
+        let skill_changed = runtime_fingerprint(
+            &connection,
+            "agent-1",
+            "model-1",
+            "deepseek",
+            None,
+            "https://api.changed.example/v1",
+            "RESPONSES",
+            Some("{\"x-cas\":\"one\"}"),
+            "deepseek-v4",
+            "high",
+            "WORKSPACE_WRITE",
+            "",
+        )
+        .unwrap();
+        assert_ne!(ordered, skill_changed);
+
+        connection
+            .execute(
+                "INSERT INTO agent_disabled_mcp_servers VALUES ('agent-1', 'browser')",
+                [],
+            )
+            .unwrap();
+        let mcp_policy_changed = runtime_fingerprint(
+            &connection,
+            "agent-1",
+            "model-1",
+            "deepseek",
+            None,
+            "https://api.changed.example/v1",
+            "RESPONSES",
+            Some("{\"x-cas\":\"one\"}"),
+            "deepseek-v4",
+            "high",
+            "WORKSPACE_WRITE",
+            "",
+        )
+        .unwrap();
+        assert_ne!(skill_changed, mcp_policy_changed);
+
+        connection
+            .execute(
+                "INSERT INTO agent_mcp_tool_policies
+                 VALUES ('agent-1', 'github', 'DENY', 'write_file')",
+                [],
+            )
+            .unwrap();
+        let mcp_tool_policy_changed = fingerprint();
+        assert_ne!(mcp_policy_changed, mcp_tool_policy_changed);
+
+        connection
+            .execute(
+                "UPDATE agents SET orchestration_phase = 'REVIEW' WHERE id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        let phase_changed = runtime_fingerprint(
+            &connection,
+            "agent-1",
+            "model-1",
+            "deepseek",
+            None,
+            "https://api.changed.example/v1",
+            "RESPONSES",
+            Some("{\"x-cas\":\"one\"}"),
+            "deepseek-v4",
+            "high",
+            "WORKSPACE_WRITE",
+            "",
+        )
+        .unwrap();
+        assert_ne!(mcp_tool_policy_changed, phase_changed);
+
+        connection
             .execute_batch(
                 "DELETE FROM agent_required_capabilities;
                  DELETE FROM agent_preferred_capabilities;
@@ -1901,7 +2050,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            ordered,
+            phase_changed,
             runtime_fingerprint(
                 &connection,
                 "agent-1",
@@ -1945,7 +2094,7 @@ mod tests {
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
-                    NULL
+                    NULL, 'ACTIVE', NULL
                  )",
                 [&fingerprint],
             )
@@ -1962,6 +2111,8 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(reuse.decision, "REUSE");
+        assert_eq!(reuse.reuse_strategy, "AUTO");
+        assert_eq!(reuse.effective_reuse_strategy, "AUTO");
         // last_model_usage_at 为 NULL 时缓存提示必须按未知输出，而不是伪装成命中窗口。
         assert_eq!(reuse.cache_hint, "UNKNOWN");
         assert_eq!(reuse.candidate_age_seconds, None);
@@ -2015,7 +2166,7 @@ mod tests {
                     'instance-1', 'agent-1', 'thread-child', 'thread-root',
                     'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
                     '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?1, NULL, NULL, NULL,
-                    NULL
+                    NULL, 'ACTIVE', NULL
                  )",
                 [&fingerprint],
             )
@@ -2124,7 +2275,7 @@ mod tests {
                         ?1, 'agent-1', ?2, 'thread-root',
                         'c:/workspace/project', 'IDLE', 0, 0, 0, 10, 100,
                         '2026-08-13T00:00:00Z', '2026-08-13T00:00:00Z', 10, ?3,
-                        NULL, NULL, NULL, ?4
+                        NULL, NULL, NULL, ?4, 'ACTIVE', NULL
                      )",
                     params![instance, thread, fingerprint, task],
                 )
@@ -2269,7 +2420,7 @@ mod tests {
                     'c:/workspace/project', 'IDLE', 10, 0, 0, 10, 100,
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'),
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-3600 seconds'), NULL, NULL,
-                    NULL, NULL, NULL, NULL
+                    NULL, NULL, NULL, NULL, 'ACTIVE', NULL
                  )",
                 [],
             )
@@ -2399,6 +2550,7 @@ mod tests {
                     enabled INTEGER NOT NULL,
                     reuse_strategy TEXT NOT NULL,
                     cache_retention_override_seconds INTEGER,
+                    orchestration_phase TEXT,
                     instruction TEXT NOT NULL DEFAULT '',
                     sandbox_policy TEXT NOT NULL DEFAULT 'WORKSPACE_WRITE',
                     reasoning_policy TEXT NOT NULL DEFAULT 'HIGH'
@@ -2440,6 +2592,20 @@ mod tests {
                     agent_id TEXT NOT NULL,
                     capability TEXT NOT NULL
                  );
+                 CREATE TABLE agent_skill_bindings (
+                    agent_id TEXT NOT NULL,
+                    skill_key TEXT NOT NULL
+                 );
+                 CREATE TABLE agent_disabled_mcp_servers (
+                    agent_id TEXT NOT NULL,
+                    server_id TEXT NOT NULL
+                 );
+                 CREATE TABLE agent_mcp_tool_policies (
+                    agent_id TEXT NOT NULL,
+                    server_id TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    tool_name TEXT NOT NULL
+                 );
                  CREATE TABLE model_capabilities (
                     model_id TEXT NOT NULL,
                     capability TEXT NOT NULL,
@@ -2468,7 +2634,9 @@ mod tests {
                     last_model_usage_at TEXT,
                     last_observed_at TEXT,
                     claimed_until TEXT,
-                    task_scope_key TEXT
+                    task_scope_key TEXT,
+                    reuse_state TEXT NOT NULL DEFAULT 'ACTIVE',
+                    reuse_state_reason TEXT
                  );
                  CREATE TABLE agent_schedule_decisions (
                     id TEXT PRIMARY KEY,
@@ -2501,8 +2669,9 @@ mod tests {
                     )
                  );
                  INSERT INTO agents (
-                    id, agent_key, role_key, enabled, reuse_strategy, cache_retention_override_seconds
-                 ) VALUES ('agent-1', 'executor', 'executor', 1, 'AUTO', NULL);
+                    id, agent_key, role_key, enabled, reuse_strategy,
+                    cache_retention_override_seconds, orchestration_phase
+                 ) VALUES ('agent-1', 'executor', 'executor', 1, 'AUTO', NULL, 'EXECUTION');
                  INSERT INTO active_agent_bindings VALUES ('agent-1');
                  INSERT INTO providers (
                     id, provider_key, preset_id, enabled, cache_support,
@@ -2632,10 +2801,14 @@ mod tests {
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
-        let nonce = SystemTime::now()
+        let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{}-{nonce}", std::process::id()))
+        let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "{prefix}-{}-{timestamp}-{sequence}",
+            std::process::id()
+        ))
     }
 }

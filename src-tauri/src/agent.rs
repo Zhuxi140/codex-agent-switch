@@ -10,6 +10,8 @@ use uuid::Uuid;
 use crate::persistence::{PersistenceError, open_database};
 use crate::provider::ApiError;
 
+const BUNDLED_SKILL_KEYS: [&str; 4] = ["caveman", "caveman-slim", "ponytail", "ponytail-slim"];
+
 pub(crate) struct AgentService {
     repository: Mutex<SqliteAgentRepository>,
 }
@@ -184,6 +186,9 @@ impl SqliteAgentRepository {
             &agent.id,
             &agent.preferred_capabilities,
         )?;
+        replace_skill_bindings(&transaction, &agent.id, &agent.skill_keys)?;
+        replace_disabled_mcp_servers(&transaction, &agent.id, &agent.disabled_mcp_server_ids)?;
+        replace_mcp_tool_policies(&transaction, &agent.id, &agent.mcp_tool_policies)?;
 
         if let Some(model_id) = &agent.model_id {
             let model =
@@ -268,6 +273,9 @@ impl SqliteAgentRepository {
                 [&changes.id],
             )?;
         }
+        replace_skill_bindings(&transaction, &changes.id, &changes.skill_keys)?;
+        replace_disabled_mcp_servers(&transaction, &changes.id, &changes.disabled_mcp_server_ids)?;
+        replace_mcp_tool_policies(&transaction, &changes.id, &changes.mcp_tool_policies)?;
         transaction.commit()?;
         self.find_by_id(&changes.id)
     }
@@ -438,6 +446,9 @@ fn load_agent(
             load_capabilities(connection, "agent_required_capabilities", &record.id)?;
         record.preferred_capabilities =
             load_capabilities(connection, "agent_preferred_capabilities", &record.id)?;
+        record.skill_keys = load_skill_keys(connection, &record.id)?;
+        record.disabled_mcp_server_ids = load_disabled_mcp_servers(connection, &record.id)?;
+        record.mcp_tool_policies = load_mcp_tool_policies(connection, &record.id)?;
         if let Some(model) = record.model.as_mut() {
             model.capabilities = load_model_capabilities(connection, &model.reference.id)?;
             model.reasoning_efforts =
@@ -528,6 +539,9 @@ fn map_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentRecord> {
         orchestration_phase: row.get(25)?,
         reuse_strategy: row.get(29)?,
         cache_retention_override_seconds: row.get(30)?,
+        skill_keys: Vec::new(),
+        disabled_mcp_server_ids: Vec::new(),
+        mcp_tool_policies: Vec::new(),
         required_capabilities: Vec::new(),
         preferred_capabilities: Vec::new(),
         model,
@@ -571,6 +585,133 @@ fn load_capabilities(
         .query_map([agent_id], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(AgentRepositoryError::from)
+}
+
+fn load_skill_keys(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Vec<String>, AgentRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT skill_key FROM agent_skill_bindings WHERE agent_id = ?1 ORDER BY skill_key",
+    )?;
+    statement
+        .query_map([agent_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AgentRepositoryError::from)
+}
+
+fn replace_skill_bindings(
+    connection: &Connection,
+    agent_id: &str,
+    skill_keys: &[String],
+) -> Result<(), AgentRepositoryError> {
+    if load_skill_keys(connection, agent_id)? == skill_keys {
+        return Ok(());
+    }
+    connection.execute(
+        "DELETE FROM agent_skill_bindings WHERE agent_id = ?1",
+        [agent_id],
+    )?;
+    for skill_key in skill_keys {
+        connection.execute(
+            "INSERT INTO agent_skill_bindings (agent_id, skill_key) VALUES (?1, ?2)",
+            params![agent_id, skill_key],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_disabled_mcp_servers(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Vec<String>, AgentRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT server_id FROM agent_disabled_mcp_servers WHERE agent_id = ?1 ORDER BY server_id",
+    )?;
+    statement
+        .query_map([agent_id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AgentRepositoryError::from)
+}
+
+fn replace_disabled_mcp_servers(
+    connection: &Connection,
+    agent_id: &str,
+    server_ids: &[String],
+) -> Result<(), AgentRepositoryError> {
+    if load_disabled_mcp_servers(connection, agent_id)? == server_ids {
+        return Ok(());
+    }
+    connection.execute(
+        "DELETE FROM agent_disabled_mcp_servers WHERE agent_id = ?1",
+        [agent_id],
+    )?;
+    for server_id in server_ids {
+        connection.execute(
+            "INSERT INTO agent_disabled_mcp_servers (agent_id, server_id) VALUES (?1, ?2)",
+            params![agent_id, server_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn load_mcp_tool_policies(
+    connection: &Connection,
+    agent_id: &str,
+) -> Result<Vec<AgentMcpToolPolicy>, AgentRepositoryError> {
+    let mut statement = connection.prepare(
+        "SELECT server_id, mode, tool_name FROM agent_mcp_tool_policies
+         WHERE agent_id = ?1 ORDER BY server_id, tool_name",
+    )?;
+    let rows = statement
+        .query_map([agent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut policies = Vec::<AgentMcpToolPolicy>::new();
+    for (server_id, mode, tool_name) in rows {
+        if let Some(policy) = policies.last_mut()
+            && policy.server_id == server_id
+            && policy.mode == mode
+        {
+            policy.tool_names.push(tool_name);
+        } else {
+            policies.push(AgentMcpToolPolicy {
+                server_id,
+                mode,
+                tool_names: vec![tool_name],
+            });
+        }
+    }
+    Ok(policies)
+}
+
+fn replace_mcp_tool_policies(
+    connection: &Connection,
+    agent_id: &str,
+    policies: &[AgentMcpToolPolicy],
+) -> Result<(), AgentRepositoryError> {
+    if load_mcp_tool_policies(connection, agent_id)? == policies {
+        return Ok(());
+    }
+    connection.execute(
+        "DELETE FROM agent_mcp_tool_policies WHERE agent_id = ?1",
+        [agent_id],
+    )?;
+    for policy in policies {
+        for tool_name in &policy.tool_names {
+            connection.execute(
+                "INSERT INTO agent_mcp_tool_policies (agent_id, server_id, mode, tool_name)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id, policy.server_id, policy.mode, tool_name],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn load_model_capabilities(
@@ -858,6 +999,12 @@ pub(crate) struct AgentCreateRequest {
     reuse_strategy: Option<ReuseStrategy>,
     #[serde(default)]
     cache_retention_override_seconds: Option<i64>,
+    #[serde(default)]
+    skill_keys: Option<Vec<String>>,
+    #[serde(default)]
+    disabled_mcp_server_ids: Vec<String>,
+    #[serde(default)]
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -875,6 +1022,20 @@ pub(crate) struct AgentUpdateRequest {
     #[serde(default)]
     reuse_strategy: Option<ReuseStrategy>,
     cache_retention_override_seconds: Option<i64>,
+    #[serde(default)]
+    skill_keys: Vec<String>,
+    #[serde(default)]
+    disabled_mcp_server_ids: Vec<String>,
+    #[serde(default)]
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentMcpToolPolicy {
+    pub(crate) server_id: String,
+    pub(crate) mode: String,
+    pub(crate) tool_names: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -1002,6 +1163,9 @@ struct NewAgent {
     orchestration_phase: &'static str,
     reuse_strategy: &'static str,
     cache_retention_override_seconds: Option<i64>,
+    skill_keys: Vec<String>,
+    disabled_mcp_server_ids: Vec<String>,
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
 }
 
 impl TryFrom<AgentCreateRequest> for NewAgent {
@@ -1036,6 +1200,15 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
             .or_else(|| preset.map(|value| value.orchestration_phase))
             .ok_or(AgentServiceError::InvalidField("orchestrationPhase"))?;
         validate_cache_retention_override(request.cache_retention_override_seconds)?;
+        let skill_keys = normalize_skill_keys(request.skill_keys.unwrap_or_else(|| {
+            preset
+                .map(|value| strings(value.default_skill_keys))
+                .unwrap_or_default()
+        }))?;
+        let disabled_mcp_server_ids =
+            normalize_disabled_mcp_server_ids(request.disabled_mcp_server_ids)?;
+        let mcp_tool_policies =
+            normalize_mcp_tool_policies(request.mcp_tool_policies, &disabled_mcp_server_ids)?;
         Ok(Self {
             id: Uuid::new_v4().to_string(),
             agent_key,
@@ -1062,6 +1235,9 @@ impl TryFrom<AgentCreateRequest> for NewAgent {
                 .unwrap_or(ReuseStrategy::Auto)
                 .as_str(),
             cache_retention_override_seconds: request.cache_retention_override_seconds,
+            skill_keys,
+            disabled_mcp_server_ids,
+            mcp_tool_policies,
         })
     }
 }
@@ -1078,6 +1254,9 @@ struct AgentChanges {
     orchestration_phase: &'static str,
     reuse_strategy: Option<&'static str>,
     cache_retention_override_seconds: Option<i64>,
+    skill_keys: Vec<String>,
+    disabled_mcp_server_ids: Vec<String>,
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
 }
 
 impl TryFrom<AgentUpdateRequest> for AgentChanges {
@@ -1095,6 +1274,11 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
             .map(|value| parse_uuid(&value, "modelId"))
             .transpose()?;
         validate_cache_retention_override(request.cache_retention_override_seconds)?;
+        let skill_keys = normalize_skill_keys(request.skill_keys)?;
+        let disabled_mcp_server_ids =
+            normalize_disabled_mcp_server_ids(request.disabled_mcp_server_ids)?;
+        let mcp_tool_policies =
+            normalize_mcp_tool_policies(request.mcp_tool_policies, &disabled_mcp_server_ids)?;
         Ok(Self {
             id,
             name: request.name.trim().to_owned(),
@@ -1107,6 +1291,9 @@ impl TryFrom<AgentUpdateRequest> for AgentChanges {
             orchestration_phase: request.orchestration_phase.as_str(),
             reuse_strategy: request.reuse_strategy.map(ReuseStrategy::as_str),
             cache_retention_override_seconds: request.cache_retention_override_seconds,
+            skill_keys,
+            disabled_mcp_server_ids,
+            mcp_tool_policies,
         })
     }
 }
@@ -1118,6 +1305,87 @@ fn validate_cache_retention_override(value: Option<i64>) -> Result<(), AgentServ
         ));
     }
     Ok(())
+}
+
+fn normalize_skill_keys(mut values: Vec<String>) -> Result<Vec<String>, AgentServiceError> {
+    for value in &mut values {
+        *value = value.trim().to_ascii_lowercase();
+    }
+    values.sort();
+    values.dedup();
+    let valid = values
+        .iter()
+        .all(|value| BUNDLED_SKILL_KEYS.contains(&value.as_str()));
+    let conflicting = [("caveman", "caveman-slim"), ("ponytail", "ponytail-slim")]
+        .iter()
+        .any(|(normal, slim)| {
+            values.iter().any(|value| value == normal) && values.iter().any(|value| value == slim)
+        });
+    (valid && !conflicting)
+        .then_some(values)
+        .ok_or(AgentServiceError::InvalidField("skillKeys"))
+}
+
+fn normalize_disabled_mcp_server_ids(
+    mut values: Vec<String>,
+) -> Result<Vec<String>, AgentServiceError> {
+    for value in &mut values {
+        *value = value.trim().to_owned();
+    }
+    values.sort();
+    values.dedup();
+    values
+        .iter()
+        .all(|value| is_valid_mcp_server_id(value))
+        .then_some(values)
+        .ok_or(AgentServiceError::InvalidField("disabledMcpServerIds"))
+}
+
+fn normalize_mcp_tool_policies(
+    mut policies: Vec<AgentMcpToolPolicy>,
+    disabled_server_ids: &[String],
+) -> Result<Vec<AgentMcpToolPolicy>, AgentServiceError> {
+    if policies.len() > 128 {
+        return Err(AgentServiceError::InvalidField("mcpToolPolicies"));
+    }
+    for policy in &mut policies {
+        policy.server_id = policy.server_id.trim().to_owned();
+        policy.mode = policy.mode.trim().to_ascii_uppercase();
+        for tool_name in &mut policy.tool_names {
+            *tool_name = tool_name.trim().to_owned();
+        }
+        policy.tool_names.sort();
+        policy.tool_names.dedup();
+        if !is_valid_mcp_server_id(&policy.server_id)
+            || !matches!(policy.mode.as_str(), "ALLOW_ONLY" | "DENY")
+            || policy.tool_names.is_empty()
+            || policy.tool_names.len() > 256
+            || policy.tool_names.iter().any(|tool_name| {
+                tool_name.is_empty()
+                    || tool_name.len() > 256
+                    || tool_name.chars().any(char::is_control)
+            })
+            || disabled_server_ids.binary_search(&policy.server_id).is_ok()
+        {
+            return Err(AgentServiceError::InvalidField("mcpToolPolicies"));
+        }
+    }
+    policies.sort_by(|left, right| left.server_id.cmp(&right.server_id));
+    if policies
+        .windows(2)
+        .any(|pair| pair[0].server_id == pair[1].server_id)
+    {
+        return Err(AgentServiceError::InvalidField("mcpToolPolicies"));
+    }
+    Ok(policies)
+}
+
+fn is_valid_mcp_server_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
 fn value_or_default(value: String, default: Option<&str>) -> String {
@@ -1185,6 +1453,7 @@ struct AgentPresetDefinition {
     preferred_capabilities: &'static [&'static str],
     minimum_context_window: Option<i64>,
     orchestration_phase: OrchestrationPhase,
+    default_skill_keys: &'static [&'static str],
 }
 
 const COMMON_REQUIRED: &[&str] = &["TOOL_CALLING", "CODEX_MULTI_AGENT"];
@@ -1194,49 +1463,53 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         key: "executor",
         name: "Executor",
         description: "在技术方向明确后负责代码实现、修改与实现级修复。",
-        instruction: "你是实现执行 Agent。严格按已确定的范围修改代码，运行必要验证，并报告结果与未完成事项。",
+        instruction: "你是实现执行 Agent。只实现 Primary 已冻结的单个工作单元，不负责需求规划、独立审查、发布或相邻重构。",
         sandbox_policy: "WORKSPACE_WRITE",
-        reasoning_policy: "HIGH",
+        reasoning_policy: "MEDIUM",
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Execution,
+        default_skill_keys: &["caveman-slim", "ponytail-slim"],
     },
     AgentPresetDefinition {
         key: "explorer",
         name: "Explorer",
         description: "负责代码库探索、信息检索与上下文收集。",
-        instruction: "你是代码库探索 Agent。只调查与汇总证据，不修改项目文件；明确区分事实、推断与未知项。",
+        instruction: "你是代码库探索 Agent。只读调查并汇总可定位证据，不负责实现或替 Primary 作产品决策。",
         sandbox_policy: "READ_ONLY",
         reasoning_policy: "MEDIUM",
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Discovery,
+        default_skill_keys: &["caveman-slim"],
     },
     AgentPresetDefinition {
         key: "reviewer",
         name: "Reviewer",
         description: "负责独立检查实现的正确性、风险与遗漏。",
-        instruction: "你是独立审查 Agent。优先报告可复现的正确性、安全性和回归问题，并提供精确文件位置。",
+        instruction: "你是独立审查 Agent。只报告可复现的正确性、安全性、回归与测试缺口，不负责修改实现。",
         sandbox_policy: "READ_ONLY",
         reasoning_policy: "HIGH",
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Review,
+        default_skill_keys: &["caveman-slim"],
     },
     AgentPresetDefinition {
         key: "tester",
         name: "Tester",
         description: "负责测试设计、执行与实现验证。",
-        instruction: "你是测试 Agent。用最小测试复现问题或验证需求，避免修改与测试无关的实现。",
+        instruction: "你是测试 Agent。只负责最小复现和验收验证，不负责修改产品实现或扩展需求。",
         sandbox_policy: "WORKSPACE_WRITE",
         reasoning_policy: "MEDIUM",
         required_capabilities: COMMON_REQUIRED,
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Verification,
+        default_skill_keys: &["caveman-slim"],
     },
 ];
 
@@ -1259,6 +1532,7 @@ pub(crate) struct AgentPresetResponse {
     required_capabilities: &'static [&'static str],
     role_key: &'static str,
     orchestration_phase: &'static str,
+    default_skill_keys: &'static [&'static str],
 }
 
 impl From<&'static AgentPresetDefinition> for AgentPresetResponse {
@@ -1272,6 +1546,7 @@ impl From<&'static AgentPresetDefinition> for AgentPresetResponse {
             required_capabilities: preset.required_capabilities,
             role_key: preset.key,
             orchestration_phase: preset.orchestration_phase.as_str(),
+            default_skill_keys: preset.default_skill_keys,
         }
     }
 }
@@ -1300,6 +1575,9 @@ struct AgentRecord {
     orchestration_phase: Option<String>,
     reuse_strategy: String,
     cache_retention_override_seconds: Option<i64>,
+    skill_keys: Vec<String>,
+    disabled_mcp_server_ids: Vec<String>,
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
 }
 
 struct BindingModelRecord {
@@ -1342,6 +1620,8 @@ pub(crate) struct AgentSummary {
     cache_retention_override_seconds: Option<i64>,
     role_key: Option<String>,
     orchestration_phase: Option<String>,
+    skill_keys: Vec<String>,
+    disabled_mcp_server_ids: Vec<String>,
 }
 
 impl From<AgentRecord> for AgentSummary {
@@ -1359,6 +1639,8 @@ impl From<AgentRecord> for AgentSummary {
             cache_retention_override_seconds: agent.cache_retention_override_seconds,
             role_key: agent.role_key,
             orchestration_phase: agent.orchestration_phase,
+            skill_keys: agent.skill_keys,
+            disabled_mcp_server_ids: agent.disabled_mcp_server_ids,
         }
     }
 }
@@ -1387,6 +1669,9 @@ pub(crate) struct AgentDetailResponse {
     updated_at: String,
     role_key: Option<String>,
     orchestration_phase: Option<String>,
+    skill_keys: Vec<String>,
+    disabled_mcp_server_ids: Vec<String>,
+    mcp_tool_policies: Vec<AgentMcpToolPolicy>,
 }
 
 impl From<AgentRecord> for AgentDetailResponse {
@@ -1413,6 +1698,9 @@ impl From<AgentRecord> for AgentDetailResponse {
             updated_at: agent.updated_at,
             role_key: agent.role_key,
             orchestration_phase: agent.orchestration_phase,
+            skill_keys: agent.skill_keys,
+            disabled_mcp_server_ids: agent.disabled_mcp_server_ids,
+            mcp_tool_policies: agent.mcp_tool_policies,
         }
     }
 }
@@ -1654,6 +1942,9 @@ mod tests {
             orchestration_phase: None,
             reuse_strategy: None,
             cache_retention_override_seconds: None,
+            skill_keys: None,
+            disabled_mcp_server_ids: Vec::new(),
+            mcp_tool_policies: Vec::new(),
         }
     }
 
@@ -1740,7 +2031,16 @@ mod tests {
     #[test]
     fn exposes_four_agent_presets() {
         let service = AgentService::in_memory();
-        assert_eq!(service.presets().len(), 4);
+        let presets = service.presets();
+        assert_eq!(presets.len(), 4);
+        assert_eq!(
+            presets
+                .iter()
+                .find(|preset| preset.key == "executor")
+                .unwrap()
+                .default_reasoning_policy,
+            "MEDIUM"
+        );
     }
 
     #[test]
@@ -1754,6 +2054,10 @@ mod tests {
         assert_eq!(agent.role_key.as_deref(), Some("executor"));
         assert_eq!(agent.orchestration_phase.as_deref(), Some("EXECUTION"));
         assert_eq!(agent.reuse_strategy, "AUTO");
+        assert_eq!(
+            agent.skill_keys,
+            vec!["caveman-slim".to_owned(), "ponytail-slim".to_owned()]
+        );
         assert_eq!(
             agent.required_capabilities,
             vec!["CODEX_MULTI_AGENT".to_owned(), "TOOL_CALLING".to_owned()]
@@ -1785,6 +2089,9 @@ mod tests {
                 orchestration_phase: OrchestrationPhase::Execution,
                 reuse_strategy: Some(ReuseStrategy::Auto),
                 cache_retention_override_seconds: None,
+                skill_keys: agent.skill_keys,
+                disabled_mcp_server_ids: agent.disabled_mcp_server_ids,
+                mcp_tool_policies: agent.mcp_tool_policies,
             })
             .unwrap();
         assert_eq!(updated.cache_retention_override_seconds, None);
@@ -1793,6 +2100,293 @@ mod tests {
         invalid.cache_retention_override_seconds = Some(0);
         assert_eq!(
             service.create(invalid).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+    }
+
+    #[test]
+    fn agent_skills_validate_round_trip_and_retire_old_threads() {
+        let service = AgentService::in_memory();
+        let mut create = request(Some("executor"), None);
+        create.skill_keys = Some(vec![
+            "ponytail".to_owned(),
+            "caveman".to_owned(),
+            "ponytail".to_owned(),
+        ]);
+        let agent = service.create(create).unwrap();
+        assert_eq!(
+            agent.skill_keys,
+            vec!["caveman".to_owned(), "ponytail".to_owned()]
+        );
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO agent_thread_instances (
+                    id, agent_id, codex_thread_id, status, created_at, last_used_at
+                 ) VALUES (
+                    'thread-instance-1', ?1, 'thread-1', 'IDLE',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+                [&agent.id],
+            )
+            .unwrap();
+
+        let updated = service
+            .update(AgentUpdateRequest {
+                agent_id: agent.id.clone(),
+                name: agent.name.clone(),
+                description: agent.description.clone(),
+                instruction: agent.instruction.clone(),
+                sandbox_policy: SandboxPolicy::WorkspaceWrite,
+                reasoning_policy: ReasoningPolicy::High,
+                model_id: None,
+                role_key: agent.role_key.clone().unwrap(),
+                orchestration_phase: OrchestrationPhase::Execution,
+                reuse_strategy: Some(ReuseStrategy::Auto),
+                cache_retention_override_seconds: None,
+                skill_keys: vec!["caveman".to_owned()],
+                disabled_mcp_server_ids: Vec::new(),
+                mcp_tool_policies: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(updated.skill_keys, vec!["caveman".to_owned()]);
+        let retired: (String, String) = service
+            .repository()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT reuse_state, reuse_state_reason
+                 FROM agent_thread_instances WHERE id = 'thread-instance-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retired,
+            ("RETIRED".to_owned(), "AGENT_SKILLS_CHANGED".to_owned())
+        );
+
+        let mut invalid = request(Some("reviewer"), None);
+        invalid.skill_keys = Some(vec!["not-bundled".to_owned()]);
+        assert_eq!(
+            service.create(invalid).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+
+        let mut conflicting = request(Some("reviewer"), None);
+        conflicting.skill_keys = Some(vec!["caveman".to_owned(), "caveman-slim".to_owned()]);
+        assert_eq!(
+            service.create(conflicting).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+    }
+
+    #[test]
+    fn agent_mcp_denylist_validates_round_trips_and_retires_old_threads() {
+        let service = AgentService::in_memory();
+        let agent = service.create(request(Some("executor"), None)).unwrap();
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO agent_thread_instances (
+                    id, agent_id, codex_thread_id, status, created_at, last_used_at
+                 ) VALUES (
+                    'thread-instance-mcp', ?1, 'thread-mcp', 'IDLE',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+                [&agent.id],
+            )
+            .unwrap();
+
+        let updated = service
+            .update(AgentUpdateRequest {
+                agent_id: agent.id.clone(),
+                name: agent.name,
+                description: agent.description,
+                instruction: agent.instruction,
+                sandbox_policy: SandboxPolicy::WorkspaceWrite,
+                reasoning_policy: ReasoningPolicy::High,
+                model_id: None,
+                role_key: agent.role_key.unwrap(),
+                orchestration_phase: OrchestrationPhase::Execution,
+                reuse_strategy: Some(ReuseStrategy::Auto),
+                cache_retention_override_seconds: None,
+                skill_keys: agent.skill_keys,
+                disabled_mcp_server_ids: vec![
+                    "browser".to_owned(),
+                    "github.readonly".to_owned(),
+                    "browser".to_owned(),
+                ],
+                mcp_tool_policies: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            updated.disabled_mcp_server_ids,
+            vec!["browser".to_owned(), "github.readonly".to_owned()]
+        );
+        let retired: (String, String) = service
+            .repository()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT reuse_state, reuse_state_reason
+                 FROM agent_thread_instances WHERE id = 'thread-instance-mcp'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retired,
+            ("RETIRED".to_owned(), "AGENT_MCP_POLICY_CHANGED".to_owned())
+        );
+
+        let mut invalid = request(Some("reviewer"), None);
+        invalid.disabled_mcp_server_ids = vec!["not allowed".to_owned()];
+        assert_eq!(
+            service.create(invalid).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+    }
+
+    #[test]
+    fn agent_mcp_tool_policies_validate_round_trip_and_retire_old_threads() {
+        let service = AgentService::in_memory();
+        let agent = service.create(request(Some("executor"), None)).unwrap();
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO agent_thread_instances (
+                    id, agent_id, codex_thread_id, status, created_at, last_used_at
+                 ) VALUES (
+                    'thread-instance-mcp-tools', ?1, 'thread-mcp-tools', 'IDLE',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'
+                 )",
+                [&agent.id],
+            )
+            .unwrap();
+
+        let updated = service
+            .update(AgentUpdateRequest {
+                agent_id: agent.id.clone(),
+                name: agent.name,
+                description: agent.description,
+                instruction: agent.instruction,
+                sandbox_policy: SandboxPolicy::WorkspaceWrite,
+                reasoning_policy: ReasoningPolicy::High,
+                model_id: None,
+                role_key: agent.role_key.unwrap(),
+                orchestration_phase: OrchestrationPhase::Execution,
+                reuse_strategy: Some(ReuseStrategy::Auto),
+                cache_retention_override_seconds: None,
+                skill_keys: agent.skill_keys,
+                disabled_mcp_server_ids: Vec::new(),
+                mcp_tool_policies: vec![
+                    AgentMcpToolPolicy {
+                        server_id: "github".to_owned(),
+                        mode: "DENY".to_owned(),
+                        tool_names: vec![
+                            "write_file".to_owned(),
+                            "read_file".to_owned(),
+                            "write_file".to_owned(),
+                        ],
+                    },
+                    AgentMcpToolPolicy {
+                        server_id: "browser".to_owned(),
+                        mode: "ALLOW_ONLY".to_owned(),
+                        tool_names: vec!["navigate".to_owned()],
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(
+            updated.mcp_tool_policies,
+            vec![
+                AgentMcpToolPolicy {
+                    server_id: "browser".to_owned(),
+                    mode: "ALLOW_ONLY".to_owned(),
+                    tool_names: vec!["navigate".to_owned()],
+                },
+                AgentMcpToolPolicy {
+                    server_id: "github".to_owned(),
+                    mode: "DENY".to_owned(),
+                    tool_names: vec!["read_file".to_owned(), "write_file".to_owned()],
+                },
+            ]
+        );
+        let retired: (String, String) = service
+            .repository()
+            .unwrap()
+            .connection
+            .query_row(
+                "SELECT reuse_state, reuse_state_reason
+                 FROM agent_thread_instances WHERE id = 'thread-instance-mcp-tools'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            retired,
+            (
+                "RETIRED".to_owned(),
+                "AGENT_MCP_TOOL_POLICY_CHANGED".to_owned()
+            )
+        );
+
+        let mut duplicate = request(Some("reviewer"), None);
+        duplicate.mcp_tool_policies = vec![
+            AgentMcpToolPolicy {
+                server_id: "github".to_owned(),
+                mode: "DENY".to_owned(),
+                tool_names: vec!["write_file".to_owned()],
+            },
+            AgentMcpToolPolicy {
+                server_id: "github".to_owned(),
+                mode: "ALLOW_ONLY".to_owned(),
+                tool_names: vec!["read_file".to_owned()],
+            },
+        ];
+        assert_eq!(
+            service.create(duplicate).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+
+        let mut overlap = request(Some("reviewer"), None);
+        overlap.disabled_mcp_server_ids = vec!["github".to_owned()];
+        overlap.mcp_tool_policies = vec![AgentMcpToolPolicy {
+            server_id: "github".to_owned(),
+            mode: "DENY".to_owned(),
+            tool_names: vec!["write_file".to_owned()],
+        }];
+        assert_eq!(
+            service.create(overlap).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+
+        let mut empty_tools = request(Some("reviewer"), None);
+        empty_tools.mcp_tool_policies = vec![AgentMcpToolPolicy {
+            server_id: "github".to_owned(),
+            mode: "DENY".to_owned(),
+            tool_names: Vec::new(),
+        }];
+        assert_eq!(
+            service.create(empty_tools).unwrap_err().code(),
+            "VALIDATION_ERROR"
+        );
+
+        let mut invalid_mode = request(Some("reviewer"), None);
+        invalid_mode.mcp_tool_policies = vec![AgentMcpToolPolicy {
+            server_id: "github".to_owned(),
+            mode: "ALL".to_owned(),
+            tool_names: vec!["write_file".to_owned()],
+        }];
+        assert_eq!(
+            service.create(invalid_mode).unwrap_err().code(),
             "VALIDATION_ERROR"
         );
     }
@@ -1916,6 +2510,9 @@ mod tests {
             orchestration_phase: "EXECUTION",
             reuse_strategy: Some("AUTO"),
             cache_retention_override_seconds: None,
+            skill_keys: agent.skill_keys.clone(),
+            disabled_mcp_server_ids: agent.disabled_mcp_server_ids.clone(),
+            mcp_tool_policies: agent.mcp_tool_policies.clone(),
         };
         assert!(matches!(
             repository.update(&changes),

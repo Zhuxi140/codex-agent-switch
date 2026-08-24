@@ -24,12 +24,13 @@ use agent::{
 };
 use codex_environment::CodexEnvironment;
 use configuration::{
-    ConfigurationApplyPreview, ConfigurationApplyRequest, ConfigurationApplyResponse,
-    ConfigurationService, ConfigurationStatus, ConfigurationStatusResponse, DiagnosticsResponse,
-    DiagnosticsRunRequest, ProjectExclusionAddRequest, ProjectExclusionDeleteRequest,
-    ProjectExclusionResponse, RuntimeModeConflictResolveRequest, RuntimeModeResponse,
-    RuntimeModeSwitchRequest, SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest,
-    SnapshotListResponse, SnapshotRestoreRequest, SnapshotRestoreResponse,
+    CodexMcpServerResponse, ConfigurationApplyPreview, ConfigurationApplyRequest,
+    ConfigurationApplyResponse, ConfigurationService, ConfigurationStatus,
+    ConfigurationStatusResponse, DiagnosticsResponse, DiagnosticsRunRequest,
+    ProjectExclusionAddRequest, ProjectExclusionDeleteRequest, ProjectExclusionResponse,
+    RuntimeModeConflictResolveRequest, RuntimeModeResponse, RuntimeModeSwitchRequest,
+    SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse,
+    SnapshotRestoreRequest, SnapshotRestoreResponse,
 };
 use model::{
     ModelAddRequest, ModelConnectionTestResponse, ModelDeleteRequest, ModelDetailResponse,
@@ -48,9 +49,10 @@ use runtime_bridge::{
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
-    AgentScheduleDecisionListRequest, AgentThreadExecutionRequest, AgentThreadInstanceListRequest,
-    AgentThreadInstanceListResponse, AgentThreadInstanceRecommendRequest,
-    AgentThreadInstanceRecommendation, AgentThreadInstanceResponse,
+    AgentScheduleDecisionListRequest, AgentThreadCleanupRequest, AgentThreadCleanupResponse,
+    AgentThreadExecutionRequest, AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
+    AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
+    AgentThreadInstanceResponse, AgentThreadInstanceReuseStateRequest,
     AgentThreadInstanceWorkspaceScopeRequest, AgentThreadProjectListResponse,
     AgentThreadProjectSummaryResponse, NativeSubagentSyncResponse, ScheduleDecisionResponse,
     UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
@@ -166,6 +168,13 @@ fn codex_redetect(
 ) -> Result<CodexEnvironment, ApiError> {
     codex_environment::clear_capability_cache();
     state.environment().map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn codex_mcp_server_list(
+    state: tauri::State<'_, ConfigurationService>,
+) -> Result<Vec<CodexMcpServerResponse>, ApiError> {
+    state.list_mcp_servers().map_err(ApiError::from)
 }
 
 #[tauri::command]
@@ -632,6 +641,25 @@ fn agent_thread_instance_set_workspace_scope(
 }
 
 #[tauri::command]
+fn agent_thread_instance_set_reuse_state(
+    state: tauri::State<'_, UsageService>,
+    request: AgentThreadInstanceReuseStateRequest,
+) -> Result<AgentThreadInstanceResponse, ApiError> {
+    state.set_agent_instance_reuse_state(request)
+}
+
+#[tauri::command]
+fn agent_thread_instance_cleanup(
+    state: tauri::State<'_, UsageService>,
+    configuration: tauri::State<'_, ConfigurationService>,
+    observer: tauri::State<'_, NativeObserverService>,
+    request: AgentThreadCleanupRequest,
+) -> Result<AgentThreadCleanupResponse, ApiError> {
+    observer.sync(&state, &configuration)?;
+    state.cleanup_agent_instances(request)
+}
+
+#[tauri::command]
 fn agent_thread_instance_recommend(
     state: tauri::State<'_, UsageService>,
     request: AgentThreadInstanceRecommendRequest,
@@ -757,6 +785,7 @@ pub fn run() {
             app_get_bootstrap,
             codex_get_environment,
             codex_redetect,
+            codex_mcp_server_list,
             settings_get,
             settings_update,
             provider_create,
@@ -805,6 +834,8 @@ pub fn run() {
             project_monitor_focus_main,
             agent_schedule_decision_list,
             agent_thread_instance_set_workspace_scope,
+            agent_thread_instance_set_reuse_state,
+            agent_thread_instance_cleanup,
             agent_thread_instance_recommend,
             agent_thread_instance_execute,
             usage_monitor_start,

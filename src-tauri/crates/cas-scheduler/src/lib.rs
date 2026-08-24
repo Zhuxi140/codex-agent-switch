@@ -2,17 +2,37 @@
 // ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
 pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;
 pub const SPAWN_RESERVATION_TTL_SECONDS: i64 = 120;
-const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的执行 Agent，不是 Primary。直接执行父 Agent 交付的任务，不得重新套用 Primary 编排流程，也不得递归创建同职责子 Agent。若项目说明与当前磁盘中的文件或代码状态冲突，先读取并核对磁盘事实，以当前代码状态和父 Agent 的明确任务为准。";
+const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的 Child Agent，不是 Primary。只完成 TASK 包中的一个可独立验收的工作单元，并把 GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP 视为边界。不得扩展到相邻问题、额外重构、文档、提交、发布、依赖安装，或未明确授权的公开 API、数据模型与产品行为变更。缺少安全推进所需信息、需要未冻结决策、越过允许范围或磁盘事实冲突会改变方向时，立即停止并把控制权交还 Primary；不得猜测或重新执行 Primary 编排流程，也不得递归创建同职责子 Agent。首行必须返回 `RESULT: DONE`、`RESULT: NEEDS_DECISION`、`RESULT: PARTIAL` 或 `RESULT: BLOCKED`，且不得声称未实际验证的结果。";
+const DELEGATED_TOOL_INSTRUCTIONS: &str = "工具契约：本地工具仍受阶段及 ALLOW/DENY 约束。外部 MCP、插件或连接器只可调用 TOOLS 明列且完成 ACCEPT 必需的项；`TOOLS: -` 表示禁用。任何外部写入、消息发送、发布、登录、授权或安装还必须由 ALLOW 明确许可，否则返回 `RESULT: NEEDS_DECISION`。Skill 只按任务匹配和已绑定规则加载，不得扫描或调用无关 Skill。";
+const EXECUTION_PHASE_INSTRUCTIONS: &str = "阶段契约：EXECUTION。优先使用本地已有工具，只在 ALLOW 内做满足 ACCEPT 的最小实现及针对性验证；不负责需求规划、独立审查、发布或相邻清理。随后只报告适用的 `CHANGED`、`VERIFIED`、`REMAINING`、`EVIDENCE`、`NEXT`。";
+const DISCOVERY_PHASE_INSTRUCTIONS: &str = "阶段契约：DISCOVERY。只读调查，不修改文件或外部状态，TOOLS 中的外部工具也仅可只读取证；证据应定位到文件、符号或行号，并区分事实、推断与未知项。随后只报告适用的 `EVIDENCE`、`INFERENCE`、`UNKNOWN`、`NEXT`。";
+const REVIEW_PHASE_INSTRUCTIONS: &str = "阶段契约：REVIEW。只做独立审查，不修改文件或外部状态；仅报告可复现的正确性、安全性、回归或测试缺口，不报告纯风格偏好。每个 `FINDING` 包含严重度、位置、证据和影响；无问题时返回 `NO_FINDINGS`。";
+const VERIFICATION_PHASE_INSTRUCTIONS: &str = "阶段契约：VERIFICATION。只复现或验证，不修改产品代码与文档；仅当 TASK 明确授权时可修改测试文件，测试和构建产物不视为产品修改。TOOLS 中的测试或浏览器工具仍不得造成未授权外部状态变更。随后只报告适用的 `COMMAND`、`OUTCOME`、`FAILURE`、`ARTIFACTS`、`NEXT`。";
+const GENERIC_PHASE_INSTRUCTIONS: &str =
+    "随后只报告适用的 `DONE`、`EVIDENCE`、`REMAINING`、`NEXT`。";
 
 pub fn render_delegated_agent_instructions(instructions: &str) -> String {
+    render_delegated_agent_instructions_for_phase(instructions, None)
+}
+
+pub fn render_delegated_agent_instructions_for_phase(
+    instructions: &str,
+    phase: Option<&str>,
+) -> String {
+    let phase_instructions = match phase {
+        Some("EXECUTION") => EXECUTION_PHASE_INSTRUCTIONS,
+        Some("DISCOVERY") => DISCOVERY_PHASE_INSTRUCTIONS,
+        Some("REVIEW") => REVIEW_PHASE_INSTRUCTIONS,
+        Some("VERIFICATION") => VERIFICATION_PHASE_INSTRUCTIONS,
+        _ => GENERIC_PHASE_INSTRUCTIONS,
+    };
+    let delegated_instructions = format!(
+        "{DELEGATED_AGENT_INSTRUCTIONS}\n{DELEGATED_TOOL_INSTRUCTIONS}\n{phase_instructions}"
+    );
     if instructions.trim().is_empty() {
-        DELEGATED_AGENT_INSTRUCTIONS.to_owned()
+        delegated_instructions
     } else {
-        format!(
-            "{}\n\n{}",
-            instructions.trim_end(),
-            DELEGATED_AGENT_INSTRUCTIONS
-        )
+        format!("{}\n\n{}", instructions.trim_end(), delegated_instructions)
     }
 }
 
@@ -21,6 +41,7 @@ pub struct Candidate {
     pub instance_id: String,
     pub thread_id: String,
     pub status: String,
+    pub reuse_state: String,
     pub input_tokens: i64,
     pub cached_input_tokens: i64,
     pub output_tokens: i64,
@@ -38,6 +59,7 @@ pub struct Candidate {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Profile {
     pub reuse_strategy: String,
+    pub orchestration_phase: Option<String>,
     pub cache_support: String,
     pub cache_retention_type: String,
     pub cache_retention_hint_seconds: Option<i64>,
@@ -61,10 +83,27 @@ pub fn runtime_fingerprint(fields: &[(&str, Vec<String>)]) -> String {
     format!("{:x}", hash.finalize())
 }
 
+pub fn skill_fingerprint_values(skill_keys: Vec<String>) -> Vec<String> {
+    skill_keys
+        .into_iter()
+        .map(|key| {
+            let revision = match key.as_str() {
+                "caveman" => "full-v1",
+                "caveman-slim" => "slim-v1",
+                "ponytail" => "full-v1",
+                "ponytail-slim" => "slim-v1",
+                _ => "unknown-v1",
+            };
+            format!("{key}@{revision}")
+        })
+        .collect()
+}
+
 impl Default for Profile {
     fn default() -> Self {
         Self {
             reuse_strategy: "AUTO".to_owned(),
+            orchestration_phase: None,
             cache_support: "UNKNOWN".to_owned(),
             cache_retention_type: "UNKNOWN".to_owned(),
             cache_retention_hint_seconds: None,
@@ -85,6 +124,7 @@ pub struct Recommendation {
     pub context_pressure_percent: Option<i64>,
     pub context_pressure_limit_percent: i64,
     pub reuse_strategy: String,
+    pub effective_reuse_strategy: String,
     pub cache_support: String,
     pub cache_retention_type: String,
     pub cache_retention_hint_seconds: Option<i64>,
@@ -233,7 +273,8 @@ pub fn recommend(
     profile: Profile,
 ) -> Recommendation {
     if let Some(candidate) = candidates.iter().find(|candidate| {
-        candidate.status == "IDLE"
+        candidate.reuse_state == "ACTIVE"
+            && candidate.status == "IDLE"
             && !candidate.claimed
             && profile.runtime_fingerprint.is_some()
             && candidate.runtime_fingerprint == profile.runtime_fingerprint
@@ -252,7 +293,7 @@ pub fn recommend(
     }
     if let Some(candidate) = candidates
         .iter()
-        .find(|candidate| candidate.status == "IDLE")
+        .find(|candidate| candidate.reuse_state == "ACTIVE" && candidate.status == "IDLE")
     {
         if profile.runtime_fingerprint.is_none() || candidate.runtime_fingerprint.is_none() {
             return recommendation(
@@ -288,7 +329,7 @@ pub fn recommend(
                 &profile,
             );
         }
-        let base_limit = base_context_pressure_limit(&profile.reuse_strategy);
+        let base_limit = base_context_pressure_limit(effective_reuse_strategy(&profile));
         let limit = context_pressure_limit(&profile, candidate.age_seconds);
         let pressure = context_pressure_percent(candidate);
         if pressure.is_none() {
@@ -319,11 +360,24 @@ pub fn recommend(
             &profile,
         );
     }
-    if let Some(candidate) = candidates.first() {
+    if let Some(candidate) = candidates
+        .iter()
+        .find(|candidate| candidate.reuse_state == "ACTIVE")
+    {
         return recommendation(
             "SPAWN",
             "NO_HEALTHY_IDLE_THREAD",
             "同一 Workspace Scope 的 Thread 当前不可安全复用，建议新建。",
+            workspace_scope_key,
+            Some(candidate),
+            &profile,
+        );
+    }
+    if let Some(candidate) = candidates.first() {
+        return recommendation(
+            "SPAWN",
+            "CANDIDATE_RETIRED",
+            "同一 Workspace Scope 的历史 Thread 已退出 CAS 复用池，建议新建。",
             workspace_scope_key,
             Some(candidate),
             &profile,
@@ -359,6 +413,7 @@ fn recommendation(
         context_pressure_percent: candidate.and_then(context_pressure_percent),
         context_pressure_limit_percent: context_pressure_limit(profile, age_seconds),
         reuse_strategy: profile.reuse_strategy.clone(),
+        effective_reuse_strategy: effective_reuse_strategy(profile).to_owned(),
         cache_support: profile.cache_support.clone(),
         cache_retention_type: profile.cache_retention_type.clone(),
         cache_retention_hint_seconds,
@@ -369,8 +424,9 @@ fn recommendation(
 }
 
 pub fn context_pressure_limit(profile: &Profile, age_seconds: Option<i64>) -> i64 {
-    let base = base_context_pressure_limit(&profile.reuse_strategy);
-    if profile.reuse_strategy == "HOT" {
+    let effective_strategy = effective_reuse_strategy(profile);
+    let base = base_context_pressure_limit(effective_strategy);
+    if effective_strategy == "HOT" {
         return base;
     }
     let (retention, _) = effective_cache_retention(profile);
@@ -378,6 +434,18 @@ pub fn context_pressure_limit(profile: &Profile, age_seconds: Option<i64>) -> i6
     let cache_penalty = profile.cache_support == "UNSUPPORTED"
         || age_seconds.is_none_or(|age| retention.is_some_and(|retention| age > retention));
     if cache_penalty { base - 10 } else { base }
+}
+
+pub fn effective_reuse_strategy(profile: &Profile) -> &'static str {
+    match profile.reuse_strategy.as_str() {
+        "HOT" => "HOT",
+        "COLD" => "COLD",
+        _ => match profile.orchestration_phase.as_deref() {
+            Some("DISCOVERY") => "HOT",
+            Some("VERIFICATION" | "REVIEW") => "COLD",
+            _ => "AUTO",
+        },
+    }
 }
 
 pub fn cache_hint(profile: &Profile, age_seconds: Option<i64>) -> &'static str {
@@ -433,11 +501,52 @@ fn context_pressure_percent(candidate: &Candidate) -> Option<i64> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn delegated_agent_stops_at_one_reviewable_unit_and_returns_control() {
+        let rendered = render_delegated_agent_instructions("保留角色规则。");
+
+        assert!(rendered.starts_with("保留角色规则。"));
+        assert!(rendered.contains("一个可独立验收的工作单元"));
+        assert!(rendered.contains("GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP"));
+        assert!(rendered.contains("需要未冻结决策"));
+        assert!(rendered.contains("RESULT: NEEDS_DECISION"));
+        assert!(rendered.contains("`TOOLS: -` 表示禁用"));
+        assert!(rendered.contains("外部写入、消息发送、发布、登录、授权或安装"));
+        assert!(rendered.contains("不得扫描或调用无关 Skill"));
+        assert!(rendered.contains("DONE"));
+        assert!(rendered.contains("REMAINING"));
+    }
+
+    #[test]
+    fn delegated_agent_contract_changes_with_orchestration_phase() {
+        let execution =
+            render_delegated_agent_instructions_for_phase("角色规则。", Some("EXECUTION"));
+        let discovery =
+            render_delegated_agent_instructions_for_phase("角色规则。", Some("DISCOVERY"));
+        let review = render_delegated_agent_instructions_for_phase("角色规则。", Some("REVIEW"));
+        let verification =
+            render_delegated_agent_instructions_for_phase("角色规则。", Some("VERIFICATION"));
+
+        assert!(execution.contains("阶段契约：EXECUTION"));
+        assert!(execution.contains("优先使用本地已有工具"));
+        assert!(execution.contains("最小实现及针对性验证"));
+        assert!(discovery.contains("只读调查"));
+        assert!(discovery.contains("外部工具也仅可只读取证"));
+        assert!(discovery.contains("INFERENCE"));
+        assert!(review.contains("不报告纯风格偏好"));
+        assert!(review.contains("不修改文件或外部状态"));
+        assert!(review.contains("NO_FINDINGS"));
+        assert!(verification.contains("不修改产品代码与文档"));
+        assert!(verification.contains("不得造成未授权外部状态变更"));
+        assert!(verification.contains("COMMAND"));
+    }
+
     fn candidate(status: &str, total_tokens: i64) -> Candidate {
         Candidate {
             instance_id: "instance-1".to_owned(),
             thread_id: "thread-1".to_owned(),
             status: status.to_owned(),
+            reuse_state: "ACTIVE".to_owned(),
             input_tokens: 0,
             cached_input_tokens: 0,
             output_tokens: 0,
@@ -448,6 +557,19 @@ mod tests {
             age_seconds: Some(10),
             claimed: false,
         }
+    }
+
+    #[test]
+    fn retired_thread_is_never_reused() {
+        let mut profile = Profile::default();
+        profile.runtime_fingerprint = Some("fingerprint".to_owned());
+        let mut retired = candidate("IDLE", 20);
+        retired.reuse_state = "RETIRED".to_owned();
+
+        let result = recommend("c:/workspace/project".to_owned(), vec![retired], profile);
+
+        assert_eq!(result.decision, "SPAWN");
+        assert_eq!(result.reason_code, "CANDIDATE_RETIRED");
     }
 
     #[test]
@@ -471,6 +593,31 @@ mod tests {
         assert_eq!(result.decision, "REUSE");
         assert_eq!(result.candidate_thread_id.as_deref(), Some("thread-1"));
         assert_eq!(result.context_pressure_percent, Some(50));
+    }
+
+    #[test]
+    fn auto_reuse_strategy_is_role_aware_and_explicit_strategy_wins() {
+        let mut profile = Profile::default();
+
+        profile.orchestration_phase = Some("DISCOVERY".to_owned());
+        assert_eq!(effective_reuse_strategy(&profile), "HOT");
+        assert_eq!(context_pressure_limit(&profile, Some(10)), 90);
+
+        profile.orchestration_phase = Some("EXECUTION".to_owned());
+        assert_eq!(effective_reuse_strategy(&profile), "AUTO");
+        assert_eq!(context_pressure_limit(&profile, Some(10)), 80);
+
+        profile.orchestration_phase = Some("VERIFICATION".to_owned());
+        assert_eq!(effective_reuse_strategy(&profile), "COLD");
+        assert_eq!(context_pressure_limit(&profile, Some(10)), 60);
+
+        profile.orchestration_phase = Some("REVIEW".to_owned());
+        profile.reuse_strategy = "HOT".to_owned();
+        assert_eq!(effective_reuse_strategy(&profile), "HOT");
+
+        profile.orchestration_phase = Some("DISCOVERY".to_owned());
+        profile.reuse_strategy = "COLD".to_owned();
+        assert_eq!(effective_reuse_strategy(&profile), "COLD");
     }
 
     #[test]
@@ -544,6 +691,18 @@ mod tests {
         ]);
         assert_eq!(first, reordered);
         assert_ne!(first, changed);
+    }
+
+    #[test]
+    fn skill_fingerprint_distinguishes_normal_slim_and_content_revision() {
+        assert_eq!(
+            skill_fingerprint_values(vec!["caveman".to_owned()]),
+            vec!["caveman@full-v1"]
+        );
+        assert_eq!(
+            skill_fingerprint_values(vec!["caveman-slim".to_owned()]),
+            vec!["caveman-slim@slim-v1"]
+        );
     }
 
     #[test]

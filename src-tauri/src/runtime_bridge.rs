@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::codex_config::render_delegated_agent_instructions;
+use crate::codex_config::render_delegated_agent_instructions_for_phase;
 use crate::codex_schema_probe::{SchemaCapability, probe_schema_capabilities};
 use crate::provider::ApiError;
 use crate::usage::{
@@ -1840,7 +1840,10 @@ fn agent_thread_params(profile: &AgentRuntimeProfile, cwd: &str) -> Value {
     let mut params = json!({
         "cwd": cwd,
         "model": profile.model_slug,
-        "developerInstructions": render_delegated_agent_instructions(&profile.instruction),
+        "developerInstructions": render_delegated_agent_instructions_for_phase(
+            &profile.instruction,
+            Some(&profile.orchestration_phase),
+        ),
         "sandbox": match profile.sandbox_policy.as_str() {
             "READ_ONLY" => Some("read-only"),
             "WORKSPACE_WRITE" => Some("workspace-write"),
@@ -2469,6 +2472,7 @@ mod tests {
             agent_key: "executor".to_owned(),
             agent_name: "Executor".to_owned(),
             instruction: "只执行已明确的实现任务。".to_owned(),
+            orchestration_phase: "EXECUTION".to_owned(),
             sandbox_policy: "WORKSPACE_WRITE".to_owned(),
             reasoning_effort: Some("high".to_owned()),
             model_slug: "deepseek-v4-flash".to_owned(),
@@ -2486,7 +2490,9 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap();
         assert!(instructions.contains("只执行已明确的实现任务。"));
-        assert!(instructions.contains("你是由 Primary 委派的执行 Agent"));
+        assert!(instructions.contains("你是由 Primary 委派的 Child Agent"));
+        assert!(instructions.contains("阶段契约：EXECUTION"));
+        assert!(instructions.contains("`TOOLS: -` 表示禁用"));
     }
 
     #[test]
@@ -2496,6 +2502,7 @@ mod tests {
             agent_key: "native-executor".to_owned(),
             agent_name: "Native Executor".to_owned(),
             instruction: "执行任务。".to_owned(),
+            orchestration_phase: "EXECUTION".to_owned(),
             sandbox_policy: "WORKSPACE_WRITE".to_owned(),
             reasoning_effort: Some("high".to_owned()),
             model_slug: "gpt-5.6-luna".to_owned(),

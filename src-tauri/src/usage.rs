@@ -11,11 +11,13 @@ use cas_scheduler::{
     Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile, REUSE_CLAIM_TTL_SECONDS,
     effective_model_reasoning_efforts, normalize_task_scope_key,
     normalize_workspace_scope_key as canonical_workspace_scope_key, recommend as schedule_instance,
-    render_delegated_agent_instructions, resolve_agent_reasoning_effort,
-    runtime_fingerprint as shared_runtime_fingerprint,
+    render_delegated_agent_instructions_for_phase, resolve_agent_reasoning_effort,
+    runtime_fingerprint as shared_runtime_fingerprint, skill_fingerprint_values,
 };
 #[cfg(test)]
-use cas_scheduler::{cache_hint, context_pressure_limit, effective_cache_retention};
+use cas_scheduler::{
+    cache_hint, context_pressure_limit, effective_cache_retention, effective_reuse_strategy,
+};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
@@ -191,6 +193,165 @@ impl UsageService {
         self.repository()?
             .set_agent_instance_workspace_scope(&thread_id, scope_key.as_deref())
             .map_err(ApiError::from)
+    }
+
+    pub(crate) fn set_agent_instance_reuse_state(
+        &self,
+        request: AgentThreadInstanceReuseStateRequest,
+    ) -> Result<AgentThreadInstanceResponse, ApiError> {
+        let thread_id = validate_runtime_key(&request.thread_id, "threadId")?;
+        if !matches!(request.reuse_state.as_str(), "ACTIVE" | "RETIRED") {
+            return Err(UsageServiceError::InvalidField("reuseState").into());
+        }
+        let repository = self.repository()?;
+        let instance = repository.agent_instance(&thread_id)?;
+        if request.reuse_state == "RETIRED" {
+            let state = if instance.status == "RUNNING" {
+                "RETIRE_PENDING"
+            } else {
+                "RETIRED"
+            };
+            return repository
+                .set_agent_instance_reuse_state(&thread_id, state, Some("USER_REQUESTED"))
+                .map_err(ApiError::from);
+        }
+        if instance.reuse_state == "ACTIVE" {
+            return Ok(instance);
+        }
+        if instance.reuse_state == "RETIRE_PENDING" && instance.status == "RUNNING" {
+            return repository
+                .set_agent_instance_reuse_state(&thread_id, "ACTIVE", None)
+                .map_err(ApiError::from);
+        }
+        if instance.status != "IDLE" {
+            return Err(UsageServiceError::ReuseRestoreBlocked(
+                "THREAD_NOT_IDLE",
+                "只有原生状态为 IDLE 的 Thread 才能恢复到复用池。",
+            )
+            .into());
+        }
+        let agent_id = instance
+            .agent_id
+            .as_deref()
+            .ok_or(UsageServiceError::AgentRuntimeUnavailable)?;
+        let runtime = repository
+            .agent_runtime_profile(agent_id)?
+            .ok_or(UsageServiceError::AgentRuntimeUnavailable)?;
+        if instance.runtime_fingerprint.as_deref() != Some(runtime.runtime_fingerprint.as_str()) {
+            return Err(UsageServiceError::ReuseRestoreBlocked(
+                "RUNTIME_FINGERPRINT_MISMATCH",
+                "Thread 的运行时配置与当前 Agent 不一致，不能恢复到复用池。",
+            )
+            .into());
+        }
+        let scope_key =
+            instance
+                .workspace_scope_key
+                .clone()
+                .ok_or(UsageServiceError::ReuseRestoreBlocked(
+                    "WORKSPACE_SCOPE_UNKNOWN",
+                    "Thread 尚未绑定 Workspace Scope，不能恢复到复用池。",
+                ))?;
+        let mut candidate = repository.agent_candidate(&thread_id)?;
+        candidate.reuse_state = "ACTIVE".to_owned();
+        let recommendation = schedule_instance(
+            scope_key,
+            vec![candidate],
+            repository.scheduling_profile(agent_id)?,
+        );
+        if recommendation.decision != "REUSE" {
+            return Err(UsageServiceError::ReuseRestoreBlocked(
+                recommendation.reason_code,
+                recommendation.message,
+            )
+            .into());
+        }
+        repository
+            .set_agent_instance_reuse_state(&thread_id, "ACTIVE", None)
+            .map_err(ApiError::from)
+    }
+
+    pub(crate) fn cleanup_agent_instances(
+        &self,
+        request: AgentThreadCleanupRequest,
+    ) -> Result<AgentThreadCleanupResponse, ApiError> {
+        let scope_key = request
+            .workspace_scope_key
+            .as_deref()
+            .map(normalize_workspace_scope_key)
+            .transpose()?;
+        let repository = self.repository()?;
+        repository.finalize_pending_retirements()?;
+        let instances = repository.list_agent_instances(
+            None,
+            scope_key.as_deref(),
+            scope_key.is_none(),
+            u32::MAX,
+            0,
+        )?;
+        let mut result = AgentThreadCleanupResponse {
+            retired_count: 0,
+            kept_count: 0,
+            running_count: 0,
+            unknown_count: 0,
+        };
+        for instance in instances {
+            if instance.reuse_state != "ACTIVE" {
+                continue;
+            }
+            if instance.status == "RUNNING" {
+                result.running_count += 1;
+                continue;
+            }
+            if matches!(instance.status.as_str(), "UNKNOWN" | "RECOVERY_REQUIRED") {
+                result.unknown_count += 1;
+                continue;
+            }
+            let retirement_reason = if instance.status == "CLOSED" {
+                Some("THREAD_CLOSED")
+            } else if let Some(agent_id) = instance.agent_id.as_deref() {
+                let Some(runtime) = repository.agent_runtime_profile(agent_id)? else {
+                    repository.set_agent_instance_reuse_state(
+                        &instance.codex_thread_id,
+                        "RETIRED",
+                        Some("AGENT_UNAVAILABLE"),
+                    )?;
+                    result.retired_count += 1;
+                    continue;
+                };
+                if instance.runtime_fingerprint.as_deref()
+                    != Some(runtime.runtime_fingerprint.as_str())
+                {
+                    Some("RUNTIME_FINGERPRINT_MISMATCH")
+                } else if instance.status == "IDLE" {
+                    let recommendation = schedule_instance(
+                        instance.workspace_scope_key.clone().unwrap_or_default(),
+                        vec![repository.agent_candidate(&instance.codex_thread_id)?],
+                        repository.scheduling_profile(agent_id)?,
+                    );
+                    matches!(
+                        recommendation.reason_code,
+                        "CONTEXT_PRESSURE" | "CACHE_HINT_PRESSURE"
+                    )
+                    .then_some(recommendation.reason_code)
+                } else {
+                    None
+                }
+            } else {
+                Some("AGENT_UNAVAILABLE")
+            };
+            if let Some(reason) = retirement_reason {
+                repository.set_agent_instance_reuse_state(
+                    &instance.codex_thread_id,
+                    "RETIRED",
+                    Some(reason),
+                )?;
+                result.retired_count += 1;
+            } else {
+                result.kept_count += 1;
+            }
+        }
+        Ok(result)
     }
 
     pub(crate) fn recommend_agent_instance(
@@ -568,6 +729,9 @@ pub(crate) struct AgentThreadProjectSummaryResponse {
     agent_count: i64,
     running_count: i64,
     recovery_required_count: i64,
+    reusable_count: i64,
+    retired_count: i64,
+    retire_pending_count: i64,
     total_tokens: i64,
     last_used_at: String,
 }
@@ -593,6 +757,28 @@ impl AgentThreadProjectListResponse {
 pub(crate) struct AgentThreadInstanceWorkspaceScopeRequest {
     thread_id: String,
     workspace_scope_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadInstanceReuseStateRequest {
+    thread_id: String,
+    reuse_state: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadCleanupRequest {
+    workspace_scope_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AgentThreadCleanupResponse {
+    retired_count: usize,
+    kept_count: usize,
+    running_count: usize,
+    unknown_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -628,6 +814,7 @@ pub(crate) struct AgentThreadInstanceRecommendation {
     context_pressure_percent: Option<i64>,
     context_pressure_limit_percent: i64,
     reuse_strategy: String,
+    effective_reuse_strategy: String,
     cache_support: String,
     cache_retention_type: String,
     cache_retention_hint_seconds: Option<i64>,
@@ -680,6 +867,7 @@ pub(crate) struct AgentRuntimeProfile {
     pub(crate) agent_key: String,
     pub(crate) agent_name: String,
     pub(crate) instruction: String,
+    pub(crate) orchestration_phase: String,
     pub(crate) sandbox_policy: String,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) model_slug: String,
@@ -697,6 +885,8 @@ pub(crate) struct AgentThreadInstanceResponse {
     parent_thread_id: Option<String>,
     workspace_scope_key: Option<String>,
     status: String,
+    reuse_state: String,
+    reuse_state_reason: Option<String>,
     input_tokens: i64,
     cached_input_tokens: i64,
     output_tokens: i64,
@@ -1090,7 +1280,8 @@ impl SqliteUsageRepository {
             "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at, task_scope_key
+                    last_model_usage_at, last_observed_at, task_scope_key,
+                    reuse_state, reuse_state_reason
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
                AND (
@@ -1121,6 +1312,9 @@ impl SqliteUsageRepository {
                     )),
                     SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END),
                     SUM(CASE WHEN status = 'RECOVERY_REQUIRED' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN status = 'IDLE' AND reuse_state = 'ACTIVE' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN reuse_state = 'RETIRED' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN reuse_state = 'RETIRE_PENDING' THEN 1 ELSE 0 END),
                     COALESCE(SUM(total_tokens), 0),
                     MAX(last_used_at)
              FROM agent_thread_instances
@@ -1135,8 +1329,11 @@ impl SqliteUsageRepository {
                     agent_count: row.get(2)?,
                     running_count: row.get(3)?,
                     recovery_required_count: row.get(4)?,
-                    total_tokens: row.get(5)?,
-                    last_used_at: row.get(6)?,
+                    reusable_count: row.get(5)?,
+                    retired_count: row.get(6)?,
+                    retire_pending_count: row.get(7)?,
+                    total_tokens: row.get(8)?,
+                    last_used_at: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1163,13 +1360,105 @@ impl SqliteUsageRepository {
                 "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at, task_scope_key
+                    last_model_usage_at, last_observed_at, task_scope_key,
+                    reuse_state, reuse_state_reason
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
                 map_agent_thread_instance,
             )
             .map_err(UsageRepositoryError::from)
+    }
+
+    fn agent_instance(
+        &self,
+        thread_id: &str,
+    ) -> Result<AgentThreadInstanceResponse, UsageRepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
+                        scope_key, status, input_tokens, cached_input_tokens, output_tokens,
+                        total_tokens, current_context_tokens, context_window, runtime_fingerprint,
+                        created_at, last_used_at, closed_at, last_model_usage_at,
+                        last_observed_at, task_scope_key, reuse_state, reuse_state_reason
+                 FROM agent_thread_instances
+                 WHERE codex_thread_id = ?1",
+                [thread_id],
+                map_agent_thread_instance,
+            )
+            .optional()?
+            .ok_or(UsageRepositoryError::AgentInstanceNotFound)
+    }
+
+    fn agent_candidate(
+        &self,
+        thread_id: &str,
+    ) -> Result<AgentThreadCandidate, UsageRepositoryError> {
+        self.connection
+            .query_row(
+                "SELECT id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
+                        scope_key, status, input_tokens, cached_input_tokens, output_tokens,
+                        total_tokens, current_context_tokens, context_window, runtime_fingerprint,
+                        created_at, last_used_at, closed_at, last_model_usage_at,
+                        last_observed_at, task_scope_key, reuse_state, reuse_state_reason,
+                        CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
+                        CASE WHEN claimed_until IS NOT NULL
+                                  AND julianday(claimed_until) > julianday('now')
+                             THEN 1 ELSE 0 END
+                 FROM agent_thread_instances
+                 WHERE codex_thread_id = ?1",
+                [thread_id],
+                |row| {
+                    let instance = map_agent_thread_instance(row)?;
+                    Ok(AgentThreadCandidate {
+                        instance_id: instance.id,
+                        thread_id: instance.codex_thread_id,
+                        status: instance.status,
+                        reuse_state: instance.reuse_state,
+                        input_tokens: instance.input_tokens,
+                        cached_input_tokens: instance.cached_input_tokens,
+                        output_tokens: instance.output_tokens,
+                        total_tokens: instance.total_tokens,
+                        current_context_tokens: instance.current_context_tokens,
+                        context_window: instance.context_window,
+                        runtime_fingerprint: instance.runtime_fingerprint,
+                        age_seconds: row.get(22)?,
+                        claimed: row.get(23)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(UsageRepositoryError::AgentInstanceNotFound)
+    }
+
+    fn set_agent_instance_reuse_state(
+        &self,
+        thread_id: &str,
+        reuse_state: &str,
+        reason: Option<&str>,
+    ) -> Result<AgentThreadInstanceResponse, UsageRepositoryError> {
+        let changed = self.connection.execute(
+            "UPDATE agent_thread_instances
+             SET reuse_state = ?2, reuse_state_reason = ?3, claimed_until = NULL
+             WHERE codex_thread_id = ?1",
+            params![thread_id, reuse_state, reason],
+        )?;
+        if changed == 0 {
+            return Err(UsageRepositoryError::AgentInstanceNotFound);
+        }
+        self.agent_instance(thread_id)
+    }
+
+    fn finalize_pending_retirements(&self) -> Result<(), UsageRepositoryError> {
+        self.connection.execute(
+            "UPDATE agent_thread_instances
+             SET reuse_state = 'RETIRED',
+                 reuse_state_reason = COALESCE(reuse_state_reason, 'USER_REQUESTED'),
+                 claimed_until = NULL
+             WHERE reuse_state = 'RETIRE_PENDING' AND status != 'RUNNING'",
+            [],
+        )?;
+        Ok(())
     }
 
     fn scope_candidates(
@@ -1189,6 +1478,7 @@ impl SqliteUsageRepository {
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
+                    reuse_state, reuse_state_reason,
                     CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                     CASE WHEN claimed_until IS NOT NULL
                               AND julianday(claimed_until) > julianday('now')
@@ -1222,8 +1512,9 @@ impl SqliteUsageRepository {
                     current_context_tokens: instance.current_context_tokens,
                     context_window: instance.context_window,
                     runtime_fingerprint: instance.runtime_fingerprint,
-                    age_seconds: row.get(20)?,
-                    claimed: row.get(21)?,
+                    reuse_state: instance.reuse_state,
+                    age_seconds: row.get(22)?,
+                    claimed: row.get(23)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1243,7 +1534,7 @@ impl SqliteUsageRepository {
                         p.cache_retention_hint_seconds, a.reasoning_policy, a.sandbox_policy,
                         a.instruction, m.id, m.model_id, p.provider_key, p.preset_id,
                         p.base_url, p.protocol, p.custom_headers_json,
-                        m.default_reasoning, m.reasoning_supported
+                        m.default_reasoning, m.reasoning_supported, a.orchestration_phase
                  FROM agents a
                  LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
                  LEFT JOIN models m ON m.id = b.model_id
@@ -1269,6 +1560,7 @@ impl SqliteUsageRepository {
                         row.get::<_, Option<String>>(14)?,
                         row.get::<_, Option<String>>(15)?,
                         row.get::<_, Option<i64>>(16)?.map(|value| value != 0),
+                        row.get::<_, Option<String>>(17)?,
                     ))
                 },
             )
@@ -1291,6 +1583,7 @@ impl SqliteUsageRepository {
             custom_headers_json,
             model_default_reasoning,
             reasoning_supported,
+            orchestration_phase,
         )) = profile
         else {
             return Ok(AgentSchedulingProfile::default());
@@ -1312,6 +1605,7 @@ impl SqliteUsageRepository {
         );
         Ok(AgentSchedulingProfile {
             reuse_strategy,
+            orchestration_phase,
             agent_cache_retention_override_seconds,
             cache_support,
             cache_retention_type,
@@ -1339,8 +1633,8 @@ impl SqliteUsageRepository {
         let profile = self
             .connection
             .query_row(
-                "SELECT a.id, a.agent_key, a.name, a.instruction, a.sandbox_policy,
-                        a.reasoning_policy, m.id, m.model_id, p.provider_key, p.preset_id,
+                "SELECT a.id, a.agent_key, a.name, a.instruction, a.orchestration_phase,
+                        a.sandbox_policy, a.reasoning_policy, m.id, m.model_id, p.provider_key, p.preset_id,
                         p.base_url, p.protocol, p.custom_headers_json,
                         m.default_reasoning, m.reasoning_supported
                  FROM active_agent_bindings active
@@ -1362,12 +1656,13 @@ impl SqliteUsageRepository {
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
                         row.get::<_, String>(8)?,
-                        row.get::<_, Option<String>>(9)?,
-                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
                         row.get::<_, String>(11)?,
-                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, String>(12)?,
                         row.get::<_, Option<String>>(13)?,
-                        row.get::<_, Option<i64>>(14)?.map(|value| value != 0),
+                        row.get::<_, Option<String>>(14)?,
+                        row.get::<_, Option<i64>>(15)?.map(|value| value != 0),
                     ))
                 },
             )
@@ -1377,6 +1672,7 @@ impl SqliteUsageRepository {
             agent_key,
             agent_name,
             instruction,
+            orchestration_phase,
             sandbox_policy,
             reasoning_policy,
             model_id,
@@ -1427,6 +1723,7 @@ impl SqliteUsageRepository {
             agent_key,
             agent_name,
             instruction,
+            orchestration_phase,
             sandbox_policy,
             reasoning_effort,
             model_slug,
@@ -1448,6 +1745,11 @@ impl SqliteUsageRepository {
         sandbox_policy: &str,
         instruction: &str,
     ) -> Result<String, UsageRepositoryError> {
+        let orchestration_phase = self.connection.query_row(
+            "SELECT COALESCE(orchestration_phase, '') FROM agents WHERE id = ?1",
+            [agent_id],
+            |row| row.get::<_, String>(0),
+        )?;
         Ok(shared_runtime_fingerprint(&[
             ("provider_key", vec![provider_key.to_owned()]),
             (
@@ -1463,9 +1765,13 @@ impl SqliteUsageRepository {
             ("model", vec![model_slug.to_owned()]),
             ("reasoning", vec![reasoning_policy.to_owned()]),
             ("sandbox", vec![sandbox_policy.to_owned()]),
+            ("orchestration_phase", vec![orchestration_phase.clone()]),
             (
                 "instruction",
-                vec![render_delegated_agent_instructions(instruction)],
+                vec![render_delegated_agent_instructions_for_phase(
+                    instruction,
+                    Some(&orchestration_phase),
+                )],
             ),
             (
                 "required_capabilities",
@@ -1480,6 +1786,31 @@ impl SqliteUsageRepository {
                 fingerprint_values(
                     &self.connection,
                     "SELECT capability FROM agent_preferred_capabilities WHERE agent_id = ?1",
+                    agent_id,
+                )?,
+            ),
+            (
+                "skills",
+                skill_fingerprint_values(fingerprint_values(
+                    &self.connection,
+                    "SELECT skill_key FROM agent_skill_bindings WHERE agent_id = ?1",
+                    agent_id,
+                )?),
+            ),
+            (
+                "disabled_mcp_servers",
+                fingerprint_values(
+                    &self.connection,
+                    "SELECT server_id FROM agent_disabled_mcp_servers WHERE agent_id = ?1",
+                    agent_id,
+                )?,
+            ),
+            (
+                "mcp_tool_policies",
+                fingerprint_values(
+                    &self.connection,
+                    "SELECT server_id || '=' || mode || '=' || tool_name
+                     FROM agent_mcp_tool_policies WHERE agent_id = ?1",
                     agent_id,
                 )?,
             ),
@@ -1578,6 +1909,15 @@ impl SqliteUsageRepository {
         let changed = self.connection.execute(
             "UPDATE agent_thread_instances
              SET status = ?2,
+                 reuse_state = CASE
+                     WHEN ?2 = 'CLOSED' THEN 'RETIRED'
+                     WHEN reuse_state = 'RETIRE_PENDING' AND ?2 != 'RUNNING' THEN 'RETIRED'
+                     ELSE reuse_state
+                 END,
+                 reuse_state_reason = CASE
+                     WHEN ?2 = 'CLOSED' THEN 'THREAD_CLOSED'
+                     ELSE reuse_state_reason
+                 END,
                  last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE codex_thread_id = ?1",
@@ -1597,6 +1937,15 @@ impl SqliteUsageRepository {
         self.connection.execute(
             "UPDATE agent_thread_instances
              SET status = ?2,
+                 reuse_state = CASE
+                     WHEN ?2 = 'CLOSED' THEN 'RETIRED'
+                     WHEN reuse_state = 'RETIRE_PENDING' AND ?2 != 'RUNNING' THEN 'RETIRED'
+                     ELSE reuse_state
+                 END,
+                 reuse_state_reason = CASE
+                     WHEN ?2 = 'CLOSED' THEN 'THREAD_CLOSED'
+                     ELSE reuse_state_reason
+                 END,
                  last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
              WHERE codex_thread_id = ?1",
@@ -1618,6 +1967,7 @@ impl SqliteUsageRepository {
              SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?3)
              WHERE id = ?1
                AND status = 'IDLE'
+               AND reuse_state = 'ACTIVE'
                AND runtime_fingerprint = ?2
                AND (
                    claimed_until IS NULL
@@ -1931,11 +2281,13 @@ fn upsert_native_agent_instance(
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at
+                    last_model_usage_at, last_observed_at, reuse_state, reuse_state_reason
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13,
             CASE WHEN ?7 = 'CLOSED' THEN ?13 ELSE NULL END,
-            NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            CASE WHEN ?7 = 'CLOSED' THEN 'RETIRED' ELSE 'ACTIVE' END,
+            CASE WHEN ?7 = 'CLOSED' THEN 'THREAD_CLOSED' ELSE NULL END
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = excluded.agent_id,
@@ -1943,6 +2295,16 @@ fn upsert_native_agent_instance(
             parent_thread_id = excluded.parent_thread_id,
             scope_key = COALESCE(agent_thread_instances.scope_key, excluded.scope_key),
             status = excluded.status,
+            reuse_state = CASE
+                WHEN excluded.status = 'CLOSED' THEN 'RETIRED'
+                WHEN agent_thread_instances.reuse_state = 'RETIRE_PENDING'
+                     AND excluded.status != 'RUNNING' THEN 'RETIRED'
+                ELSE agent_thread_instances.reuse_state
+            END,
+            reuse_state_reason = CASE
+                WHEN excluded.status = 'CLOSED' THEN 'THREAD_CLOSED'
+                ELSE agent_thread_instances.reuse_state_reason
+            END,
             total_tokens = MAX(agent_thread_instances.total_tokens, excluded.total_tokens),
             current_context_tokens = excluded.current_context_tokens,
             context_window = excluded.context_window,
@@ -2010,6 +2372,8 @@ fn map_agent_thread_instance(
         parent_thread_id: row.get(4)?,
         workspace_scope_key: row.get(5)?,
         status: row.get(6)?,
+        reuse_state: row.get(20)?,
+        reuse_state_reason: row.get(21)?,
         input_tokens: row.get(7)?,
         cached_input_tokens: row.get(8)?,
         output_tokens: row.get(9)?,
@@ -2249,6 +2613,11 @@ fn sync_agent_thread_instance(
                 excluded.parent_thread_id
             ),
             status = excluded.status,
+            reuse_state = CASE
+                WHEN agent_thread_instances.reuse_state = 'RETIRE_PENDING'
+                     AND excluded.status != 'RUNNING' THEN 'RETIRED'
+                ELSE agent_thread_instances.reuse_state
+            END,
             input_tokens = MAX(agent_thread_instances.input_tokens, excluded.input_tokens),
             cached_input_tokens = MAX(
                 agent_thread_instances.cached_input_tokens,
@@ -2382,6 +2751,7 @@ fn recommend_instance(
         context_pressure_percent: recommendation.context_pressure_percent,
         context_pressure_limit_percent: recommendation.context_pressure_limit_percent,
         reuse_strategy: recommendation.reuse_strategy,
+        effective_reuse_strategy: recommendation.effective_reuse_strategy,
         cache_support: recommendation.cache_support,
         cache_retention_type: recommendation.cache_retention_type,
         cache_retention_hint_seconds: recommendation.cache_retention_hint_seconds,
@@ -2414,6 +2784,10 @@ impl From<UsageServiceError> for ApiError {
                 "该 Agent 当前未启用，或其 Provider / Model 不可运行。",
                 false,
             ),
+            UsageServiceError::ReuseRestoreBlocked(reason_code, message) => {
+                details = Some(BTreeMap::from([("reasonCode", reason_code.to_owned())]));
+                ("AGENT_THREAD_RESTORE_BLOCKED", message, false)
+            }
             UsageServiceError::Repository(UsageRepositoryError::AgentInstanceNotFound) => (
                 "AGENT_THREAD_INSTANCE_NOT_FOUND",
                 "未找到指定的子 Agent Thread 实例。",
@@ -2452,6 +2826,7 @@ pub(crate) enum UsageServiceError {
     ThreadIdentityConflict,
     DecisionChanged,
     AgentRuntimeUnavailable,
+    ReuseRestoreBlocked(&'static str, &'static str),
     Repository(UsageRepositoryError),
     DatabaseUnavailable,
 }
@@ -2463,6 +2838,9 @@ impl fmt::Display for UsageServiceError {
             Self::ThreadIdentityConflict => formatter.write_str("usage thread identity conflict"),
             Self::DecisionChanged => formatter.write_str("agent thread decision changed"),
             Self::AgentRuntimeUnavailable => formatter.write_str("agent runtime unavailable"),
+            Self::ReuseRestoreBlocked(reason_code, _) => {
+                write!(formatter, "agent thread restore blocked: {reason_code}")
+            }
             Self::Repository(error) => write!(formatter, "usage repository failed: {error}"),
             Self::DatabaseUnavailable => formatter.write_str("database unavailable"),
         }
@@ -3173,6 +3551,47 @@ mod tests {
 
         repository
             .connection
+            .execute(
+                "INSERT INTO agent_skill_bindings VALUES ('agent-1', 'caveman')",
+                [],
+            )
+            .unwrap();
+        let skills_changed = fingerprint();
+        assert_ne!(model_capabilities_changed, skills_changed);
+
+        repository
+            .connection
+            .execute(
+                "INSERT INTO agent_disabled_mcp_servers VALUES ('agent-1', 'browser')",
+                [],
+            )
+            .unwrap();
+        let mcp_policy_changed = fingerprint();
+        assert_ne!(skills_changed, mcp_policy_changed);
+
+        repository
+            .connection
+            .execute(
+                "INSERT INTO agent_mcp_tool_policies
+                 VALUES ('agent-1', 'github', 'DENY', 'write_file')",
+                [],
+            )
+            .unwrap();
+        let mcp_tool_policy_changed = fingerprint();
+        assert_ne!(mcp_policy_changed, mcp_tool_policy_changed);
+
+        repository
+            .connection
+            .execute(
+                "UPDATE agents SET orchestration_phase = 'REVIEW' WHERE id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        let phase_changed = fingerprint();
+        assert_ne!(mcp_tool_policy_changed, phase_changed);
+
+        repository
+            .connection
             .execute_batch(
                 "DELETE FROM agent_required_capabilities;
                  DELETE FROM agent_preferred_capabilities;
@@ -3477,6 +3896,36 @@ mod tests {
     }
 
     #[test]
+    fn scheduling_profile_reads_phase_for_role_aware_auto_reuse() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+
+        let execution = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap();
+        assert_eq!(execution.orchestration_phase.as_deref(), Some("EXECUTION"));
+        assert_eq!(effective_reuse_strategy(&execution), "AUTO");
+
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE agents SET orchestration_phase = 'DISCOVERY' WHERE id = 'agent-1'",
+                [],
+            )
+            .unwrap();
+        let discovery = service
+            .repository()
+            .unwrap()
+            .scheduling_profile("agent-1")
+            .unwrap();
+        assert_eq!(effective_reuse_strategy(&discovery), "HOT");
+    }
+
+    #[test]
     fn attribution_is_backfilled_once_and_can_be_queried() {
         let service = UsageService::in_memory();
         let mut initial = snapshot(10, "LIVE");
@@ -3628,6 +4077,130 @@ mod tests {
             .unwrap();
         assert_eq!(unscoped.items.len(), 1);
         assert_eq!(unscoped.items[0].codex_thread_id, "instance-unscoped");
+    }
+
+    #[test]
+    fn running_retirement_finishes_without_closing_or_deleting_thread() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "LIVE")).unwrap();
+
+        let pending = service
+            .set_agent_instance_reuse_state(AgentThreadInstanceReuseStateRequest {
+                thread_id: "thread-child-1".to_owned(),
+                reuse_state: "RETIRED".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(pending.status, "RUNNING");
+        assert_eq!(pending.reuse_state, "RETIRE_PENDING");
+
+        service.upsert_snapshot(snapshot(120, "FINAL")).unwrap();
+        let retired = service
+            .repository()
+            .unwrap()
+            .agent_instance("thread-child-1")
+            .unwrap();
+        assert_eq!(retired.status, "IDLE");
+        assert_eq!(retired.reuse_state, "RETIRED");
+        assert_eq!(retired.total_tokens, 120);
+    }
+
+    #[test]
+    fn healthy_retired_thread_can_be_restored_and_agent_disable_retires_it_again() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        let repository = service.repository().unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO active_agent_bindings (role_key, agent_id, created_at, updated_at)
+                 VALUES ('executor', 'agent-1', '2026-08-11T10:00:00Z', '2026-08-11T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        let fingerprint = repository
+            .scheduling_profile("agent-1")
+            .unwrap()
+            .runtime_fingerprint
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET scope_key = 'c:/workspace/project', runtime_fingerprint = ?1
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [&fingerprint],
+            )
+            .unwrap();
+        drop(repository);
+
+        service
+            .set_agent_instance_reuse_state(AgentThreadInstanceReuseStateRequest {
+                thread_id: "thread-child-1".to_owned(),
+                reuse_state: "RETIRED".to_owned(),
+            })
+            .unwrap();
+        let restored = service
+            .set_agent_instance_reuse_state(AgentThreadInstanceReuseStateRequest {
+                thread_id: "thread-child-1".to_owned(),
+                reuse_state: "ACTIVE".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(restored.reuse_state, "ACTIVE");
+
+        let repository = service.repository().unwrap();
+        repository
+            .connection
+            .execute("UPDATE agents SET enabled = 0 WHERE id = 'agent-1'", [])
+            .unwrap();
+        assert_eq!(
+            repository
+                .agent_instance("thread-child-1")
+                .unwrap()
+                .reuse_state,
+            "RETIRED"
+        );
+    }
+
+    #[test]
+    fn cleanup_retires_runtime_mismatch_but_keeps_usage_history() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        let repository = service.repository().unwrap();
+        repository
+            .connection
+            .execute(
+                "INSERT INTO active_agent_bindings (role_key, agent_id, created_at, updated_at)
+                 VALUES ('executor', 'agent-1', '2026-08-11T10:00:00Z', '2026-08-11T10:00:00Z')",
+                [],
+            )
+            .unwrap();
+        repository
+            .connection
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET scope_key = 'c:/workspace/project', runtime_fingerprint = 'stale'
+                 WHERE codex_thread_id = 'thread-child-1'",
+                [],
+            )
+            .unwrap();
+        drop(repository);
+
+        let result = service
+            .cleanup_agent_instances(AgentThreadCleanupRequest {
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+        assert_eq!(result.retired_count, 1);
+        let instance = service
+            .repository()
+            .unwrap()
+            .agent_instance("thread-child-1")
+            .unwrap();
+        assert_eq!(instance.reuse_state, "RETIRED");
+        assert_eq!(instance.total_tokens, 100);
     }
 
     fn seed_agent(service: &UsageService) {
