@@ -149,7 +149,7 @@ export function ProjectMonitorView({
 }: MonitorViewProps) {
   const selectedProject = projects.find((project) => projectKey(project) === selectedKey) ?? null;
   const visibleInstances = useMemo(() => instances
-    .filter((instance) => instance.status !== "CLOSED")
+    .filter((instance) => instance.status !== "CLOSED" && instance.reuseState !== "RETIRED")
     .sort((left, right) => {
       const priority = { RUNNING: 0, RECOVERY_REQUIRED: 1, IDLE: 2, UNKNOWN: 3, CLOSED: 4 };
       return priority[left.status] - priority[right.status]
@@ -158,7 +158,9 @@ export function ProjectMonitorView({
   const activeTokens = visibleInstances
     .filter((instance) => instance.status === "RUNNING")
     .reduce((total, instance) => total + instance.totalTokens, 0);
-  const hasIdle = visibleInstances.some((instance) => instance.status === "IDLE");
+  const hasIdle = visibleInstances.some((instance) => (
+    instance.status === "IDLE" && instance.reuseState === "ACTIVE"
+  ));
   const status = !selectedProject
     ? { label: "请选择项目", tone: "muted" }
     : !selectedProject.workspaceScopeKey
@@ -268,6 +270,14 @@ export function ProjectMonitorView({
                 <dd>{formatTokens(activeTokens)}</dd>
               </div>
             </dl>
+
+            {selectedProject && (
+              <div className="project-monitor-pool-summary">
+                <span>可复用 {selectedProject.reusableCount}</span>
+                <span>待处理 {selectedProject.recoveryRequiredCount + selectedProject.retirePendingCount}</span>
+                {selectedProject.retiredCount > 0 && <span>已退休 {selectedProject.retiredCount}</span>}
+              </div>
+            )}
 
             <div className="project-monitor-thread-list" aria-label="最近活跃子 Agent Thread">
               {loading && !selectedProject && (

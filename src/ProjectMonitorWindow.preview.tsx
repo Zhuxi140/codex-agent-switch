@@ -13,6 +13,9 @@ const project: AgentThreadProjectSummaryResponse = {
   agentCount: 2,
   runningCount: 1,
   recoveryRequiredCount: 0,
+  reusableCount: 2,
+  retiredCount: 1,
+  retirePendingCount: 0,
   totalTokens: 184_220,
   lastUsedAt: "2026-08-23T12:00:00Z",
 };
@@ -25,6 +28,8 @@ const instance: AgentThreadInstanceResponse = {
   parentThreadId: "019ffb15-0000-7000-8000-123456789abc",
   workspaceScopeKey: project.workspaceScopeKey,
   status: "RUNNING",
+  reuseState: "ACTIVE",
+  reuseStateReason: null,
   inputTokens: 0,
   cachedInputTokens: 0,
   outputTokens: 0,

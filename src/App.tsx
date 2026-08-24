@@ -13,6 +13,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   addProjectExclusion,
   addModel,
+  cleanupAgentThreadInstances,
   createAgent,
   createProvider,
   deleteAgent,
@@ -33,6 +34,7 @@ import {
   listAgentThreadInstances,
   listAgentThreadProjects,
   listAgents,
+  listCodexMcpServers,
   listModels,
   listProviders,
   listProjectExclusions,
@@ -50,6 +52,7 @@ import {
   startUsageMonitor,
   stopUsageMonitor,
   setAgentThreadInstanceWorkspaceScope,
+  setAgentThreadInstanceReuseState,
   testModelConnection,
   switchRuntimeMode,
   syncNativeSubagents,
@@ -59,8 +62,11 @@ import {
   updateProvider,
   type Appearance,
   type AgentDetailResponse,
+  type AgentMcpToolPolicy,
+  type AgentMcpToolPolicyMode,
   type AgentPresetResponse,
   type AgentReuseStrategy,
+  type AgentSkillKey,
   type AgentSummary,
   type AgentThreadInstanceResponse,
   type AgentThreadInstanceRecommendation,
@@ -68,6 +74,7 @@ import {
   type AgentThreadProjectSummaryResponse,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
+  type CodexMcpServerResponse,
   type ConfigurationStatusResponse,
   type ConfigurationConflictResponse,
   type DiagnosticsResponse,
@@ -1821,6 +1828,9 @@ function AgentsPage() {
   const [activeAgentIds, setActiveAgentIds] = useState<string[]>([]);
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [presets, setPresets] = useState<AgentPresetResponse[]>([]);
+  const [mcpServers, setMcpServers] = useState<CodexMcpServerResponse[]>([]);
+  const [mcpDiscoveryLoading, setMcpDiscoveryLoading] = useState(true);
+  const [mcpDiscoveryError, setMcpDiscoveryError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1851,9 +1861,23 @@ function AgentsPage() {
     }
   }, []);
 
+  const loadMcpServers = useCallback(async () => {
+    setMcpDiscoveryLoading(true);
+    setMcpDiscoveryError(null);
+    try {
+      setMcpServers(await listCodexMcpServers());
+    } catch (reason: unknown) {
+      setMcpServers([]);
+      setMcpDiscoveryError(errorMessage(reason));
+    } finally {
+      setMcpDiscoveryLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadMcpServers();
+  }, [load, loadMcpServers]);
 
   function changed(message: string) {
     setSuccess(message);
@@ -1888,6 +1912,9 @@ function AgentsPage() {
 
       {creating && (
         <CreateAgentPanel
+          mcpDiscoveryError={mcpDiscoveryError}
+          mcpDiscoveryLoading={mcpDiscoveryLoading}
+          mcpServers={mcpServers}
           models={models}
           onCancel={() => setCreating(false)}
           onCreated={() => {
@@ -1895,6 +1922,7 @@ function AgentsPage() {
             changed("Agent 已创建；绑定与 Capability 要求已原子保存。");
           }}
           presets={presets}
+          refreshMcpServers={loadMcpServers}
         />
       )}
 
@@ -1902,6 +1930,9 @@ function AgentsPage() {
         <AgentDetailPanel
           agentId={selectedId}
           isActive={activeAgentIds.includes(selectedId)}
+          mcpDiscoveryError={mcpDiscoveryError}
+          mcpDiscoveryLoading={mcpDiscoveryLoading}
+          mcpServers={mcpServers}
           models={models}
           onBack={() => setSelectedId(null)}
           onChanged={changed}
@@ -1909,6 +1940,7 @@ function AgentsPage() {
             setSelectedId(null);
             changed("Agent 已删除。");
           }}
+          refreshMcpServers={loadMcpServers}
         />
       )}
 
@@ -2387,7 +2419,7 @@ function AgentThreadProjectOverview({
         <div>
           <span className="eyebrow">Subagent Threads</span>
           <h2 id="agent-instance-title">子 Agent 项目</h2>
-          <p>按 Workspace Scope 汇总子 Agent Thread；项目概览每 5 秒同步一次。</p>
+          <p>按 Workspace Scope 汇总子 Agent Thread；应用级观察服务每 3 秒同步一次。</p>
         </div>
         <div className="runtime-monitor-actions">
           {nativeSync && (
@@ -2487,8 +2519,13 @@ interface AgentThreadGroup {
   totalTokens: number;
   runningCount: number;
   recoveryRequiredCount: number;
+  reusableCount: number;
+  retiredCount: number;
+  retirePendingCount: number;
   lastUsedAt: string;
 }
+
+type AgentThreadFilter = "ALL" | "REUSABLE" | "RUNNING" | "ATTENTION" | "RETIRED";
 
 function AgentThreadProjectDetail({
   project,
@@ -2507,6 +2544,10 @@ function AgentThreadProjectDetail({
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [savingScope, setSavingScope] = useState<string | null>(null);
   const [checkingRecommendation, setCheckingRecommendation] = useState<string | null>(null);
+  const [managingReuseState, setManagingReuseState] = useState<string | null>(null);
+  const [filter, setFilter] = useState<AgentThreadFilter>("ALL");
+  const [cleanupMessage, setCleanupMessage] = useState<string | null>(null);
+  const [cleaning, setCleaning] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2591,7 +2632,60 @@ function AgentThreadProjectDetail({
     }
   }
 
-  const groups = groupAgentThreadInstances(instances);
+  async function changeReuseState(instance: AgentThreadInstanceResponse) {
+    const activate = instance.reuseState !== "ACTIVE";
+    if (!activate && !window.confirm(
+      instance.status === "RUNNING"
+        ? "该 Thread 正在运行。确认后会在当前 Turn 结束时移出 CAS 复用池，不会中断任务或删除历史。"
+        : "确认将该 Thread 移出 CAS 复用池？Codex Thread、rollout 与 Token 历史都会保留。",
+    )) return;
+    setManagingReuseState(instance.id);
+    setError(null);
+    setCleanupMessage(null);
+    try {
+      const updated = await setAgentThreadInstanceReuseState(
+        instance.codexThreadId,
+        activate ? "ACTIVE" : "RETIRED",
+      );
+      setInstances((current) => current.map((item) => item.id === updated.id ? updated : item));
+      setRecommendations((current) => {
+        const next = { ...current };
+        delete next[instance.id];
+        return next;
+      });
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setManagingReuseState(null);
+    }
+  }
+
+  async function cleanupReusePool() {
+    if (!window.confirm(
+      "整理只会移出已关闭、Agent 不可用、运行时配置失配或 Context 已耗尽的 Thread；运行中、待恢复和状态未知的 Thread 不会被处理。继续吗？",
+    )) return;
+    setCleaning(true);
+    setError(null);
+    setCleanupMessage(null);
+    try {
+      const result = await cleanupAgentThreadInstances(project.workspaceScopeKey);
+      setCleanupMessage(
+        `已移出 ${result.retiredCount} 个；保留 ${result.keptCount} 个；跳过运行中 ${result.runningCount} 个、待核验 ${result.unknownCount} 个。`,
+      );
+      await load();
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setCleaning(false);
+    }
+  }
+
+  const groups = groupAgentThreadInstances(instances)
+    .map((group) => ({
+      ...group,
+      instances: group.instances.filter((instance) => threadMatchesFilter(instance, filter)),
+    }))
+    .filter((group) => group.instances.length > 0);
 
   return (
     <section className="agent-instance-card" aria-labelledby="agent-instance-title">
@@ -2620,6 +2714,14 @@ function AgentThreadProjectDetail({
             />
           )}
           <button className="secondary-button" onClick={onBack} type="button">返回项目</button>
+          <button
+            className="secondary-button"
+            disabled={cleaning || loading}
+            onClick={() => void cleanupReusePool()}
+            type="button"
+          >
+            {cleaning ? "整理中…" : "整理不可复用 Thread"}
+          </button>
           <IconButton
             disabled={loading}
             icon="refresh"
@@ -2631,6 +2733,22 @@ function AgentThreadProjectDetail({
       </header>
 
       {error && <div className="inline-error" role="alert">{error}</div>}
+      {cleanupMessage && <div className="inline-success" role="status">{cleanupMessage}</div>}
+      {instances.length > 0 && (
+        <div className="agent-thread-filter-row">
+          <label>
+            <span>Thread 筛选</span>
+            <select value={filter} onChange={(event) => setFilter(event.target.value as AgentThreadFilter)}>
+              <option value="ALL">全部（{instances.length}）</option>
+              <option value="REUSABLE">可复用（{instances.filter((item) => item.reuseState === "ACTIVE" && item.status === "IDLE").length}）</option>
+              <option value="RUNNING">运行中（{instances.filter((item) => item.status === "RUNNING").length}）</option>
+              <option value="ATTENTION">需要处理（{instances.filter((item) => matchesAttention(item)).length}）</option>
+              <option value="RETIRED">已退休（{instances.filter((item) => item.reuseState === "RETIRED").length}）</option>
+            </select>
+          </label>
+          <small>退休只影响 CAS 复用资格，不删除 Codex Thread 或 Token 历史。</small>
+        </div>
+      )}
       {nativeSync && (
         <span
           className={nativeSync.capability === "SUPPORTED"
@@ -2650,6 +2768,9 @@ function AgentThreadProjectDetail({
       {!loading && !error && instances.length === 0 && (
         <div className="usage-empty">该项目下暂无子 Agent Thread。</div>
       )}
+      {!loading && !error && instances.length > 0 && groups.length === 0 && (
+        <div className="usage-empty">当前筛选条件下没有 Thread。</div>
+      )}
       {!error && instances.length > 0 && (
         <div className="agent-project-agent-list">
           {groups.map((group) => (
@@ -2667,6 +2788,9 @@ function AgentThreadProjectDetail({
                 <span className="agent-project-agent-summary">
                   {group.runningCount > 0 && <em>{group.runningCount} 运行中</em>}
                   {group.recoveryRequiredCount > 0 && <em>{group.recoveryRequiredCount} 待恢复</em>}
+                  {group.reusableCount > 0 && <em>{group.reusableCount} 可复用</em>}
+                  {group.retirePendingCount > 0 && <em>{group.retirePendingCount} 完成后退休</em>}
+                  {group.retiredCount > 0 && <em>{group.retiredCount} 已退休</em>}
                   <strong>{formatTokenCount(group.totalTokens)} Tokens</strong>
                   <span aria-hidden="true">
                     <UiIcon name={expandedAgent === group.key ? "chevron-up" : "chevron-down"} />
@@ -2688,6 +2812,12 @@ function AgentThreadProjectDetail({
                             description={agentInstanceStatusDescription(instance.status)}
                             icon={instance.status === "IDLE" ? "check" : instance.status === "RUNNING" ? "clock" : instance.status === "CLOSED" ? "x-circle" : "alert"}
                             label={agentInstanceStatusLabel(instance.status)}
+                          />
+                          <StatusBadge
+                            className={`agent-reuse-state ${instance.reuseState.toLowerCase()}`}
+                            description={agentReuseStateDescription(instance)}
+                            icon={instance.reuseState === "ACTIVE" ? "threads" : instance.reuseState === "RETIRE_PENDING" ? "clock" : "x-circle"}
+                            label={agentReuseStateLabel(instance.reuseState)}
                           />
                         </span>
                         <span>
@@ -2754,8 +2884,20 @@ function AgentThreadProjectDetail({
                             <button className="ghost-button" disabled={savingScope === instance.id} onClick={() => void saveWorkspaceScope(instance)} type="button">
                               {savingScope === instance.id ? "保存中…" : "保存 Scope"}
                             </button>
-                            <button className="ghost-button" disabled={checkingRecommendation === instance.id} onClick={() => void checkRecommendation(instance)} type="button">
+                            <button className="ghost-button" disabled={checkingRecommendation === instance.id || instance.reuseState !== "ACTIVE"} onClick={() => void checkRecommendation(instance)} type="button">
                               {checkingRecommendation === instance.id ? "评估中…" : "评估复用"}
+                            </button>
+                            <button
+                              className="ghost-button"
+                              disabled={managingReuseState === instance.id}
+                              onClick={() => void changeReuseState(instance)}
+                              type="button"
+                            >
+                              {managingReuseState === instance.id
+                                ? "处理中…"
+                                : instance.reuseState === "ACTIVE"
+                                  ? instance.status === "RUNNING" ? "完成后退休" : "移出复用池"
+                                  : instance.reuseState === "RETIRE_PENDING" ? "取消待退休" : "恢复到复用池"}
                             </button>
                           </div>
                           {recommendations[instance.id] && (
@@ -2768,6 +2910,11 @@ function AgentThreadProjectDetail({
                                 {recommendations[instance.id].reasonCode}
                                 {" · "}Context {recommendations[instance.id].contextPressurePercent ?? "—"}
                                 /{recommendations[instance.id].contextPressureLimitPercent}%
+                                {" · "}Reuse {recommendations[instance.id].reuseStrategy}
+                                {recommendations[instance.id].reuseStrategy
+                                  !== recommendations[instance.id].effectiveReuseStrategy
+                                  ? `→${recommendations[instance.id].effectiveReuseStrategy}`
+                                  : ""}
                                 {" · "}Cache {recommendations[instance.id].cacheHint}
                               </span>
                               <InfoTip label="该结果基于当前 CAS 数据的预览；实际委派前 cas-helper 会重新读取 Codex 原生状态并按租约重新决策，结果可能变化。" />
@@ -2815,12 +2962,18 @@ function groupAgentThreadInstances(instances: AgentThreadInstanceResponse[]): Ag
       totalTokens: 0,
       runningCount: 0,
       recoveryRequiredCount: 0,
+      reusableCount: 0,
+      retiredCount: 0,
+      retirePendingCount: 0,
       lastUsedAt: instance.lastUsedAt,
     };
     group.instances.push(instance);
     group.totalTokens += instance.totalTokens;
     group.runningCount += instance.status === "RUNNING" ? 1 : 0;
     group.recoveryRequiredCount += instance.status === "RECOVERY_REQUIRED" ? 1 : 0;
+    group.reusableCount += instance.status === "IDLE" && instance.reuseState === "ACTIVE" ? 1 : 0;
+    group.retiredCount += instance.reuseState === "RETIRED" ? 1 : 0;
+    group.retirePendingCount += instance.reuseState === "RETIRE_PENDING" ? 1 : 0;
     if (instance.lastUsedAt > group.lastUsedAt) group.lastUsedAt = instance.lastUsedAt;
     groups.set(key, group);
   }
@@ -3119,6 +3272,42 @@ function agentInstanceStatusDescription(status: AgentThreadInstanceStatus): stri
   }[status];
 }
 
+function agentReuseStateLabel(state: AgentThreadInstanceResponse["reuseState"]): string {
+  return {
+    ACTIVE: "复用池内",
+    RETIRE_PENDING: "完成后退休",
+    RETIRED: "已退休",
+  }[state];
+}
+
+function agentReuseStateDescription(instance: AgentThreadInstanceResponse): string {
+  const reason = instance.reuseStateReason
+    ? `\n原因：${instance.reuseStateReason}`
+    : "";
+  return {
+    ACTIVE: `CAS 调度器允许在其他约束全部满足时复用该 Thread。${reason}`,
+    RETIRE_PENDING: `当前任务不会被中断；Turn 结束后该 Thread 将退出 CAS 复用池。${reason}`,
+    RETIRED: `该 Thread 不再参与 CAS 调度，但 Codex Thread、rollout 和 Token 历史仍保留。${reason}`,
+  }[instance.reuseState];
+}
+
+function matchesAttention(instance: AgentThreadInstanceResponse): boolean {
+  return instance.reuseState === "RETIRE_PENDING"
+    || instance.status === "RECOVERY_REQUIRED"
+    || instance.status === "UNKNOWN";
+}
+
+function threadMatchesFilter(
+  instance: AgentThreadInstanceResponse,
+  filter: AgentThreadFilter,
+): boolean {
+  if (filter === "ALL") return true;
+  if (filter === "REUSABLE") return instance.reuseState === "ACTIVE" && instance.status === "IDLE";
+  if (filter === "RUNNING") return instance.status === "RUNNING";
+  if (filter === "ATTENTION") return matchesAttention(instance);
+  return instance.reuseState === "RETIRED";
+}
+
 function formatUsageDate(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
@@ -3155,16 +3344,30 @@ function shortThreadId(value: string): string {
   return value.length > 16 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
 }
 
+type AgentMcpToolPolicyDraft = {
+  serverId: string;
+  mode: AgentMcpToolPolicyMode;
+  toolNamesText: string;
+};
+
 function CreateAgentPanel({
+  mcpDiscoveryError,
+  mcpDiscoveryLoading,
+  mcpServers,
   models,
   onCancel,
   onCreated,
   presets,
+  refreshMcpServers,
 }: {
+  mcpDiscoveryError: string | null;
+  mcpDiscoveryLoading: boolean;
+  mcpServers: CodexMcpServerResponse[];
   models: ModelSummary[];
   onCancel: () => void;
   onCreated: () => void;
   presets: AgentPresetResponse[];
+  refreshMcpServers: () => Promise<void>;
 }) {
   const initial = presets[0];
   const [templateKey, setTemplateKey] = useState(initial?.key ?? "");
@@ -3185,6 +3388,12 @@ function CreateAgentPanel({
   const [reuseStrategy, setReuseStrategy] = useState<AgentReuseStrategy>("AUTO");
   const [cacheRetentionOverrideSeconds, setCacheRetentionOverrideSeconds] =
     useState<number | null>(null);
+  const [skillKeys, setSkillKeys] = useState<AgentSkillKey[]>(
+    initial?.defaultSkillKeys ?? [],
+  );
+  const [disabledMcpServerIdsText, setDisabledMcpServerIdsText] = useState("");
+  const [mcpToolPolicyDrafts, setMcpToolPolicyDrafts] =
+    useState<AgentMcpToolPolicyDraft[]>([]);
   const [modelId, setModelId] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -3203,6 +3412,9 @@ function CreateAgentPanel({
     setReasoningPolicy(preset?.defaultReasoningPolicy ?? "MODEL_DEFAULT");
     setReuseStrategy("AUTO");
     setCacheRetentionOverrideSeconds(null);
+    setSkillKeys(preset?.defaultSkillKeys ?? []);
+    setDisabledMcpServerIdsText("");
+    setMcpToolPolicyDrafts([]);
     setError(null);
     setInvalidField(null);
   }
@@ -3219,6 +3431,8 @@ function CreateAgentPanel({
       instructionRequired: !templateKey,
       roleKey,
       cacheRetentionOverrideSeconds,
+      disabledMcpServerIdsText,
+      mcpToolPolicyDrafts,
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -3241,6 +3455,9 @@ function CreateAgentPanel({
         modelId: modelId || null,
         roleKey,
         orchestrationPhase,
+        skillKeys,
+        disabledMcpServerIds: parseMcpServerIds(disabledMcpServerIdsText),
+        mcpToolPolicies: serializeMcpToolPolicies(mcpToolPolicyDrafts),
       });
       onCreated();
     } catch (reason: unknown) {
@@ -3345,7 +3562,11 @@ function CreateAgentPanel({
           </select>
         </label>
 
-        <ReuseStrategyField value={reuseStrategy} onChange={setReuseStrategy} />
+        <ReuseStrategyField
+          phase={orchestrationPhase}
+          value={reuseStrategy}
+          onChange={setReuseStrategy}
+        />
         <AgentCacheRetentionField
           invalid={invalidField === "cacheRetentionOverrideSeconds"}
           onChange={(value) => {
@@ -3353,6 +3574,29 @@ function CreateAgentPanel({
             if (invalidField === "cacheRetentionOverrideSeconds") setInvalidField(null);
           }}
           value={cacheRetentionOverrideSeconds}
+        />
+        <AgentSkillFields onChange={setSkillKeys} value={skillKeys} />
+        <AgentMcpDenylistField
+          discoveredServers={mcpServers}
+          discoveryError={mcpDiscoveryError}
+          discoveryLoading={mcpDiscoveryLoading}
+          invalid={invalidField === "disabledMcpServerIds"}
+          onChange={(value) => {
+            setDisabledMcpServerIdsText(value);
+            if (invalidField === "disabledMcpServerIds") setInvalidField(null);
+          }}
+          onRefresh={() => void refreshMcpServers()}
+          value={disabledMcpServerIdsText}
+        />
+        <AgentMcpToolPolicyField
+          disabledMcpServerIds={parseMcpServerIds(disabledMcpServerIdsText)}
+          discoveredServers={mcpServers}
+          invalid={invalidField === "mcpToolPolicies"}
+          onChange={(value) => {
+            setMcpToolPolicyDrafts(value);
+            if (invalidField === "mcpToolPolicies") setInvalidField(null);
+          }}
+          value={mcpToolPolicyDrafts}
         />
 
         <label className="field full-width">
@@ -3448,20 +3692,31 @@ function CreateAgentPanel({
 function AgentDetailPanel({
   agentId,
   isActive,
+  mcpDiscoveryError,
+  mcpDiscoveryLoading,
+  mcpServers,
   models,
   onBack,
   onChanged,
   onDeleted,
+  refreshMcpServers,
 }: {
   agentId: string;
   isActive: boolean;
+  mcpDiscoveryError: string | null;
+  mcpDiscoveryLoading: boolean;
+  mcpServers: CodexMcpServerResponse[];
   models: ModelSummary[];
   onBack: () => void;
   onChanged: (message: string) => void;
   onDeleted: () => void;
+  refreshMcpServers: () => Promise<void>;
 }) {
   const [agent, setAgent] = useState<AgentDetailResponse | null>(null);
   const [modelId, setModelId] = useState("");
+  const [disabledMcpServerIdsText, setDisabledMcpServerIdsText] = useState("");
+  const [mcpToolPolicyDrafts, setMcpToolPolicyDrafts] =
+    useState<AgentMcpToolPolicyDraft[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [invalidField, setInvalidField] = useState<AgentFormField | null>(null);
@@ -3479,6 +3734,8 @@ function AgentDetailPanel({
           reasoningPolicy: normalizeReasoningPolicy(value.reasoningPolicy, selectedModel),
         });
         setModelId(nextModelId);
+        setDisabledMcpServerIdsText(value.disabledMcpServerIds.join("\n"));
+        setMcpToolPolicyDrafts(mcpToolPolicyDraftsFrom(value.mcpToolPolicies));
       })
       .catch((reason: unknown) => setError(errorMessage(reason)));
   }, [agentId, models]);
@@ -3495,6 +3752,8 @@ function AgentDetailPanel({
       instructionRequired: true,
       roleKey: agent.roleKey ?? "",
       cacheRetentionOverrideSeconds: agent.cacheRetentionOverrideSeconds,
+      disabledMcpServerIdsText,
+      mcpToolPolicyDrafts,
     });
     if (localInvalidField) {
       setInvalidField(localInvalidField);
@@ -3515,9 +3774,14 @@ function AgentDetailPanel({
         modelId: modelId || null,
         roleKey: agent.roleKey ?? "",
         orchestrationPhase: agent.orchestrationPhase ?? "EXECUTION",
+        skillKeys: agent.skillKeys,
+        disabledMcpServerIds: parseMcpServerIds(disabledMcpServerIdsText),
+        mcpToolPolicies: serializeMcpToolPolicies(mcpToolPolicyDrafts),
       });
       setAgent(refreshed);
       setModelId(refreshed.modelBinding?.id ?? "");
+      setDisabledMcpServerIdsText(refreshed.disabledMcpServerIds.join("\n"));
+      setMcpToolPolicyDrafts(mcpToolPolicyDraftsFrom(refreshed.mcpToolPolicies));
       onChanged("Agent 配置已保存。");
     } catch (reason: unknown) {
       setError(errorMessage(reason));
@@ -3636,6 +3900,7 @@ function AgentDetailPanel({
         </label>
 
         <ReuseStrategyField
+          phase={agent.orchestrationPhase ?? "EXECUTION"}
           value={agent.reuseStrategy}
           onChange={(value) => setAgent({ ...agent, reuseStrategy: value })}
         />
@@ -3646,6 +3911,32 @@ function AgentDetailPanel({
             if (invalidField === "cacheRetentionOverrideSeconds") setInvalidField(null);
           }}
           value={agent.cacheRetentionOverrideSeconds}
+        />
+        <AgentSkillFields
+          onChange={(skillKeys) => setAgent({ ...agent, skillKeys })}
+          value={agent.skillKeys}
+        />
+        <AgentMcpDenylistField
+          discoveredServers={mcpServers}
+          discoveryError={mcpDiscoveryError}
+          discoveryLoading={mcpDiscoveryLoading}
+          invalid={invalidField === "disabledMcpServerIds"}
+          onChange={(value) => {
+            setDisabledMcpServerIdsText(value);
+            if (invalidField === "disabledMcpServerIds") setInvalidField(null);
+          }}
+          onRefresh={() => void refreshMcpServers()}
+          value={disabledMcpServerIdsText}
+        />
+        <AgentMcpToolPolicyField
+          disabledMcpServerIds={parseMcpServerIds(disabledMcpServerIdsText)}
+          discoveredServers={mcpServers}
+          invalid={invalidField === "mcpToolPolicies"}
+          onChange={(value) => {
+            setMcpToolPolicyDrafts(value);
+            if (invalidField === "mcpToolPolicies") setInvalidField(null);
+          }}
+          value={mcpToolPolicyDrafts}
         />
 
         <label className="field full-width">
@@ -3812,27 +4103,420 @@ function PolicyFields({
 
 function ReuseStrategyField({
   onChange,
+  phase,
   value,
 }: {
   onChange: (value: AgentReuseStrategy) => void;
+  phase: OrchestrationPhase;
   value: AgentReuseStrategy;
 }) {
+  const effectiveStrategy = effectiveAgentReuseStrategy(value, phase);
   return (
     <label className="field">
       <span className="field-label-with-info">
         Thread 复用策略
-        <InfoTip label="这是缓存感知调度偏好；Workspace Scope、运行状态与 Context 健康始终优先。" />
+        <InfoTip label="AUTO 会按 Phase 解析：Discovery 偏热、Execution 平衡、Verification 与 Review 偏冷。HOT/COLD 是用户强制偏好。该设置只改变 Context 软阈值；Scope、运行状态、Fingerprint 与 Context 健康仍是硬条件。" />
       </span>
       <select
         onChange={(event) => onChange(event.target.value as AgentReuseStrategy)}
         value={value}
       >
-        <option value="AUTO">自动（推荐）</option>
+        <option value="AUTO">自动（按 Phase）</option>
         <option value="HOT">偏热</option>
         <option value="COLD">偏冷</option>
       </select>
+      <small>
+        当前生效：{reuseStrategyLabel(effectiveStrategy)}
+        {value === "AUTO" ? `（${phaseLabel(phase)} 默认）` : "（用户指定）"}
+      </small>
     </label>
   );
+}
+
+function effectiveAgentReuseStrategy(
+  value: AgentReuseStrategy,
+  phase: OrchestrationPhase,
+): AgentReuseStrategy {
+  if (value !== "AUTO") return value;
+  if (phase === "DISCOVERY") return "HOT";
+  if (phase === "VERIFICATION" || phase === "REVIEW") return "COLD";
+  return "AUTO";
+}
+
+function reuseStrategyLabel(value: AgentReuseStrategy): string {
+  return value === "HOT" ? "偏热" : value === "COLD" ? "偏冷" : "平衡";
+}
+
+function phaseLabel(value: OrchestrationPhase): string {
+  const labels: Record<OrchestrationPhase, string> = {
+    DISCOVERY: "Discovery",
+    EXECUTION: "Execution",
+    VERIFICATION: "Verification",
+    REVIEW: "Review",
+  };
+  return labels[value];
+}
+
+type AgentSkillVariant = "NONE" | "SLIM" | "NORMAL";
+
+const bundledAgentSkillFamilies: Array<{
+  name: string;
+  normalKey: AgentSkillKey;
+  slimKey: AgentSkillKey;
+  normalDescription: string;
+  slimDescription: string;
+}> = [
+  {
+    name: "Caveman",
+    normalKey: "caveman",
+    slimKey: "caveman-slim",
+    normalDescription: "保留原项目的完整模式、强度选项、示例与规则。",
+    slimDescription: "仅保留压缩表达的核心规则，适合日常子 Agent。",
+  },
+  {
+    name: "Ponytail",
+    normalKey: "ponytail",
+    slimKey: "ponytail-slim",
+    normalDescription: "保留原项目的完整工作流、模式、示例与规则。",
+    slimDescription: "仅保留最小实现、范围控制与验证规则。",
+  },
+];
+
+function selectedSkillVariant(
+  value: AgentSkillKey[],
+  family: (typeof bundledAgentSkillFamilies)[number],
+): AgentSkillVariant {
+  if (value.includes(family.slimKey)) return "SLIM";
+  if (value.includes(family.normalKey)) return "NORMAL";
+  return "NONE";
+}
+
+function skillVariantDescription(
+  variant: AgentSkillVariant,
+  family: (typeof bundledAgentSkillFamilies)[number],
+): string {
+  if (variant === "SLIM") return family.slimDescription;
+  if (variant === "NORMAL") return family.normalDescription;
+  return "不显式绑定此 Skill 家族。";
+}
+
+function AgentSkillFields({
+  onChange,
+  value,
+}: {
+  onChange: (value: AgentSkillKey[]) => void;
+  value: AgentSkillKey[];
+}) {
+  function selectVariant(
+    family: (typeof bundledAgentSkillFamilies)[number],
+    variant: AgentSkillVariant,
+  ) {
+    const remaining = value.filter(
+      (key) => key !== family.normalKey && key !== family.slimKey,
+    );
+    const selected =
+      variant === "SLIM"
+        ? family.slimKey
+        : variant === "NORMAL"
+          ? family.normalKey
+          : null;
+    onChange((selected ? [...remaining, selected] : remaining).sort());
+  }
+
+  return (
+    <fieldset className="agent-skill-field full-width">
+      <div className="agent-skill-heading">
+        <span className="field-label-with-info">
+          内置 Skills
+          <InfoTip label="选中的 Skill 随 CAS 分发并写入当前 CODEX_HOME；不依赖本机预先安装。" />
+        </span>
+        <button
+          className="reference-link"
+          onClick={() => onChange(["caveman-slim", "ponytail-slim"])}
+          type="button"
+        >
+          应用精简预设
+        </button>
+      </div>
+      <div className="agent-skill-options">
+        {bundledAgentSkillFamilies.map((family) => {
+          const variant = selectedSkillVariant(value, family);
+          return (
+            <label className="agent-skill-version-option" key={family.name}>
+              <strong>{family.name}</strong>
+              <select
+                onChange={(event) =>
+                  selectVariant(family, event.target.value as AgentSkillVariant)
+                }
+                value={variant}
+              >
+                <option value="NONE">未启用</option>
+                <option value="SLIM">CAS 精简版（推荐）</option>
+                <option value="NORMAL">正常版</option>
+              </select>
+              <small>{skillVariantDescription(variant, family)}</small>
+            </label>
+          );
+        })}
+      </div>
+      <small>
+        每个家族只能选择一个版本。未启用时不写入该 Skill；正常版保留完整规则，精简版减少子 Agent 上下文占用。
+      </small>
+    </fieldset>
+  );
+}
+
+function AgentMcpDenylistField({
+  discoveredServers,
+  discoveryError,
+  discoveryLoading,
+  invalid,
+  onChange,
+  onRefresh,
+  value,
+}: {
+  discoveredServers: CodexMcpServerResponse[];
+  discoveryError: string | null;
+  discoveryLoading: boolean;
+  invalid: boolean;
+  onChange: (value: string) => void;
+  onRefresh: () => void;
+  value: string;
+}) {
+  const selected = new Set(parseMcpServerIds(value));
+
+  function toggle(serverId: string) {
+    if (selected.has(serverId)) {
+      selected.delete(serverId);
+    } else {
+      selected.add(serverId);
+    }
+    onChange([...selected].sort().join("\n"));
+  }
+
+  return (
+    <fieldset className="agent-skill-field full-width">
+      <div className="agent-skill-heading">
+        <span className="field-label-with-info">
+          禁用 MCP Servers <em>Optional</em>
+          <InfoTip label="只读发现当前 CODEX_HOME/config.toml 中的全局 MCP Server。勾选项只在该 Agent 中禁用；未勾选项继续继承 Primary。" />
+        </span>
+        <button
+          className="reference-link"
+          disabled={discoveryLoading}
+          onClick={onRefresh}
+          type="button"
+        >
+          <UiIcon name="refresh" />
+          {discoveryLoading ? "读取中…" : "重新读取"}
+        </button>
+      </div>
+
+      {discoveredServers.length > 0 && (
+        <div className="agent-skill-options" aria-label="已发现的 MCP Servers">
+          {discoveredServers.map((server) => (
+            <label className="agent-skill-option" key={server.id}>
+              <input
+                checked={selected.has(server.id)}
+                onChange={() => toggle(server.id)}
+                type="checkbox"
+              />
+              <span>
+                <strong>{server.id}</strong>
+                <small>
+                  {server.transport === "STDIO"
+                    ? "本地 STDIO"
+                    : server.transport === "HTTP"
+                      ? "远程 HTTP"
+                      : "类型未知"}
+                  {" · "}{server.enabled ? "全局启用" : "全局已禁用"}
+                </small>
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+
+      {!discoveryLoading && !discoveryError && discoveredServers.length === 0 && (
+        <small>当前 CODEX_HOME/config.toml 中未发现全局 MCP Server。</small>
+      )}
+      {discoveryError && <small className="field-error" role="alert">自动发现失败：{discoveryError}</small>}
+
+      <label className="field">
+        <span>完整禁用列表 / 手工补充</span>
+        <textarea
+          aria-invalid={invalid}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={"例如：\nbrowser\ngithub.readonly"}
+          rows={3}
+          value={value}
+        />
+        <small className={invalid ? "field-error" : undefined}>
+          {invalid
+            ? "Server ID 只能包含字母、数字、点、短横线和下划线，单项最多 128 个字符。"
+            : "可补充项目级或尚未发现的 ID；每行或逗号分隔。保存后更改会停止复用旧 Thread。"}
+        </small>
+      </label>
+    </fieldset>
+  );
+}
+
+function AgentMcpToolPolicyField({
+  disabledMcpServerIds,
+  discoveredServers,
+  invalid,
+  onChange,
+  value,
+}: {
+  disabledMcpServerIds: string[];
+  discoveredServers: CodexMcpServerResponse[];
+  invalid: boolean;
+  onChange: (value: AgentMcpToolPolicyDraft[]) => void;
+  value: AgentMcpToolPolicyDraft[];
+}) {
+  const listId = useId();
+
+  function update(index: number, patch: Partial<AgentMcpToolPolicyDraft>) {
+    onChange(value.map((policy, current) => current === index ? { ...policy, ...patch } : policy));
+  }
+
+  return (
+    <fieldset className="agent-skill-field full-width">
+      <div className="agent-skill-heading">
+        <span className="field-label-with-info">
+          MCP 工具权限 <em>Optional</em>
+          <InfoTip label="“仅允许”会写入 enabled_tools；“禁用”会写入 disabled_tools。每个 Server 只能选择一种模式，且不能同时完整禁用。" />
+        </span>
+        <button
+          className="reference-link"
+          onClick={() => onChange([
+            ...value,
+            { serverId: "", mode: "DENY", toolNamesText: "" },
+          ])}
+          type="button"
+        >
+          添加工具规则
+        </button>
+      </div>
+
+      <datalist id={listId}>
+        {discoveredServers.map((server) => <option key={server.id} value={server.id} />)}
+      </datalist>
+
+      {value.length === 0 && (
+        <small>未配置时继承该 MCP Server 暴露的全部工具。</small>
+      )}
+      {value.map((policy, index) => {
+        const issue = invalid
+          ? mcpToolPolicyDraftError(policy, index, value, disabledMcpServerIds)
+          : null;
+        return (
+          <div className="agent-mcp-tool-policy-row" key={index}>
+            <label className="field">
+              <span>Server ID</span>
+              <input
+                aria-invalid={Boolean(issue)}
+                list={listId}
+                maxLength={128}
+                onChange={(event) => update(index, { serverId: event.target.value })}
+                placeholder="例如 github"
+                value={policy.serverId}
+              />
+            </label>
+            <label className="field">
+              <span>策略</span>
+              <select
+                aria-invalid={Boolean(issue)}
+                onChange={(event) => update(index, {
+                  mode: event.target.value as AgentMcpToolPolicyMode,
+                })}
+                value={policy.mode}
+              >
+                <option value="DENY">禁用列出的工具</option>
+                <option value="ALLOW_ONLY">仅允许列出的工具</option>
+              </select>
+            </label>
+            <label className="field agent-mcp-tool-names">
+              <span>工具名称</span>
+              <textarea
+                aria-invalid={Boolean(issue)}
+                onChange={(event) => update(index, { toolNamesText: event.target.value })}
+                placeholder={"每行或逗号分隔，例如：\nread_file\nlist_directory"}
+                rows={2}
+                value={policy.toolNamesText}
+              />
+            </label>
+            <button
+              aria-label={`删除第 ${index + 1} 条 MCP 工具规则`}
+              className="ghost-button agent-mcp-tool-remove"
+              onClick={() => onChange(value.filter((_, current) => current !== index))}
+              type="button"
+            >
+              <UiIcon name="trash" />
+            </button>
+            {issue && <small className="field-error agent-mcp-tool-error">{issue}</small>}
+          </div>
+        );
+      })}
+
+      <small className={invalid ? "field-error" : undefined}>
+        {invalid
+          ? "请修正工具规则中的红色字段。"
+          : "工具名需按 Provider 实际暴露名称填写。CAS 不连接或启动 MCP Server 来枚举工具；保存后更改会停止复用旧 Thread。"}
+      </small>
+    </fieldset>
+  );
+}
+
+function parseMcpServerIds(value: string): string[] {
+  return [...new Set(value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean))].sort();
+}
+
+function parseMcpToolNames(value: string): string[] {
+  return [...new Set(value.split(/[\r\n,]+/).map((item) => item.trim()).filter(Boolean))].sort();
+}
+
+function mcpToolPolicyDraftsFrom(policies: AgentMcpToolPolicy[]): AgentMcpToolPolicyDraft[] {
+  return policies.map((policy) => ({
+    serverId: policy.serverId,
+    mode: policy.mode,
+    toolNamesText: policy.toolNames.join("\n"),
+  }));
+}
+
+function serializeMcpToolPolicies(drafts: AgentMcpToolPolicyDraft[]): AgentMcpToolPolicy[] {
+  return drafts
+    .map((policy) => ({
+      serverId: policy.serverId.trim(),
+      mode: policy.mode,
+      toolNames: parseMcpToolNames(policy.toolNamesText),
+    }))
+    .sort((left, right) => left.serverId.localeCompare(right.serverId));
+}
+
+function mcpToolPolicyDraftError(
+  policy: AgentMcpToolPolicyDraft,
+  index: number,
+  policies: AgentMcpToolPolicyDraft[],
+  disabledMcpServerIds: string[],
+): string | null {
+  const serverId = policy.serverId.trim();
+  if (!/^[A-Za-z0-9_.-]{1,128}$/.test(serverId)) {
+    return "Server ID 只能包含字母、数字、点、短横线和下划线。";
+  }
+  if (policies.findIndex((current) => current.serverId.trim() === serverId) !== index) {
+    return "同一个 Server 只能配置一条工具规则。";
+  }
+  if (disabledMcpServerIds.includes(serverId)) {
+    return "该 Server 已被完整禁用，不能再配置工具级权限。";
+  }
+  const toolNames = parseMcpToolNames(policy.toolNamesText);
+  if (toolNames.length === 0) return "至少填写一个工具名称。";
+  if (toolNames.length > 256) return "单个 Server 最多配置 256 个工具名称。";
+  if (toolNames.some((toolName) => toolName.length > 256 || /[\u0000-\u001f\u007f]/.test(toolName))) {
+    return "工具名称最多 256 个字符，且不能包含控制字符。";
+  }
+  return null;
 }
 
 function AgentCacheRetentionField({
@@ -5693,7 +6377,9 @@ type AgentFormField =
   | "instruction"
   | "modelId"
   | "reasoningPolicy"
-  | "cacheRetentionOverrideSeconds";
+  | "cacheRetentionOverrideSeconds"
+  | "disabledMcpServerIds"
+  | "mcpToolPolicies";
 
 function invalidAgentField(values: {
   agentKey?: string;
@@ -5703,6 +6389,8 @@ function invalidAgentField(values: {
   instructionRequired: boolean;
   roleKey: string;
   cacheRetentionOverrideSeconds: number | null;
+  disabledMcpServerIdsText: string;
+  mcpToolPolicyDrafts: AgentMcpToolPolicyDraft[];
 }): AgentFormField | null {
   if (values.agentKey !== undefined && !/^[a-z][a-z0-9_-]{0,63}$/.test(values.agentKey)) {
     return "agentKey";
@@ -5721,6 +6409,26 @@ function invalidAgentField(values: {
   ) {
     return "cacheRetentionOverrideSeconds";
   }
+  if (
+    parseMcpServerIds(values.disabledMcpServerIdsText)
+      .some((serverId) => !/^[A-Za-z0-9_.-]{1,128}$/.test(serverId))
+  ) {
+    return "disabledMcpServerIds";
+  }
+  const disabledMcpServerIds = parseMcpServerIds(values.disabledMcpServerIdsText);
+  if (
+    values.mcpToolPolicyDrafts.length > 128
+    || values.mcpToolPolicyDrafts.some((policy, index) => (
+      mcpToolPolicyDraftError(
+        policy,
+        index,
+        values.mcpToolPolicyDrafts,
+        disabledMcpServerIds,
+      ) !== null
+    ))
+  ) {
+    return "mcpToolPolicies";
+  }
   return null;
 }
 
@@ -5736,6 +6444,8 @@ function agentErrorField(reason: unknown): AgentFormField | null {
       "modelId",
       "reasoningPolicy",
       "cacheRetentionOverrideSeconds",
+      "disabledMcpServerIds",
+      "mcpToolPolicies",
     ].includes(field ?? "")
   ) {
     return field as AgentFormField;

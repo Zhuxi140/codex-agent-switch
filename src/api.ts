@@ -35,6 +35,12 @@ export interface CodexEnvironmentResponse extends CodexEnvironmentSummary {
   issues: DiagnosticIssue[];
 }
 
+export interface CodexMcpServerResponse {
+  id: string;
+  transport: "STDIO" | "HTTP" | "UNKNOWN";
+  enabled: boolean;
+}
+
 export type Appearance = "SYSTEM" | "LIGHT" | "DARK";
 export type OrchestrationFailurePolicy = "STRICT_STOP" | "PRIMARY_FALLBACK";
 
@@ -79,6 +85,10 @@ export function getAppBootstrap(): Promise<AppBootstrapResponse> {
 
 export function getCodexEnvironment(): Promise<CodexEnvironmentResponse> {
   return invoke<CodexEnvironmentResponse>("codex_get_environment");
+}
+
+export function listCodexMcpServers(): Promise<CodexMcpServerResponse[]> {
+  return invoke<CodexMcpServerResponse[]>("codex_mcp_server_list");
 }
 
 export function redetectCodex(): Promise<CodexEnvironmentResponse> {
@@ -510,10 +520,24 @@ export interface AgentSummary {
   cacheRetentionOverrideSeconds: number | null;
   roleKey: string | null;
   orchestrationPhase: OrchestrationPhase | null;
+  skillKeys: AgentSkillKey[];
+  disabledMcpServerIds: string[];
 }
 
 export type OrchestrationPhase = "DISCOVERY" | "EXECUTION" | "VERIFICATION" | "REVIEW";
 export type AgentReuseStrategy = "AUTO" | "HOT" | "COLD";
+export type AgentSkillKey =
+  | "caveman"
+  | "caveman-slim"
+  | "ponytail"
+  | "ponytail-slim";
+export type AgentMcpToolPolicyMode = "ALLOW_ONLY" | "DENY";
+
+export interface AgentMcpToolPolicy {
+  serverId: string;
+  mode: AgentMcpToolPolicyMode;
+  toolNames: string[];
+}
 
 export interface AgentDetailResponse {
   id: string;
@@ -529,6 +553,9 @@ export interface AgentDetailResponse {
   cacheRetentionOverrideSeconds: number | null;
   roleKey: string | null;
   orchestrationPhase: OrchestrationPhase | null;
+  skillKeys: AgentSkillKey[];
+  disabledMcpServerIds: string[];
+  mcpToolPolicies: AgentMcpToolPolicy[];
   requiredCapabilities: string[];
   preferredCapabilities: string[];
   modelBinding: AgentModelReference | null;
@@ -548,6 +575,7 @@ export interface AgentPresetResponse {
   requiredCapabilities: string[];
   roleKey: string;
   orchestrationPhase: OrchestrationPhase;
+  defaultSkillKeys: AgentSkillKey[];
 }
 
 export interface AgentCreateRequest {
@@ -564,6 +592,9 @@ export interface AgentCreateRequest {
   modelId?: string | null;
   roleKey: string;
   orchestrationPhase?: OrchestrationPhase | null;
+  skillKeys: AgentSkillKey[];
+  disabledMcpServerIds: string[];
+  mcpToolPolicies: AgentMcpToolPolicy[];
 }
 
 export interface AgentUpdateRequest {
@@ -578,6 +609,9 @@ export interface AgentUpdateRequest {
   modelId?: string | null;
   roleKey: string;
   orchestrationPhase: OrchestrationPhase;
+  skillKeys: AgentSkillKey[];
+  disabledMcpServerIds: string[];
+  mcpToolPolicies: AgentMcpToolPolicy[];
 }
 
 export function listAgentPresets(): Promise<AgentPresetResponse[]> {
@@ -673,6 +707,8 @@ export type AgentThreadInstanceStatus =
   | "CLOSED"
   | "UNKNOWN";
 
+export type AgentThreadReuseState = "ACTIVE" | "RETIRE_PENDING" | "RETIRED";
+
 export interface AgentThreadInstanceResponse {
   id: string;
   agentId: string | null;
@@ -681,6 +717,8 @@ export interface AgentThreadInstanceResponse {
   parentThreadId: string | null;
   workspaceScopeKey: string | null;
   status: AgentThreadInstanceStatus;
+  reuseState: AgentThreadReuseState;
+  reuseStateReason: string | null;
   inputTokens: number;
   cachedInputTokens: number;
   outputTokens: number;
@@ -719,6 +757,9 @@ export interface AgentThreadProjectSummaryResponse {
   agentCount: number;
   runningCount: number;
   recoveryRequiredCount: number;
+  reusableCount: number;
+  retiredCount: number;
+  retirePendingCount: number;
   totalTokens: number;
   lastUsedAt: string;
 }
@@ -746,6 +787,8 @@ export interface AgentThreadInstanceRecommendation {
     | "RUNTIME_FINGERPRINT_MISMATCH"
     | "RUNTIME_FINGERPRINT_UNKNOWN"
     | "CACHE_HINT_PRESSURE"
+    | "THREAD_CLAIMED"
+    | "CANDIDATE_RETIRED"
     | "NO_HEALTHY_IDLE_THREAD"
     | "NO_WORKSPACE_SCOPE_MATCH";
   message: string;
@@ -755,6 +798,7 @@ export interface AgentThreadInstanceRecommendation {
   contextPressurePercent: number | null;
   contextPressureLimitPercent: number;
   reuseStrategy: AgentReuseStrategy;
+  effectiveReuseStrategy: AgentReuseStrategy;
   cacheSupport: ProviderCacheSupport;
   cacheRetentionType: ProviderCacheRetentionType;
   cacheRetentionHintSeconds: number | null;
@@ -869,6 +913,30 @@ export function setAgentThreadInstanceWorkspaceScope(
 ): Promise<AgentThreadInstanceResponse> {
   return invoke<AgentThreadInstanceResponse>("agent_thread_instance_set_workspace_scope", {
     request: { threadId, workspaceScopeKey },
+  });
+}
+
+export function setAgentThreadInstanceReuseState(
+  threadId: string,
+  reuseState: "ACTIVE" | "RETIRED",
+): Promise<AgentThreadInstanceResponse> {
+  return invoke<AgentThreadInstanceResponse>("agent_thread_instance_set_reuse_state", {
+    request: { threadId, reuseState },
+  });
+}
+
+export interface AgentThreadCleanupResponse {
+  retiredCount: number;
+  keptCount: number;
+  runningCount: number;
+  unknownCount: number;
+}
+
+export function cleanupAgentThreadInstances(
+  workspaceScopeKey: string | null,
+): Promise<AgentThreadCleanupResponse> {
+  return invoke<AgentThreadCleanupResponse>("agent_thread_instance_cleanup", {
+    request: { workspaceScopeKey },
   });
 }
 
