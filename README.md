@@ -12,7 +12,7 @@
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
 > [!WARNING]
-> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 配置会改写 Codex 全局配置及 `AGENTS.md` 编排资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 会改写 Codex 的 `config.toml` 相关片段并投影 Agent、模型目录与 Skill 资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
 ## 核心理念
 
@@ -64,7 +64,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 1. 从 GitHub Release 下载 `Codex.Agent.Switch_0.4.1_x64-setup.exe` 并运行安装。
 2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
 3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
-4. 在 Models 与 Agents 页面绑定模型，并在运行模式中启用编排配置；Preview 后 Apply。
+4. 在 Models 与 Agents 页面绑定模型；可为每个 Agent 选择 CAS 内置 Skill、完整禁用指定 MCP Server，或按工具名配置“仅允许 / 禁用”规则；随后在运行模式中启用编排配置并 Apply。
 5. 在用量页面查看原生子 Agent Thread 的生命周期（基于 rollout 事实）、当前上下文与 Token 统计。
 
 安装包当前未进行代码签名；Windows SmartScreen 可能显示警告，请按组织安全策略核验 Release 的 SHA-256。
@@ -73,11 +73,11 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
 
-### 当前主分支开发验证（2026-08-23）
+### 当前主分支开发验证（2026-08-24）
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 174 passed、0 failed、5 ignored |
+| Rust Workspace 测试 | 189 passed、0 failed、5 ignored |
 | 前端生产构建 | 通过 |
 | Diff 检查 | 通过 |
 | Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
@@ -85,7 +85,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 | Codex Native Phase 6：App Server 断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`） |
 | Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 6 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 6 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
 
 当前 workspace 的 5 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试，以及 4 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
@@ -131,9 +131,46 @@ CAS 只统计 Token，不统计费用。下表仅列出可客观采集的指标�
 
 基准方法：使用同一版本、同一任务集、相同权限和验收标准，对各方案进行多轮运行；先公布每轮原始 Token、耗时与成功结果，再计算汇总指标。在样本足够前，不以任何费用、性能或效率结论进行宣传。
 
+仓库提供了零第三方依赖的 [`benchmarks/efficiency-fixture`](benchmarks/efficiency-fixture) Pilot 夹具，用于先校准测试流程，而不是预先证明 CAS 更高效。Task 1A 要求实现闭区间归一化，Task 1B 在同一个 Primary 任务中继续实现区间扣除；CAS ON 组应记录第一次 `SPAWN`、第二次 `REUSE` 的调度证据。固定运行顺序为 `OFF-01 → ON-01 → ON-02 → OFF-02`，以减小预热和顺序偏差；每轮都必须保留原始 Token、耗时、验收结果和人工接管记录。
+
+验收文件是基准契约，不得在测试过程中修改。夹具中的初始实现会故意失败，参测方案需要完成实现后再运行：
+
+```powershell
+node --test benchmarks/efficiency-fixture/acceptance/task-1a.test.mjs
+node --test benchmarks/efficiency-fixture/acceptance/task-1a.test.mjs benchmarks/efficiency-fixture/acceptance/task-1b.test.mjs
+```
+
+只有四轮均按相同权限、相同验收标准完成，并公开逐轮原始数据后，才会把上表中的“待测试”替换为汇总值。
+
+## 内置 Skill 与精简预设
+
+CAS 已把 `caveman`、`ponytail` 的正常版，以及面向子 Agent 的 CAS 精简版和对应 MIT License 编译进应用，不依赖用户电脑预先安装。Agent 页面中每个 Skill 家族可选择“未启用 / CAS 精简版 / 正常版”，同一家族不能同时启用两个版本：
+
+- **Caveman 正常版**：保留上游完整模式、强度选项、示例和规则。
+- **Caveman 精简版**：只保留压缩进度与结果的核心约束，同时要求保留错误、安全信息和验收证据。
+- **Ponytail 正常版**：保留上游完整工作流、模式、示例和规则。
+- **Ponytail 精简版**：只保留复用现有实现、最小范围改动、停止边界和必要验证。
+- **精简预设**：一次选择两份精简版。新建 Executor 默认启用两项；新建 Explorer、Reviewer、Tester 默认只启用 Caveman 精简版。已有 Agent 的选择不会被自动改写。
+
+Apply 时，CAS 将所选版本投影到当前 `CODEX_HOME/cas/bundled-skills/`，并在对应 `agents/cas-*.toml` 中写入 `[[skills.config]]` 与匹配的版本约束。切回 Default、删除绑定或切换 `CODEX_HOME` 时，这些文件与其他 CAS 托管资源走同一套 Preview、冲突检测、快照、清理和恢复流程。
+
+Skill 的键和内容修订号都是 Agent 运行时身份的一部分：改变版本会让旧 Thread 退出复用池，并改变桌面端和 `cas-helper` 使用的 `runtime_fingerprint`，防止新旧指令配置错误复用。精简版用于减少 Skill 自身与输出带来的上下文占用，但 CAS 不承诺固定 Token 节省比例，应以用量监控中的真实数据判断。
+
 ## 多 Agent 编排
 
 CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等 Role/Phase。编排模式下每种 Role 只能启用一个 Agent，避免职责和模型绑定发生歧义。Primary 负责读取、规划、审查和收束；所有实现命令与文件写入必须委派给 Execution Agent。
+
+委派以“一个可独立验收的工作单元”为边界。Primary 只发送由 `GOAL / DECISIONS / ALLOW / DENY / TOOLS / CWD / ACCEPT / STOP` 组成的紧凑 TASK 包，不附带完整对话历史或工具说明。Child 首行以 `DONE / NEEDS_DECISION / PARTIAL / BLOCKED` 返回，后续字段由阶段决定：Execution 报告改动与验证，Discovery 区分证据、推断和未知项，Review 输出带严重度与位置的 Findings，Verification 输出命令、结果、失败和产物。Primary 审查结果后，才接受结果、作出缺失决定，或向同一 Thread 交付下一单元，避免执行器自行扩大任务。
+
+CAS 不复制或改写用户全局 MCP 的命令、环境变量、凭据与 OAuth 状态；自定义 Agent 未覆盖的会话设置继续按 Codex 原生规则继承。Agents 页面会只读解析当前 `CODEX_HOME/config.toml`，仅向前端返回 MCP Server ID、传输类型和全局启用状态，供用户勾选；连接地址、命令、环境变量和认证信息不会离开 Rust 后端。项目级、Profile 或插件内未被发现的 Server 仍可手工补充 ID。
+
+用户选择的静态 MCP 禁用列表只在对应 `agents/cas-*.toml` 中写入 `[mcp_servers.<id>] enabled = false`，未列出的 Server 继续继承 Primary。工具级权限有两种互斥模式：**仅允许列出的工具**投影为 `enabled_tools`，**禁用列出的工具**投影为 `disabled_tools`；同一 Server 只能选择一种工具模式，也不能同时被完整禁用。工具名由用户按 Provider 实际暴露名称手工填写，CAS 不连接或启动 MCP Server 来枚举工具。
+
+完整禁用列表或工具权限变化都会使旧 Thread 退出复用池，并同时改变桌面端与 `cas-helper` 使用的运行时指纹，防止沿用旧工具权限。插件与 App 权限不在本机制范围内。
+
+静态配置仍不替代单次任务授权：CAS 写入 Child 指令的 `TOOLS` 契约，只允许调用 TASK `TOOLS` 明列且完成验收必需的外部工具；`TOOLS: -` 表示禁用，外部写入还必须同时获得 `ALLOW` 明确许可。Discovery 与 Review 的外部工具保持只读，Verification 也不得制造未授权外部状态。CAS 选中的内置 Skill 通过 `skills.config` 投影，并按任务匹配和 Agent 显式绑定规则渐进加载；Primary 不把完整 Skill 内容复制进委派 prompt。
+
+Primary 专属的调度协议只写入 `config.toml` 的 `developer_instructions`；CAS 不再把完整协议写入全局 `AGENTS.md`。用户已有的全局和项目 `AGENTS.md` 仍由 Codex 正常加载，对 Primary 与 Child 共同生效；Child 另由 `agents/cas-*.toml` 接收职责边界。升级后首次 Apply 会移除旧版本留下的 CAS 全局编排块，并保留用户原有内容。
 
 失败策略可选：
 
@@ -157,13 +194,13 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 - **显式 Task Scope**：`cas-helper schedule <agent-key> [task-key]` 支持由 Primary 从任务描述提取的稳定任务键（如 `auth-oauth2`）。只有 `task-key` 完全一致的空闲 Thread 才会被复用；未传任务键的预检不会复用任何绑定了任务键的 Thread（fail-closed），CAS 不做任何模糊分类或历史猜测。`bind` 同样接受并固化任务键，既有键不被覆盖。
 
-- **运行时指纹**：每个 Agent 配置生成稳定 `runtime_fingerprint`（纳入 Provider 身份、Base URL、模型、指令、推理与沙箱策略、能力集合），配置变更后旧 Thread 立即失配并 `SPAWN`，不会复用旧配置的线程。
+- **运行时指纹**：每个 Agent 配置生成稳定 `runtime_fingerprint`（纳入 Provider 身份、Base URL、模型、指令、推理与沙箱策略、能力集合、内置 Skill 选择、MCP Server 禁用列表及工具级权限），配置变更后旧 Thread 立即失配并 `SPAWN`，不会复用旧配置或旧工具权限的线程。
 - **Workspace Scope**：当前工作目录的规范化值（UNIX/UNC 统一归一），不是逻辑任务或模块匹配；执行入口会拒绝 Scope 与实际 `cwd` 不一致的请求。未提供 Task Scope 时，同一工作区内的不同任务不会被自动区分；提供显式 Task Scope 后才按任务键精确隔离。
 - **上下文健康以当前上下文为准**：仅使用 `current_context_tokens`（来自 App Server `lastTokenUsage` 或 rollout 尾部解析），累计 `totalTokenUsage`/`tokens_used` 只用于用量统计；当前上下文或运行时窗口未知时 fail closed 为 `CONTEXT_UNKNOWN` 并 `SPAWN`，不会把「无法证明健康」当作健康。
 
-调度器还结合 Agent 的 `AUTO` / `HOT` / `COLD` 策略、Provider 的缓存能力和缓存保留提示，避免复用上下文压力过高或已超出缓存窗口的 Thread。
+调度器还结合 Agent 的 `AUTO` / `HOT` / `COLD` 策略、Provider 的缓存能力和缓存保留提示，避免复用上下文压力过高或已超出缓存窗口的 Thread。`AUTO` 会按 Phase 解析软偏好：Discovery 为 `HOT`（90% Context 阈值）、Execution 保持平衡（80%）、Verification 与 Review 为 `COLD`（60%）；用户显式选择 `HOT/COLD` 时覆盖角色默认。缓存窗口只会影响软阈值与提示，不会绕过 Agent、Primary、Scope、IDLE、Fingerprint 或 Context 可观测性等安全条件，实际缓存命中仍以 Provider 返回的 Token 用量为准。
 
-成功的子 Agent Thread 会保留并同步为 `IDLE`，不得自动调用 `close_agent`；仅在用户明确要求、Agent 被停用或移除、Thread 异常不可用，或 CAS 判定不再可复用时才允许关闭。
+成功的子 Agent Thread 会保留并同步为 `IDLE`，不得自动调用 `close_agent`。CAS 以独立的 `ACTIVE / RETIRE_PENDING / RETIRED` 状态管理复用资格：运行中的 Thread 只能标记为“完成后退休”，不会被中断；退休只将其移出候选池，不删除 Codex Thread、rollout 或 Token 历史。恢复到复用池前会重新校验 Agent、运行时指纹、Workspace 和上下文健康；批量清理由这些客观条件判定，不依赖模型阅读历史。
 
 ## Provider、Model 与用量
 
@@ -180,16 +217,17 @@ CAS 将 Agent 分为 Primary、Discovery、Execution、Verification、Review 等
 
 配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。删除 Provider 时先在 CAS 数据库记录待清理凭据，再删除并回查 Windows 凭据；清理未完成会保留队列并在后续启动重试。
 
-编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段与全局 `AGENTS.md`，并删除 `agents/cas-*.toml` 等 CAS 托管资源（不触碰用户自有内容）；关闭应用时自动执行同一清理路径。
+编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段，并删除 `agents/cas-*.toml`、`cas/bundled-skills/*` 等 CAS 托管资源。新版不会向全局 `AGENTS.md` 写入 Primary 协议；若检测到旧版 CAS 托管块，则只移除该块并保留用户内容。关闭应用时自动执行同一清理路径。
 
 ## Roadmap（下一阶段：v0.5 RC）
 
 - **真实编排闭环（RC-1 已完成）**：Codex Native 已固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token 与决策日志。
 - **并发与失配矩阵（RC-2 已完成）**：同任务并发返回唯一 SPAWN 与 WAIT；Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定拒绝旧 Thread，并给出 SPAWN 建议。
 - **恢复能力**：覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和 Runtime Bridge 断流恢复。
+- **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
 - **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
 
-在上述门槛通过前，不继续增加 Reuse Score、AI 任务分类、Thread Pool 或费用估算。
+在上述门槛通过前，不继续增加 Reuse Score、AI 任务分类或费用估算。
 
 ## 开发验证
 
@@ -221,3 +259,5 @@ npm.cmd run e2e:runtime-recovery -- -TimeoutSeconds 120
 ## License
 
 [MIT](LICENSE) © 2026 [ZhuXi](https://github.com/Zhuxi140)
+
+内置第三方纯 Skill 保留各自 MIT License：[`caveman`](https://github.com/JuliusBrussee/caveman) © 2026 Julius Brussee；[`ponytail`](https://github.com/DietrichGebert/ponytail) © 2026 Dietrich Gebert。CAS 未捆绑 `caveman` 仓库中采用其他许可证的 Proxy / Engine。

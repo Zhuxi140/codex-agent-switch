@@ -1,0 +1,13 @@
+只完成以下任务，不添加额外功能：
+
+在 src/ranges.mjs 中实现 normalizeRanges(ranges)。输入是闭区间数组，每个区间为 [start, end]。
+
+要求：
+1. start/end 必须是有限安全整数，且 start <= end；非法输入抛出 TypeError。
+2. 按起点排序，并合并重叠或相邻区间；例如 [1, 2] 与 [3, 4] 合并为 [1, 4]。
+3. 不得修改输入数组及其内部区间。
+4. 空数组返回空数组。
+5. 只允许修改 src/ranges.mjs，不得修改 acceptance、package.json、prompts 或其他文件。
+6. 运行 node --test acceptance/task-1a.test.mjs 验证。
+
+完成后简洁报告修改和验证结果。

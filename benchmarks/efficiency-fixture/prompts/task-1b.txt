@@ -1,0 +1,14 @@
+继续当前任务，只完成以下追加需求：
+
+在 src/ranges.mjs 中实现 subtractRanges(ranges, exclusions)。ranges 和 exclusions 都是闭区间数组。返回 ranges 扣除 exclusions 后剩余的闭区间，并保持从小到大、互不重叠且不相邻。
+
+要求：
+1. 两组输入都使用 normalizeRanges 的相同校验与规范化规则。
+2. 扣除可能覆盖整个区间、区间头部、尾部或中间，并可能跨越多个区间。
+3. 不得修改任一输入数组及其内部区间。
+4. exclusions 为空时返回 ranges 的规范化结果。
+5. 保持任务 1A 的全部行为不变。
+6. 只允许修改 src/ranges.mjs，不得修改 acceptance、package.json、prompts 或其他文件。
+7. 运行 node --test acceptance/task-1a.test.mjs acceptance/task-1b.test.mjs 验证。
+
+完成后简洁报告修改和验证结果。

@@ -1,0 +1,9 @@
+{
+  "name": "cas-efficiency-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:task-1a": "node --test acceptance/task-1a.test.mjs",
+    "test:task-1b": "node --test acceptance/task-1a.test.mjs acceptance/task-1b.test.mjs"
+  }
+}
