@@ -401,6 +401,15 @@ impl UsageService {
             .list_schedule_decisions(request.limit.unwrap_or(30).min(200))?)
     }
 
+    pub(crate) fn list_runtime_enforcement_events(
+        &self,
+        request: RuntimeEnforcementEventListRequest,
+    ) -> Result<Vec<RuntimeEnforcementEventResponse>, ApiError> {
+        Ok(self
+            .repository()?
+            .list_runtime_enforcement_events(request.limit.unwrap_or(30).min(200))?)
+    }
+
     pub(crate) fn prepare_agent_execution(
         &self,
         request: AgentThreadExecutionRequest,
@@ -848,6 +857,36 @@ pub(crate) struct ScheduleDecisionResponse {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentScheduleDecisionListRequest {
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeEnforcementEventResponse {
+    pub(crate) id: String,
+    pub(crate) created_at: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) agent_name_snapshot: Option<String>,
+    pub(crate) agent_type: Option<String>,
+    pub(crate) orchestration_phase: Option<String>,
+    pub(crate) codex_agent_id: Option<String>,
+    pub(crate) lease_id: Option<String>,
+    pub(crate) workspace_scope_key: Option<String>,
+    pub(crate) task_scope_key: Option<String>,
+    pub(crate) lease_state: Option<String>,
+    pub(crate) lease_expires_at: Option<String>,
+    pub(crate) tool_name: String,
+    pub(crate) decision: String,
+    pub(crate) reason_code: String,
+    pub(crate) cwd: Option<String>,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeEnforcementEventListRequest {
     limit: Option<u32>,
 }
 
@@ -2064,6 +2103,49 @@ impl SqliteUsageRepository {
                     candidate_age_seconds: row.get(14)?,
                     claimed: row.get(15)?,
                     task_scope_key: row.get(16)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(UsageRepositoryError::from)
+    }
+
+    fn list_runtime_enforcement_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RuntimeEnforcementEventResponse>, UsageRepositoryError> {
+        let mut statement = self.connection.prepare(
+            "SELECT e.id, e.created_at, e.session_id, e.turn_id, e.agent_id,
+                    a.name, e.agent_type, e.orchestration_phase, e.tool_name,
+                    e.decision, e.reason_code, e.cwd, e.message, e.codex_agent_id,
+                    e.lease_id, e.workspace_scope_key, e.task_scope_key,
+                    e.lease_state, e.lease_expires_at
+             FROM runtime_enforcement_events e
+             LEFT JOIN agents a ON a.id = e.agent_id
+             ORDER BY e.created_at DESC, e.rowid DESC
+             LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| {
+                Ok(RuntimeEnforcementEventResponse {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    session_id: row.get(2)?,
+                    turn_id: row.get(3)?,
+                    agent_id: row.get(4)?,
+                    agent_name_snapshot: row.get(5)?,
+                    agent_type: row.get(6)?,
+                    orchestration_phase: row.get(7)?,
+                    codex_agent_id: row.get(13)?,
+                    lease_id: row.get(14)?,
+                    workspace_scope_key: row.get(15)?,
+                    task_scope_key: row.get(16)?,
+                    lease_state: row.get(17)?,
+                    lease_expires_at: row.get(18)?,
+                    tool_name: row.get(8)?,
+                    decision: row.get(9)?,
+                    reason_code: row.get(10)?,
+                    cwd: row.get(11)?,
+                    message: row.get(12)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -3342,6 +3424,52 @@ mod tests {
         assert_eq!(decisions[0].source, "DESKTOP_EXECUTE");
         assert_eq!(decisions[0].decision, "REUSE");
         assert_eq!(decisions[1].source, "DESKTOP_PREVIEW");
+    }
+
+    #[test]
+    fn runtime_enforcement_events_are_listed_with_agent_identity() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service
+            .repository()
+            .unwrap()
+            .connection
+            .execute(
+                "INSERT INTO runtime_enforcement_events (
+                    id, created_at, session_id, turn_id, agent_id, agent_type,
+                    orchestration_phase, tool_name, decision, reason_code, cwd, message,
+                    codex_agent_id, lease_id, workspace_scope_key, task_scope_key,
+                    lease_state, lease_expires_at
+                 ) VALUES (
+                    'event-1', '2026-08-11T10:00:00Z', 'session-1', 'turn-1',
+                    'agent-1', 'executor', 'EXECUTION', 'apply_patch', 'ALLOW',
+                    'EXECUTION_LEASE_ACTIVE', 'c:/workspace', '已放行。',
+                    'codex-agent-1', 'lease-1', 'c:/workspace', 'auth-oauth2',
+                    'ACTIVE', '2026-08-11T11:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let events = service
+            .list_runtime_enforcement_events(RuntimeEnforcementEventListRequest::default())
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].agent_name_snapshot.as_deref(), Some("Executor"));
+        assert_eq!(events[0].decision, "ALLOW");
+        assert_eq!(events[0].reason_code, "EXECUTION_LEASE_ACTIVE");
+        assert_eq!(events[0].codex_agent_id.as_deref(), Some("codex-agent-1"));
+        assert_eq!(events[0].lease_id.as_deref(), Some("lease-1"));
+        assert_eq!(
+            events[0].workspace_scope_key.as_deref(),
+            Some("c:/workspace")
+        );
+        assert_eq!(events[0].task_scope_key.as_deref(), Some("auth-oauth2"));
+        assert_eq!(events[0].lease_state.as_deref(), Some("ACTIVE"));
+        assert_eq!(
+            events[0].lease_expires_at.as_deref(),
+            Some("2026-08-11T11:00:00Z")
+        );
     }
 
     #[test]

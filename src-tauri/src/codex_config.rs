@@ -13,6 +13,15 @@ const AUTH_TIMEOUT_MS: i64 = 5_000;
 const AUTH_REFRESH_INTERVAL_MS: i64 = 300_000;
 const ORCHESTRATION_BEGIN: &str = "<<< CAS ORCHESTRATION v1 >>>";
 const ORCHESTRATION_END: &str = "<<< END CAS ORCHESTRATION v1 >>>";
+const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
+const RUNTIME_HOOK_EVENTS: [(&str, &str); 3] = [
+    ("SubagentStart", ".*"),
+    ("SubagentStop", ".*"),
+    (
+        "PreToolUse",
+        "^(Bash|shell_command|exec_command|apply_patch|Edit|Write)$",
+    ),
+];
 const GLOBAL_ORCHESTRATION_BEGIN: &str = "<!-- CAS ORCHESTRATION v1 BEGIN -->";
 const GLOBAL_ORCHESTRATION_END: &str = "<!-- CAS ORCHESTRATION v1 END -->";
 pub(crate) const ORCHESTRATION_RUNTIME_CONTRACT: &str =
@@ -385,10 +394,20 @@ pub(crate) fn restore_project_exclusion_projection(
     Ok(render_document(document, current))
 }
 
+#[cfg(test)]
 pub(crate) fn upsert_orchestration_projection(
     existing: &str,
     instructions: &str,
     baseline: &OrchestrationBaseline,
+) -> Result<String, ConfigError> {
+    upsert_orchestration_projection_with_hooks(existing, instructions, baseline, None)
+}
+
+pub(crate) fn upsert_orchestration_projection_with_hooks(
+    existing: &str,
+    instructions: &str,
+    baseline: &OrchestrationBaseline,
+    runtime_hook_command: Option<&str>,
 ) -> Result<String, ConfigError> {
     let mut document = existing.parse::<DocumentMut>()?;
     let current_instructions =
@@ -414,6 +433,10 @@ pub(crate) fn upsert_orchestration_projection(
     ensure_agents_table(&mut document)?;
     document["agents"]["enabled"] = value(true);
     set_multi_agent_v2(&mut document, false)?;
+    remove_runtime_hooks(&mut document)?;
+    if let Some(command) = runtime_hook_command {
+        append_runtime_hooks(&mut document, command)?;
+    }
     Ok(render_document(document, existing))
 }
 
@@ -450,6 +473,7 @@ pub(crate) fn remove_orchestration_projection(
     }
     restore_agents_enabled(&mut document, baseline.agents_enabled)?;
     restore_multi_agent_v2(&mut document, baseline.multi_agent_v2_enabled)?;
+    remove_runtime_hooks(&mut document)?;
     Ok(render_document(document, existing))
 }
 
@@ -492,6 +516,8 @@ pub(crate) fn restore_orchestration_projection(
         .and_then(TomlValue::as_bool);
     restore_agents_enabled(&mut document, snapshot_agents_enabled)?;
     restore_multi_agent_v2(&mut document, optional_multi_agent_v2(&snapshot_document)?)?;
+    remove_runtime_hooks(&mut document)?;
+    restore_runtime_hooks(&mut document, &snapshot_document)?;
     Ok(render_document(document, current))
 }
 
@@ -516,10 +542,144 @@ pub(crate) fn orchestration_projection_semantic(
     });
     if block.contains(ORCHESTRATION_RUNTIME_CONTRACT) {
         semantic["multiAgentV2"] = optional_multi_agent_v2(&document)?.into();
+        semantic["runtimeHooks"] = runtime_hooks_semantic(&document).into();
     }
     Ok(Some(
         serde_json::to_string(&semantic).expect("JSON value must serialize"),
     ))
+}
+
+fn append_runtime_hooks(document: &mut DocumentMut, command: &str) -> Result<(), ConfigError> {
+    if !document.contains_key("hooks") {
+        document["hooks"] = Item::Table(Table::new());
+    }
+    let hooks = document["hooks"]
+        .as_table_mut()
+        .ok_or(ConfigError::InvalidStructure("hooks"))?;
+    for (event, matcher) in RUNTIME_HOOK_EVENTS {
+        if !hooks.contains_key(event) {
+            hooks[event] = Item::ArrayOfTables(ArrayOfTables::new());
+        }
+        let entries = hooks[event]
+            .as_array_of_tables_mut()
+            .ok_or(ConfigError::InvalidStructure("hooks event"))?;
+        let mut entry = Table::new();
+        entry["matcher"] = value(matcher);
+        let mut handlers = ArrayOfTables::new();
+        let mut handler = Table::new();
+        handler["type"] = value("command");
+        handler["command"] = value(command);
+        handler["command_windows"] = value(command);
+        handlers.push(handler);
+        entry["hooks"] = Item::ArrayOfTables(handlers);
+        entries.push(entry);
+    }
+    Ok(())
+}
+
+fn remove_runtime_hooks(document: &mut DocumentMut) -> Result<(), ConfigError> {
+    let Some(hooks) = document.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks
+        .as_table_mut()
+        .ok_or(ConfigError::InvalidStructure("hooks"))?;
+    for (event, _) in RUNTIME_HOOK_EVENTS {
+        let remove_event = if let Some(item) = hooks.get_mut(event) {
+            let entries = item
+                .as_array_of_tables_mut()
+                .ok_or(ConfigError::InvalidStructure("hooks event"))?;
+            for index in (0..entries.len()).rev() {
+                if entries.get(index).is_some_and(runtime_hook_entry_is_owned) {
+                    entries.remove(index);
+                }
+            }
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_event {
+            hooks.remove(event);
+        }
+    }
+    if hooks.is_empty() {
+        document.remove("hooks");
+    }
+    Ok(())
+}
+
+fn restore_runtime_hooks(
+    document: &mut DocumentMut,
+    snapshot: &DocumentMut,
+) -> Result<(), ConfigError> {
+    let Some(snapshot_hooks) = snapshot.get("hooks") else {
+        return Ok(());
+    };
+    let snapshot_hooks = snapshot_hooks
+        .as_table()
+        .ok_or(ConfigError::InvalidStructure("hooks"))?;
+    for (event, _) in RUNTIME_HOOK_EVENTS {
+        let Some(entries) = snapshot_hooks.get(event) else {
+            continue;
+        };
+        let entries = entries
+            .as_array_of_tables()
+            .ok_or(ConfigError::InvalidStructure("hooks event"))?;
+        for entry in entries
+            .iter()
+            .filter(|entry| runtime_hook_entry_is_owned(entry))
+        {
+            if !document.contains_key("hooks") {
+                document["hooks"] = Item::Table(Table::new());
+            }
+            let hooks = document["hooks"]
+                .as_table_mut()
+                .ok_or(ConfigError::InvalidStructure("hooks"))?;
+            if !hooks.contains_key(event) {
+                hooks[event] = Item::ArrayOfTables(ArrayOfTables::new());
+            }
+            hooks[event]
+                .as_array_of_tables_mut()
+                .ok_or(ConfigError::InvalidStructure("hooks event"))?
+                .push(entry.clone());
+        }
+    }
+    Ok(())
+}
+
+fn runtime_hook_entry_is_owned(entry: &Table) -> bool {
+    entry
+        .get("hooks")
+        .and_then(Item::as_array_of_tables)
+        .is_some_and(|handlers| {
+            handlers.iter().any(|handler| {
+                ["command", "command_windows"].iter().any(|key| {
+                    handler
+                        .get(key)
+                        .and_then(Item::as_value)
+                        .and_then(TomlValue::as_str)
+                        .is_some_and(|command| command.contains(RUNTIME_HOOK_MARKER))
+                })
+            })
+        })
+}
+
+fn runtime_hooks_semantic(document: &DocumentMut) -> String {
+    let Some(hooks) = document.get("hooks").and_then(Item::as_table) else {
+        return "[]".to_owned();
+    };
+    let mut entries = Vec::new();
+    for (event, _) in RUNTIME_HOOK_EVENTS {
+        if let Some(event_entries) = hooks.get(event).and_then(Item::as_array_of_tables) {
+            entries.extend(
+                event_entries
+                    .iter()
+                    .filter(|entry| runtime_hook_entry_is_owned(entry))
+                    .map(|entry| format!("{}:{}", json_string(event), canonical_table(entry))),
+            );
+        }
+    }
+    format!("[{}]", entries.join(","))
 }
 
 #[cfg(test)]
@@ -1142,6 +1302,63 @@ multi_agent_v2 = true
         assert_eq!(restored["agents"]["enabled"].as_bool(), Some(false));
         assert_eq!(restored["agents"]["max_threads"].as_integer(), Some(6));
         assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn runtime_hooks_preserve_user_entries_and_default_removes_only_cas_owned_entries() {
+        let existing = r#"default_permissions = ":workspace"
+
+[[hooks.PreToolUse]]
+matcher = "^MCP$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "user-hook --check"
+"#;
+        let baseline = capture_orchestration_baseline(existing).unwrap();
+        let instructions = format!("{ORCHESTRATION_RUNTIME_CONTRACT}\n必须委派写入。");
+        let active = upsert_orchestration_projection_with_hooks(
+            existing,
+            &instructions,
+            &baseline,
+            Some(r#""C:\Program Files\CAS\cas-helper.exe" hook "C:\CAS\cas.db" cas-runtime-enforcement-v1"#),
+        )
+        .unwrap();
+        assert!(active.contains("user-hook --check"));
+        assert_eq!(active.matches(RUNTIME_HOOK_MARKER).count(), 6);
+        assert!(
+            orchestration_projection_semantic(&active)
+                .unwrap()
+                .is_some_and(|semantic| semantic.contains("runtimeHooks"))
+        );
+
+        let restored = remove_orchestration_projection(&active, &baseline).unwrap();
+        assert!(restored.contains("user-hook --check"));
+        assert!(!restored.contains(RUNTIME_HOOK_MARKER));
+    }
+
+    #[test]
+    fn orchestration_snapshot_restore_reinstates_only_snapshot_cas_hooks() {
+        let baseline = capture_orchestration_baseline("").unwrap();
+        let instructions = format!("{ORCHESTRATION_RUNTIME_CONTRACT}\n必须委派写入。");
+        let snapshot = upsert_orchestration_projection_with_hooks(
+            "",
+            &instructions,
+            &baseline,
+            Some("old-helper hook old.db cas-runtime-enforcement-v1"),
+        )
+        .unwrap();
+        let current = upsert_orchestration_projection_with_hooks(
+            "",
+            &instructions,
+            &baseline,
+            Some("new-helper hook new.db cas-runtime-enforcement-v1"),
+        )
+        .unwrap();
+
+        let restored = restore_orchestration_projection(&current, &snapshot).unwrap();
+        assert!(restored.contains("old-helper hook old.db"));
+        assert!(!restored.contains("new-helper hook new.db"));
     }
 
     #[test]

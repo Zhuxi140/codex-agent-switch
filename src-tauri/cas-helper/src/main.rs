@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -14,6 +14,7 @@ use cas_scheduler::{
     effective_model_reasoning_efforts, normalize_task_scope_key, normalize_workspace_scope_key,
     recommend, render_delegated_agent_instructions_for_phase, resolve_agent_reasoning_effort,
     runtime_fingerprint as shared_runtime_fingerprint, skill_fingerprint_values,
+    workspace_is_within,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
@@ -24,6 +25,9 @@ const EXIT_STORE_UNAVAILABLE: u8 = 4;
 const EXIT_PERMISSION_DENIED: u8 = 5;
 const EXIT_RETRIEVAL_FAILED: u8 = 6;
 const EXIT_SCHEDULING_UNAVAILABLE: u8 = 7;
+const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
+const RUNTIME_DELEGATION_LEASE_TTL_SECONDS: i64 = 3_600;
 
 fn main() -> ExitCode {
     match parse_args(env::args_os()) {
@@ -80,12 +84,14 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::Hook { database_path }) => runtime_hook(database_path),
         Err(()) => {
             eprintln!(
                 "Usage:\n  cas-helper token <credential-id>\n  \
                  cas-helper schedule <agent-key> [task-key]\n  \
                  cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
-                 cas-helper bind <agent-key> <child-thread-id> [task-key]"
+                 cas-helper bind <agent-key> <child-thread-id> [task-key]\n  \
+                 cas-helper hook <database-path> cas-runtime-enforcement-v1"
             );
             ExitCode::from(EXIT_INVALID_ARGUMENTS)
         }
@@ -104,6 +110,9 @@ enum Command {
         agent_key: String,
         child_thread_id: String,
         task_scope_key: Option<String>,
+    },
+    Hook {
+        database_path: PathBuf,
     },
 }
 
@@ -175,6 +184,14 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             task_scope_key,
         });
     }
+    if command == OsStr::new("hook") {
+        let database_path = PathBuf::from(args.next().ok_or(())?);
+        let marker = valid_argument(args.next().ok_or(())?)?;
+        if args.next().is_some() || !database_path.is_absolute() || marker != RUNTIME_HOOK_MARKER {
+            return Err(());
+        }
+        return Ok(Command::Hook { database_path });
+    }
     Err(())
 }
 
@@ -238,6 +255,916 @@ fn deliver(id: CredentialId) -> ExitCode {
             ExitCode::from(EXIT_RETRIEVAL_FAILED)
         }
     }
+}
+
+fn runtime_hook(database_path: PathBuf) -> ExitCode {
+    let mut input = Vec::new();
+    if io::stdin()
+        .lock()
+        .take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut input)
+        .is_err()
+        || input.len() as u64 > MAX_HOOK_INPUT_BYTES
+    {
+        eprintln!("CAS runtime hook input unavailable.");
+        return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+    }
+    let payload = match serde_json::from_slice::<serde_json::Value>(&input) {
+        Ok(payload) => payload,
+        Err(_) => {
+            eprintln!("CAS runtime hook input invalid.");
+            return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+        }
+    };
+    match payload
+        .get("hook_event_name")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("SubagentStart") => record_subagent_start(&database_path, &payload),
+        Some("PreToolUse") => enforce_pre_tool_use(&database_path, &payload),
+        Some("SubagentStop") => record_subagent_stop(&database_path, &payload),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeLease {
+    id: String,
+    agent_id: String,
+    parent_thread_id: String,
+    codex_agent_id: Option<String>,
+    workspace_scope_key: String,
+    task_scope_key: Option<String>,
+    state: String,
+    expires_at: String,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeIdentity {
+    agent_id: Option<String>,
+    agent_type: Option<String>,
+    phase: Option<String>,
+    codex_agent_id: Option<String>,
+    lease: Option<RuntimeLease>,
+}
+
+fn record_subagent_start(database_path: &Path, payload: &serde_json::Value) -> ExitCode {
+    let Some(turn_id) = hook_string(payload, "turn_id") else {
+        return ExitCode::SUCCESS;
+    };
+    let Some(session_id) = hook_string(payload, "session_id") else {
+        return ExitCode::SUCCESS;
+    };
+    let Some(agent_type) = hook_string(payload, "agent_type") else {
+        return ExitCode::SUCCESS;
+    };
+    let Some(codex_agent_id) = hook_string(payload, "agent_id") else {
+        return ExitCode::SUCCESS;
+    };
+    let workspace_scope_key = hook_string(payload, "cwd").and_then(normalize_workspace_scope_key);
+    let connection = match open_runtime_database(database_path) {
+        Ok(connection) => connection,
+        Err(()) => return ExitCode::SUCCESS,
+    };
+    let managed = find_active_agent_for_type(&connection, agent_type)
+        .ok()
+        .flatten();
+    let (agent_id, phase, lease) = match managed {
+        Some((agent_id, phase)) => {
+            let lease = resolve_start_lease(
+                &connection,
+                &agent_id,
+                session_id,
+                codex_agent_id,
+                workspace_scope_key.as_deref(),
+            )
+            .ok()
+            .flatten();
+            (Some(agent_id), phase, lease)
+        }
+        None => (None, Some("UNMANAGED".to_owned()), None),
+    };
+    if connection
+        .execute(
+            "INSERT INTO runtime_hook_turns (
+                turn_id, session_id, agent_id, agent_type, orchestration_phase,
+                codex_agent_id, lease_id, workspace_scope_key, task_scope_key,
+                lease_state, lease_expires_at, stopped_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+             ON CONFLICT(turn_id) DO UPDATE SET
+                session_id = excluded.session_id,
+                agent_id = excluded.agent_id,
+                agent_type = excluded.agent_type,
+                orchestration_phase = excluded.orchestration_phase,
+                codex_agent_id = excluded.codex_agent_id,
+                lease_id = excluded.lease_id,
+                workspace_scope_key = excluded.workspace_scope_key,
+                task_scope_key = excluded.task_scope_key,
+                lease_state = excluded.lease_state,
+                lease_expires_at = excluded.lease_expires_at,
+                stopped_at = NULL,
+                updated_at = excluded.updated_at",
+            params![
+                turn_id,
+                session_id,
+                agent_id,
+                agent_type,
+                phase,
+                codex_agent_id,
+                lease.as_ref().map(|value| value.id.as_str()),
+                lease
+                    .as_ref()
+                    .map(|value| value.workspace_scope_key.as_str())
+                    .or(workspace_scope_key.as_deref()),
+                lease
+                    .as_ref()
+                    .and_then(|value| value.task_scope_key.as_deref()),
+                lease.as_ref().map(|value| value.state.as_str()),
+                lease.as_ref().map(|value| value.expires_at.as_str()),
+            ],
+        )
+        .is_err()
+    {
+        eprintln!("CAS runtime hook mapping unavailable.");
+    }
+    let identity = RuntimeIdentity {
+        agent_id,
+        agent_type: Some(agent_type.to_owned()),
+        phase,
+        codex_agent_id: Some(codex_agent_id.to_owned()),
+        lease,
+    };
+    if identity.phase.as_deref() != Some("UNMANAGED") {
+        let (decision, reason_code, message) = if identity.lease.is_some() {
+            (
+                "ALLOW",
+                "DELEGATION_LEASE_ACTIVATED",
+                "CAS 已将 Codex 子 Agent 身份绑定到本次委派租约。",
+            )
+        } else {
+            (
+                "WARN",
+                "DELEGATION_LEASE_UNRESOLVED",
+                "CAS 尚未找到与该子 Agent 匹配的委派租约；EXECUTION 写入将在绑定完成前被拒绝。",
+            )
+        };
+        record_enforcement_event(
+            &connection,
+            session_id,
+            turn_id,
+            &identity,
+            "SubagentStart",
+            decision,
+            reason_code,
+            workspace_scope_key.as_deref(),
+            message,
+        );
+        if decision == "WARN" {
+            return emit_hook_warning(message);
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn resolve_start_lease(
+    connection: &Connection,
+    agent_id: &str,
+    hook_session_id: &str,
+    codex_agent_id: &str,
+    workspace_scope_key: Option<&str>,
+) -> Result<Option<RuntimeLease>, rusqlite::Error> {
+    expire_runtime_leases(connection)?;
+    let active = load_unique_runtime_lease(
+        connection,
+        "agent_id = ?1 AND codex_agent_id = ?2 AND state = 'ACTIVE'\
+         AND julianday(expires_at) > julianday('now')",
+        [agent_id, codex_agent_id],
+    )?;
+    if active.is_some() {
+        return Ok(active);
+    }
+    let Some(workspace_scope_key) = workspace_scope_key else {
+        return Ok(None);
+    };
+    let exact_parent = load_runtime_leases(
+        connection,
+        "agent_id = ?1 AND parent_thread_id = ?2 AND workspace_scope_key = ?3\
+         AND state = 'PENDING' AND julianday(expires_at) > julianday('now')",
+        [agent_id, hook_session_id, workspace_scope_key],
+    )?;
+    let candidates = if exact_parent.is_empty() {
+        load_runtime_leases(
+            connection,
+            "agent_id = ?1 AND workspace_scope_key = ?2 AND state = 'PENDING'\
+             AND julianday(expires_at) > julianday('now')",
+            [agent_id, workspace_scope_key],
+        )?
+    } else {
+        exact_parent
+    };
+    let [candidate] = candidates.as_slice() else {
+        return Ok(None);
+    };
+    let changed = connection.execute(
+        "UPDATE runtime_delegation_leases
+         SET codex_agent_id = ?2, state = 'ACTIVE', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?3)
+         WHERE id = ?1 AND state = 'PENDING'",
+        params![
+            candidate.id,
+            codex_agent_id,
+            format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds")
+        ],
+    )?;
+    if changed != 1 {
+        return Ok(None);
+    }
+    load_runtime_lease(connection, &candidate.id)
+}
+
+fn enforce_pre_tool_use(database_path: &Path, payload: &serde_json::Value) -> ExitCode {
+    let tool_name = hook_string(payload, "tool_name").unwrap_or("Unknown");
+    let command = payload
+        .get("tool_input")
+        .and_then(|value| value.get("command"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    if !policy_relevant_write(tool_name, command) {
+        return ExitCode::SUCCESS;
+    }
+    let turn_id = hook_string(payload, "turn_id").unwrap_or("unknown-turn");
+    let session_id = hook_string(payload, "session_id").unwrap_or("unknown-session");
+    let cwd = hook_string(payload, "cwd");
+    let connection = match open_runtime_database(database_path) {
+        Ok(connection) => connection,
+        Err(()) => {
+            return emit_hook_deny(
+                "RUNTIME_POLICY_UNAVAILABLE",
+                "CAS Runtime Enforcement 无法读取策略数据库，已拒绝明确写入以避免静默失守。",
+            );
+        }
+    };
+    let identity = match resolve_runtime_identity(&connection, payload, turn_id, session_id) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return emit_hook_deny(
+                "RUNTIME_POLICY_UNAVAILABLE",
+                "CAS Runtime Enforcement 无法读取运行时身份，已拒绝明确写入以避免静默失守。",
+            );
+        }
+    };
+    let (decision, reason_code, message) = match identity.phase.as_deref() {
+        Some("EXECUTION") => match validate_execution_lease(&connection, &identity, cwd) {
+            Ok(()) => (
+                "ALLOW",
+                "EXECUTION_LEASE_WRITE_ALLOWED",
+                "EXECUTION Agent 的有效委派租约已验证，明确工作区写入已放行。",
+            ),
+            Err((reason_code, message)) => ("DENY", reason_code, message),
+        },
+        Some("DISCOVERY" | "REVIEW" | "VERIFICATION") => (
+            "DENY",
+            "READ_ONLY_ROLE_WRITE_DENIED",
+            "当前子 Agent 角色只负责发现、审查或验证，不允许执行写入。",
+        ),
+        Some("UNMANAGED") | Some(_) => return ExitCode::SUCCESS,
+        None => match orchestration_failure_policy(&connection).as_str() {
+            "PRIMARY_FALLBACK" => (
+                "WARN",
+                "PRIMARY_FALLBACK_WRITE_WARNING",
+                "Primary 正在接管明确写入；CAS 已按 Primary Fallback 放行并记录审计。",
+            ),
+            _ => (
+                "DENY",
+                "PRIMARY_STRICT_STOP_WRITE_DENIED",
+                "Strict Stop 已阻止 Primary 直接写入；请委派给 EXECUTION Agent。",
+            ),
+        },
+    };
+    record_enforcement_event(
+        &connection,
+        session_id,
+        turn_id,
+        &identity,
+        tool_name,
+        decision,
+        reason_code,
+        cwd,
+        message,
+    );
+    match decision {
+        "DENY" => emit_hook_deny(reason_code, message),
+        "WARN" => emit_hook_warning(message),
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+fn resolve_runtime_identity(
+    connection: &Connection,
+    payload: &serde_json::Value,
+    turn_id: &str,
+    session_id: &str,
+) -> Result<RuntimeIdentity, rusqlite::Error> {
+    expire_runtime_leases(connection)?;
+    let mapped = connection
+        .query_row(
+            "SELECT h.agent_id, h.agent_type,
+                    CASE WHEN h.agent_id IS NOT NULL AND EXISTS (
+                        SELECT 1 FROM agents a WHERE a.id = h.agent_id AND a.enabled = 1
+                          AND (
+                            EXISTS (SELECT 1 FROM active_agent_bindings b WHERE b.agent_id = a.id)
+                            OR EXISTS (SELECT 1 FROM configuration_state s WHERE s.active_agent_id = a.id)
+                          )
+                    ) THEN h.orchestration_phase ELSE 'UNMANAGED' END,
+                    h.codex_agent_id, h.lease_id
+             FROM runtime_hook_turns h WHERE h.turn_id = ?1",
+            [turn_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((agent_id, agent_type, phase, codex_agent_id, lease_id)) = mapped {
+        let lease = lease_id
+            .as_deref()
+            .map(|lease_id| load_runtime_lease(connection, lease_id))
+            .transpose()?
+            .flatten();
+        return Ok(RuntimeIdentity {
+            agent_id,
+            agent_type: Some(agent_type),
+            phase,
+            codex_agent_id,
+            lease,
+        });
+    }
+    let lease = load_unique_runtime_lease(
+        connection,
+        "codex_agent_id = ?1 AND state = 'ACTIVE' AND julianday(expires_at) > julianday('now')",
+        [session_id],
+    )?;
+    if let Some(lease) = lease {
+        let agent = connection.query_row(
+            "SELECT a.agent_key, a.orchestration_phase
+             FROM agents a WHERE a.id = ?1 AND a.enabled = 1
+               AND (
+                 EXISTS (SELECT 1 FROM active_agent_bindings b WHERE b.agent_id = a.id)
+                 OR EXISTS (SELECT 1 FROM configuration_state s WHERE s.active_agent_id = a.id)
+               )",
+            [&lease.agent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )?;
+        remember_turn_from_lease(
+            connection,
+            turn_id,
+            session_id,
+            &agent.0,
+            agent.1.as_deref(),
+            &lease,
+        )?;
+        return Ok(RuntimeIdentity {
+            agent_id: Some(lease.agent_id.clone()),
+            agent_type: Some(agent.0),
+            phase: agent.1,
+            codex_agent_id: lease.codex_agent_id.clone(),
+            lease: Some(lease),
+        });
+    }
+    if let Some(agent_type) = hook_string(payload, "agent_type") {
+        let managed = find_active_agent_for_type(connection, agent_type)?;
+        return Ok(match managed {
+            Some((agent_id, phase)) => RuntimeIdentity {
+                agent_id: Some(agent_id),
+                agent_type: Some(agent_type.to_owned()),
+                phase,
+                codex_agent_id: hook_string(payload, "agent_id").map(str::to_owned),
+                lease: None,
+            },
+            None => RuntimeIdentity {
+                agent_type: Some(agent_type.to_owned()),
+                phase: Some("UNMANAGED".to_owned()),
+                ..RuntimeIdentity::default()
+            },
+        });
+    }
+    Ok(RuntimeIdentity::default())
+}
+
+fn validate_execution_lease(
+    connection: &Connection,
+    identity: &RuntimeIdentity,
+    cwd: Option<&str>,
+) -> Result<(), (&'static str, &'static str)> {
+    let Some(lease) = identity.lease.as_ref() else {
+        return Err((
+            "EXECUTION_LEASE_MISSING",
+            "EXECUTION Agent 未绑定有效的 CAS 委派租约，已拒绝写入。",
+        ));
+    };
+    if lease.state != "ACTIVE" {
+        return Err((
+            "EXECUTION_LEASE_INACTIVE",
+            "EXECUTION Agent 的 CAS 委派租约已结束，已拒绝写入。",
+        ));
+    }
+    if identity.agent_id.as_deref() != Some(lease.agent_id.as_str())
+        || identity
+            .codex_agent_id
+            .as_deref()
+            .zip(lease.codex_agent_id.as_deref())
+            .is_none_or(|(actual, expected)| actual != expected)
+    {
+        return Err((
+            "AGENT_IDENTITY_MISMATCH",
+            "Codex 子 Agent 身份与 CAS 委派租约不一致，已拒绝写入。",
+        ));
+    }
+    let Some(cwd_scope) = cwd.and_then(normalize_workspace_scope_key) else {
+        return Err((
+            "WORKSPACE_SCOPE_UNAVAILABLE",
+            "无法确认当前工作区范围，已拒绝 EXECUTION Agent 写入。",
+        ));
+    };
+    if !workspace_is_within(&cwd_scope, &lease.workspace_scope_key) {
+        return Err((
+            "WORKSPACE_SCOPE_MISMATCH",
+            "当前工作区不属于本次 CAS 委派范围，已拒绝写入。",
+        ));
+    }
+    if project_is_excluded(connection, &cwd_scope).unwrap_or(true) {
+        return Err((
+            "PROJECT_EXCLUDED",
+            "当前项目已被 CAS 排除，已拒绝子 Agent 写入。",
+        ));
+    }
+    let changed = connection
+        .execute(
+            "UPDATE runtime_delegation_leases
+             SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
+             WHERE id = ?1 AND state = 'ACTIVE' AND julianday(expires_at) > julianday('now')",
+            params![
+                lease.id,
+                format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds")
+            ],
+        )
+        .unwrap_or(0);
+    (changed == 1).then_some(()).ok_or((
+        "EXECUTION_LEASE_EXPIRED",
+        "EXECUTION Agent 的 CAS 委派租约已过期，已拒绝写入。",
+    ))
+}
+
+fn project_is_excluded(
+    connection: &Connection,
+    workspace_scope_key: &str,
+) -> Result<bool, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT project_path FROM project_orchestration_exclusions ORDER BY normalized_path",
+    )?;
+    let paths = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(paths
+        .iter()
+        .filter_map(|path| normalize_workspace_scope_key(path))
+        .any(|excluded| workspace_is_within(workspace_scope_key, &excluded)))
+}
+
+fn record_subagent_stop(database_path: &Path, payload: &serde_json::Value) -> ExitCode {
+    let session_id = hook_string(payload, "session_id").unwrap_or("unknown-session");
+    let turn_id = hook_string(payload, "turn_id").unwrap_or("unknown-turn");
+    let Some(codex_agent_id) = hook_string(payload, "agent_id") else {
+        println!("{{}}");
+        return ExitCode::SUCCESS;
+    };
+    let connection = match open_runtime_database(database_path) {
+        Ok(connection) => connection,
+        Err(()) => {
+            println!("{{}}");
+            return ExitCode::SUCCESS;
+        }
+    };
+    let lease = load_unique_runtime_lease(
+        &connection,
+        "codex_agent_id = ?1 AND state = 'ACTIVE'",
+        [codex_agent_id],
+    )
+    .ok()
+    .flatten();
+    let mut identity = if let Some(lease) = lease.as_ref() {
+        let agent = connection
+            .query_row(
+                "SELECT agent_key, orchestration_phase FROM agents WHERE id = ?1",
+                [&lease.agent_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        RuntimeIdentity {
+            agent_id: Some(lease.agent_id.clone()),
+            agent_type: agent.as_ref().map(|value| value.0.clone()),
+            phase: agent.and_then(|value| value.1),
+            codex_agent_id: Some(codex_agent_id.to_owned()),
+            lease: Some(lease.clone()),
+        }
+    } else {
+        RuntimeIdentity {
+            agent_type: hook_string(payload, "agent_type").map(str::to_owned),
+            codex_agent_id: Some(codex_agent_id.to_owned()),
+            ..RuntimeIdentity::default()
+        }
+    };
+    let released = connection
+        .execute(
+            "UPDATE runtime_delegation_leases
+             SET state = 'RELEASED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 release_reason = 'SUBAGENT_STOP'
+             WHERE codex_agent_id = ?1 AND state = 'ACTIVE'",
+            [codex_agent_id],
+        )
+        .unwrap_or(0);
+    let _ = connection.execute(
+        "UPDATE runtime_hook_turns
+         SET lease_state = 'RELEASED', stopped_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE codex_agent_id = ?1 AND stopped_at IS NULL",
+        [codex_agent_id],
+    );
+    let _ = connection.execute(
+        "UPDATE agent_thread_instances
+         SET status = 'IDLE', claimed_until = NULL,
+             last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE codex_thread_id = ?1",
+        [codex_agent_id],
+    );
+    if let Some(lease) = lease.as_ref() {
+        let _ = connection.execute(
+            "DELETE FROM agent_spawn_reservations
+             WHERE agent_id = ?1 AND parent_thread_id = ?2
+               AND workspace_scope_key = ?3
+               AND task_scope_key IS ?4",
+            params![
+                lease.agent_id,
+                lease.parent_thread_id,
+                lease.workspace_scope_key,
+                lease.task_scope_key
+            ],
+        );
+    }
+    let (decision, reason_code, message) = if released > 0 {
+        if let Some(lease) = identity.lease.as_mut() {
+            lease.state = "RELEASED".to_owned();
+        }
+        (
+            "ALLOW",
+            "DELEGATION_LEASE_RELEASED",
+            "子 Agent 已结束，本次委派租约已释放；Thread 保留给后续复用决策。",
+        )
+    } else {
+        (
+            "WARN",
+            "DELEGATION_LEASE_STOP_UNRESOLVED",
+            "子 Agent 已结束，但 CAS 未找到活动委派租约；已保留诊断记录。",
+        )
+    };
+    record_enforcement_event(
+        &connection,
+        session_id,
+        turn_id,
+        &identity,
+        "SubagentStop",
+        decision,
+        reason_code,
+        hook_string(payload, "cwd"),
+        message,
+    );
+    println!("{{}}");
+    ExitCode::SUCCESS
+}
+
+fn open_runtime_database(path: &Path) -> Result<Connection, ()> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| ())?;
+    connection
+        .busy_timeout(Duration::from_secs(2))
+        .map_err(|_| ())?;
+    Ok(connection)
+}
+
+fn find_active_agent(
+    connection: &Connection,
+    agent_key: &str,
+) -> Result<Option<(String, Option<String>)>, rusqlite::Error> {
+    connection
+        .query_row(
+            "SELECT a.id, a.orchestration_phase
+             FROM agents a
+             WHERE a.agent_key = ?1 AND a.enabled = 1
+               AND (
+                 EXISTS (SELECT 1 FROM active_agent_bindings b WHERE b.agent_id = a.id)
+                 OR EXISTS (SELECT 1 FROM configuration_state s WHERE s.active_agent_id = a.id)
+               )",
+            [agent_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+}
+
+fn find_active_agent_for_type(
+    connection: &Connection,
+    agent_type: &str,
+) -> Result<Option<(String, Option<String>)>, rusqlite::Error> {
+    let exact = find_active_agent(connection, agent_type)?;
+    if exact.is_some() {
+        return Ok(exact);
+    }
+    match agent_type.strip_prefix("cas-") {
+        Some(agent_key) => find_active_agent(connection, agent_key),
+        None => Ok(None),
+    }
+}
+
+fn orchestration_failure_policy(connection: &Connection) -> String {
+    connection
+        .query_row(
+            "SELECT setting_value FROM application_settings
+             WHERE setting_key = 'orchestration_failure_policy'",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+        .unwrap_or_else(|| "STRICT_STOP".to_owned())
+}
+
+fn load_runtime_lease(
+    connection: &Connection,
+    lease_id: &str,
+) -> Result<Option<RuntimeLease>, rusqlite::Error> {
+    connection
+        .query_row(
+            "SELECT id, agent_id, parent_thread_id, codex_agent_id, workspace_scope_key,
+                    task_scope_key, state, expires_at
+             FROM runtime_delegation_leases WHERE id = ?1",
+            [lease_id],
+            runtime_lease_from_row,
+        )
+        .optional()
+}
+
+fn load_runtime_leases<const N: usize>(
+    connection: &Connection,
+    condition: &str,
+    parameters: [&str; N],
+) -> Result<Vec<RuntimeLease>, rusqlite::Error> {
+    let mut statement = connection.prepare(&format!(
+        "SELECT id, agent_id, parent_thread_id, codex_agent_id, workspace_scope_key,
+                task_scope_key, state, expires_at
+         FROM runtime_delegation_leases WHERE {condition}
+         ORDER BY created_at DESC, rowid DESC"
+    ))?;
+    statement
+        .query_map(
+            rusqlite::params_from_iter(parameters),
+            runtime_lease_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn load_unique_runtime_lease<const N: usize>(
+    connection: &Connection,
+    condition: &str,
+    parameters: [&str; N],
+) -> Result<Option<RuntimeLease>, rusqlite::Error> {
+    let leases = load_runtime_leases(connection, condition, parameters)?;
+    Ok(match leases.as_slice() {
+        [lease] => Some(lease.clone()),
+        _ => None,
+    })
+}
+
+fn runtime_lease_from_row(row: &rusqlite::Row<'_>) -> Result<RuntimeLease, rusqlite::Error> {
+    Ok(RuntimeLease {
+        id: row.get(0)?,
+        agent_id: row.get(1)?,
+        parent_thread_id: row.get(2)?,
+        codex_agent_id: row.get(3)?,
+        workspace_scope_key: row.get(4)?,
+        task_scope_key: row.get(5)?,
+        state: row.get(6)?,
+        expires_at: row.get(7)?,
+    })
+}
+
+fn expire_runtime_leases(connection: &Connection) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "UPDATE runtime_delegation_leases
+         SET state = 'EXPIRED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             release_reason = 'TTL_EXPIRED'
+         WHERE state IN ('PENDING', 'ACTIVE')
+           AND julianday(expires_at) <= julianday('now')",
+        [],
+    )?;
+    Ok(())
+}
+
+fn remember_turn_from_lease(
+    connection: &Connection,
+    turn_id: &str,
+    session_id: &str,
+    agent_type: &str,
+    phase: Option<&str>,
+    lease: &RuntimeLease,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO runtime_hook_turns (
+            turn_id, session_id, agent_id, agent_type, orchestration_phase,
+            codex_agent_id, lease_id, workspace_scope_key, task_scope_key,
+            lease_state, lease_expires_at, stopped_at, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+         ON CONFLICT(turn_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            agent_id = excluded.agent_id,
+            agent_type = excluded.agent_type,
+            orchestration_phase = excluded.orchestration_phase,
+            codex_agent_id = excluded.codex_agent_id,
+            lease_id = excluded.lease_id,
+            workspace_scope_key = excluded.workspace_scope_key,
+            task_scope_key = excluded.task_scope_key,
+            lease_state = excluded.lease_state,
+            lease_expires_at = excluded.lease_expires_at,
+            stopped_at = NULL,
+            updated_at = excluded.updated_at",
+        params![
+            turn_id,
+            session_id,
+            lease.agent_id,
+            agent_type,
+            phase,
+            lease.codex_agent_id,
+            lease.id,
+            lease.workspace_scope_key,
+            lease.task_scope_key,
+            lease.state,
+            lease.expires_at
+        ],
+    )?;
+    Ok(())
+}
+
+fn record_enforcement_event(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    identity: &RuntimeIdentity,
+    tool_name: &str,
+    decision: &str,
+    reason_code: &str,
+    cwd: Option<&str>,
+    message: &str,
+) {
+    let _ = connection.execute(
+        "INSERT INTO runtime_enforcement_events (
+            id, created_at, session_id, turn_id, agent_id, agent_type,
+            orchestration_phase, tool_name, decision, reason_code, cwd, message,
+            codex_agent_id, lease_id, workspace_scope_key, task_scope_key,
+            lease_state, lease_expires_at
+         ) VALUES (
+            lower(hex(randomblob(16))),
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16
+         )",
+        params![
+            session_id,
+            turn_id,
+            identity.agent_id,
+            identity.agent_type,
+            identity.phase,
+            tool_name,
+            decision,
+            reason_code,
+            cwd,
+            message,
+            identity.codex_agent_id,
+            identity.lease.as_ref().map(|lease| lease.id.as_str()),
+            identity
+                .lease
+                .as_ref()
+                .map(|lease| lease.workspace_scope_key.as_str()),
+            identity
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.task_scope_key.as_deref()),
+            identity.lease.as_ref().map(|lease| lease.state.as_str()),
+            identity
+                .lease
+                .as_ref()
+                .map(|lease| lease.expires_at.as_str())
+        ],
+    );
+}
+
+fn emit_hook_deny(reason_code: &str, message: &str) -> ExitCode {
+    let output = serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!("{message} ({reason_code})")
+        }
+    });
+    println!("{output}");
+    ExitCode::SUCCESS
+}
+
+fn emit_hook_warning(message: &str) -> ExitCode {
+    println!("{}", serde_json::json!({ "systemMessage": message }));
+    ExitCode::SUCCESS
+}
+
+fn hook_string<'a>(payload: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 4096)
+}
+
+fn policy_relevant_write(tool_name: &str, command: &str) -> bool {
+    match tool_name.to_ascii_lowercase().as_str() {
+        "apply_patch" | "edit" | "write" => true,
+        "bash" | "shell_command" | "exec_command" => obvious_write_command(command),
+        _ => false,
+    }
+}
+
+fn obvious_write_command(command: &str) -> bool {
+    let command = format!(" {} ", command.trim().to_ascii_lowercase());
+    // ponytail: v1 只拦截明确写入，不实现跨 PowerShell/cmd/POSIX 的完整 shell 解析器。
+    const MUTATING_PATTERNS: &[&str] = &[
+        " set-content ",
+        " add-content ",
+        " out-file ",
+        " remove-item ",
+        " move-item ",
+        " copy-item ",
+        " new-item ",
+        " rename-item ",
+        " clear-content ",
+        "writealltext(",
+        "writeallbytes(",
+        "appendalltext(",
+        " rm ",
+        " mv ",
+        " cp ",
+        " mkdir ",
+        " touch ",
+        " del ",
+        " erase ",
+        " rmdir ",
+        " sed -i",
+        " tee ",
+        " git add ",
+        " git commit ",
+        " git push ",
+        " git apply ",
+        " git am ",
+        " git merge ",
+        " git rebase ",
+        " git reset ",
+        " git checkout ",
+        " git switch ",
+        " git branch -d",
+        " npm install ",
+        " npm i ",
+        " cargo install ",
+        " pip install ",
+        " winget install ",
+        " choco install ",
+    ];
+    MUTATING_PATTERNS
+        .iter()
+        .any(|pattern| command.contains(pattern))
+        || command.contains('>')
 }
 
 fn schedule(
@@ -430,6 +1357,24 @@ fn load_recommendation(
     // F-11：候选读取与 REUSE 租约写入必须在同一 Immediate 事务内，
     // 否则两个并发 helper 预检可以同时选中同一个 IDLE Thread（双重 REUSE）。
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE runtime_delegation_leases
+         SET state = 'EXPIRED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), release_reason = 'TTL_EXPIRED'
+         WHERE state IN ('PENDING', 'ACTIVE')
+           AND julianday(expires_at) <= julianday('now')",
+        [],
+    )?;
+    let matching_lease_exists = transaction.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM runtime_delegation_leases
+            WHERE agent_id = ?1 AND parent_thread_id = ?2 AND workspace_scope_key = ?3
+              AND task_scope_key IS ?4 AND state IN ('PENDING', 'ACTIVE')
+              AND julianday(expires_at) > julianday('now')
+         )",
+        params![active.agent_id, parent_thread_id, scope_key, task_scope_key],
+        |row| row.get::<_, i64>(0),
+    )? != 0;
     // 显式 Task Scope：同键才可复用；无键任务不得复用绑定了任务键的 Thread（fail-closed）。
     let (task_condition, task_parameter) = match task_scope_key {
         Some(key) => ("AND task_scope_key = ?4", Some(key.to_owned())),
@@ -507,6 +1452,33 @@ fn load_recommendation(
     });
     let runtime_fingerprint = active.profile.runtime_fingerprint.clone();
     let mut recommendation = recommend(scope_key.to_owned(), candidates, active.profile);
+    if matching_lease_exists {
+        recommendation.decision = "WAIT";
+        recommendation.reason_code = "DELEGATION_LEASE_ACTIVE";
+        recommendation.message = "同一任务已有有效委派租约，请等待当前子 Agent 完成。";
+        recommendation.candidate_instance_id = None;
+        recommendation.candidate_thread_id = None;
+    }
+    if recommendation.decision == "REUSE"
+        && let Some(thread_id) = recommendation.candidate_thread_id.as_deref()
+    {
+        let thread_lease_active = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM runtime_delegation_leases
+                WHERE codex_agent_id = ?1 AND state = 'ACTIVE'
+                  AND julianday(expires_at) > julianday('now')
+             )",
+            [thread_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if thread_lease_active {
+            recommendation.decision = "WAIT";
+            recommendation.reason_code = "THREAD_RUNTIME_LEASE_ACTIVE";
+            recommendation.message = "候选 Thread 仍持有运行时委派租约，请等待它结束。";
+            recommendation.candidate_instance_id = None;
+            recommendation.candidate_thread_id = None;
+        }
+    }
     if recommendation.decision == "SPAWN"
         && matches!(
             recommendation.reason_code,
@@ -576,6 +1548,10 @@ fn load_recommendation(
         }
     }
     // F-13：与决策同事务写入只追加审计记录，UI 预览不能冒充实际执行日志。
+    let schedule_decision_id =
+        transaction.query_row("SELECT lower(hex(randomblob(16)))", [], |row| {
+            row.get::<_, String>(0)
+        })?;
     transaction.execute(
         "INSERT INTO agent_schedule_decisions (
             id, created_at, source, agent_id, agent_name_snapshot, workspace_scope_key,
@@ -583,12 +1559,13 @@ fn load_recommendation(
             context_pressure_percent, context_pressure_limit_percent, cache_hint,
             candidate_age_seconds, claimed, task_scope_key
          ) VALUES (
-            lower(hex(randomblob(16))),
+            ?1,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-            'HELPER', ?1, (SELECT name FROM agents WHERE id = ?1), ?2,
-            ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+            'HELPER', ?2, (SELECT name FROM agents WHERE id = ?2), ?3,
+            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
          )",
         params![
+            schedule_decision_id,
             active.agent_id,
             scope_key,
             parent_thread_id,
@@ -607,6 +1584,39 @@ fn load_recommendation(
             task_scope_key,
         ],
     )?;
+    if matches!(recommendation.decision, "REUSE" | "SPAWN") {
+        let (state, codex_agent_id, ttl_seconds) = if recommendation.decision == "REUSE" {
+            (
+                "ACTIVE",
+                recommendation.candidate_thread_id.as_deref(),
+                RUNTIME_DELEGATION_LEASE_TTL_SECONDS,
+            )
+        } else {
+            ("PENDING", None, SPAWN_RESERVATION_TTL_SECONDS)
+        };
+        transaction.execute(
+            "INSERT INTO runtime_delegation_leases (
+                id, created_at, updated_at, agent_id, parent_thread_id, codex_agent_id,
+                workspace_scope_key, task_scope_key, schedule_decision_id, state, expires_at
+             ) VALUES (
+                lower(hex(randomblob(16))),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?8)
+             )",
+            params![
+                active.agent_id,
+                parent_thread_id,
+                codex_agent_id,
+                scope_key,
+                task_scope_key,
+                schedule_decision_id,
+                state,
+                format!("+{ttl_seconds} seconds"),
+            ],
+        )?;
+    }
     transaction.commit()?;
     Ok(Some(recommendation))
 }
@@ -941,6 +1951,58 @@ fn bind_native_thread(
             scope_key,
             fingerprint,
             task_scope_key,
+        ],
+    )?;
+    let leases = load_runtime_leases(
+        &transaction,
+        "agent_id = ?1 AND parent_thread_id = ?2 AND workspace_scope_key = ?3
+         AND state IN ('PENDING', 'ACTIVE')
+         AND julianday(expires_at) > julianday('now')",
+        [active.agent_id.as_str(), parent_thread_id, scope_key],
+    )?;
+    let matching_leases = leases
+        .iter()
+        .filter(|lease| {
+            lease.task_scope_key.as_deref() == task_scope_key
+                && lease
+                    .codex_agent_id
+                    .as_deref()
+                    .is_none_or(|value| value == child_thread_id)
+        })
+        .collect::<Vec<_>>();
+    let [lease] = matching_leases.as_slice() else {
+        return Err(ScheduleError::BindRejected);
+    };
+    let lease = *lease;
+    let changed = transaction.execute(
+        "UPDATE runtime_delegation_leases
+         SET codex_agent_id = ?2, state = 'ACTIVE',
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?3)
+         WHERE id = ?1 AND state IN ('PENDING', 'ACTIVE')",
+        params![
+            lease.id,
+            child_thread_id,
+            format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds")
+        ],
+    )?;
+    if changed != 1 {
+        return Err(ScheduleError::BindRejected);
+    }
+    transaction.execute(
+        "UPDATE runtime_hook_turns
+         SET lease_id = ?2, workspace_scope_key = ?3, task_scope_key = ?4,
+             lease_state = 'ACTIVE',
+             lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+         WHERE codex_agent_id = ?1 AND agent_id = ?6",
+        params![
+            child_thread_id,
+            lease.id,
+            scope_key,
+            task_scope_key,
+            format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds"),
+            active.agent_id
         ],
     )?;
     if let Some(task_scope_key) = task_scope_key {
@@ -1348,6 +2410,282 @@ mod tests {
     }
 
     #[test]
+    fn hook_requires_absolute_database_path_and_owned_marker() {
+        let valid = [
+            OsString::from("cas-helper"),
+            OsString::from("hook"),
+            OsString::from(r"C:\CAS Data\cas.db"),
+            OsString::from(RUNTIME_HOOK_MARKER),
+        ];
+        assert!(matches!(
+            parse_args(valid),
+            Ok(Command::Hook { database_path }) if database_path == PathBuf::from(r"C:\CAS Data\cas.db")
+        ));
+        assert!(
+            parse_args([
+                OsString::from("cas-helper"),
+                OsString::from("hook"),
+                OsString::from("cas.db"),
+                OsString::from(RUNTIME_HOOK_MARKER),
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn obvious_write_detection_does_not_block_read_only_shell_commands() {
+        assert!(policy_relevant_write("apply_patch", ""));
+        assert!(policy_relevant_write(
+            "shell_command",
+            "Set-Content -LiteralPath file.txt -Value ok"
+        ));
+        assert!(policy_relevant_write("Bash", "git add README.md"));
+        assert!(!policy_relevant_write("Bash", "git status --short"));
+        assert!(!policy_relevant_write(
+            "shell_command",
+            "Get-Content package.json"
+        ));
+    }
+
+    #[test]
+    fn runtime_hook_maps_roles_and_audits_primary_policy() {
+        let root = unique_temp_dir("runtime-hook-policy");
+        std::fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("cas.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE agents (
+                    id TEXT PRIMARY KEY,
+                    agent_key TEXT NOT NULL,
+                    name TEXT,
+                    enabled INTEGER NOT NULL,
+                    orchestration_phase TEXT
+                 );
+                 CREATE TABLE active_agent_bindings (agent_id TEXT NOT NULL);
+                 CREATE TABLE configuration_state (active_agent_id TEXT);
+                 CREATE TABLE application_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT
+                 );
+                 CREATE TABLE project_orchestration_exclusions (
+                    project_path TEXT NOT NULL,
+                    normalized_path TEXT NOT NULL
+                 );
+                 CREATE TABLE agent_schedule_decisions (id TEXT PRIMARY KEY);
+                 CREATE TABLE agent_spawn_reservations (
+                    agent_id TEXT NOT NULL,
+                    parent_thread_id TEXT NOT NULL,
+                    workspace_scope_key TEXT NOT NULL,
+                    task_scope_key TEXT NOT NULL
+                 );
+                 CREATE TABLE agent_thread_instances (
+                    codex_thread_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    claimed_until TEXT,
+                    last_observed_at TEXT
+                 );
+                 CREATE TABLE runtime_delegation_leases (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    parent_thread_id TEXT NOT NULL,
+                    codex_agent_id TEXT,
+                    workspace_scope_key TEXT NOT NULL,
+                    task_scope_key TEXT,
+                    schedule_decision_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    released_at TEXT,
+                    release_reason TEXT
+                 );
+                 CREATE TABLE runtime_hook_turns (
+                    turn_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    agent_id TEXT,
+                    agent_type TEXT NOT NULL,
+                    orchestration_phase TEXT,
+                    codex_agent_id TEXT,
+                    lease_id TEXT,
+                    workspace_scope_key TEXT,
+                    task_scope_key TEXT,
+                    lease_state TEXT,
+                    lease_expires_at TEXT,
+                    stopped_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE runtime_enforcement_events (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    agent_id TEXT,
+                    agent_type TEXT,
+                    orchestration_phase TEXT,
+                    tool_name TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    reason_code TEXT NOT NULL,
+                    cwd TEXT,
+                    message TEXT NOT NULL,
+                    codex_agent_id TEXT,
+                    lease_id TEXT,
+                    workspace_scope_key TEXT,
+                    task_scope_key TEXT,
+                    lease_state TEXT,
+                    lease_expires_at TEXT
+                 );
+                 INSERT INTO agents VALUES ('agent-executor', 'executor', 'Executor', 1, 'EXECUTION');
+                 INSERT INTO active_agent_bindings VALUES ('agent-executor');
+                 INSERT INTO application_settings VALUES ('orchestration_failure_policy', 'STRICT_STOP');
+                 INSERT INTO agent_schedule_decisions VALUES ('decision-1');
+                 INSERT INTO runtime_delegation_leases VALUES (
+                    'lease-1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'agent-executor', 'session-1', NULL,
+                    'c:/workspace', 'task-1', 'decision-1', 'PENDING',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds'), NULL, NULL
+                 );
+                 INSERT INTO agent_thread_instances VALUES ('child-1', 'RUNNING', NULL, NULL);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let started = serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "session_id": "session-1",
+            "turn_id": "turn-executor",
+            "agent_id": "child-1",
+            "agent_type": "executor",
+            "cwd": "C:/workspace"
+        });
+        record_subagent_start(&database_path, &started);
+        let execution_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-1",
+            "turn_id": "turn-executor",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &execution_write);
+        let primary_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-1",
+            "turn_id": "turn-primary",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &primary_write);
+        let direct_identity_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-1",
+            "turn_id": "turn-direct",
+            "agent_type": "executor",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &direct_identity_write);
+        let outside_scope_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "child-1",
+            "turn_id": "turn-executor",
+            "cwd": "C:/other",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &outside_scope_write);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO project_orchestration_exclusions (project_path, normalized_path)
+                 VALUES ('C:/workspace', 'c:/workspace')",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let excluded_project_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "child-1",
+            "turn_id": "turn-executor",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &excluded_project_write);
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute("DELETE FROM project_orchestration_exclusions", [])
+            .unwrap();
+        drop(connection);
+        let stopped = serde_json::json!({
+            "hook_event_name": "SubagentStop",
+            "session_id": "session-1",
+            "turn_id": "turn-executor",
+            "agent_id": "child-1",
+            "agent_type": "executor",
+            "cwd": "C:/workspace"
+        });
+        record_subagent_stop(&database_path, &stopped);
+        let after_stop_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "child-1",
+            "turn_id": "turn-after-stop",
+            "agent_type": "executor",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &after_stop_write);
+
+        let connection = Connection::open(&database_path).unwrap();
+        let decisions = connection
+            .prepare("SELECT decision || ':' || reason_code FROM runtime_enforcement_events ORDER BY rowid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            decisions,
+            vec![
+                "ALLOW:DELEGATION_LEASE_ACTIVATED",
+                "ALLOW:EXECUTION_LEASE_WRITE_ALLOWED",
+                "DENY:PRIMARY_STRICT_STOP_WRITE_DENIED",
+                "DENY:EXECUTION_LEASE_MISSING",
+                "DENY:WORKSPACE_SCOPE_MISMATCH",
+                "DENY:PROJECT_EXCLUDED",
+                "ALLOW:DELEGATION_LEASE_RELEASED",
+                "DENY:EXECUTION_LEASE_MISSING",
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM runtime_delegation_leases WHERE id = 'lease-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "RELEASED"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT status FROM agent_thread_instances WHERE codex_thread_id = 'child-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "IDLE"
+        );
+        drop(connection);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn custom_codex_home_precedes_environment_and_platform_defaults() {
         let root = unique_temp_dir("codex-home-precedence");
         let custom = root.join("custom");
@@ -1718,6 +3056,13 @@ mod tests {
             None,
         )
         .unwrap();
+        connection
+            .execute(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'RELEASED', release_reason = 'TEST_COMPLETE'",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             connection
                 .query_row(
@@ -1742,6 +3087,14 @@ mod tests {
         assert_eq!(reuse.decision, "REUSE");
         assert_eq!(reuse.candidate_thread_id.as_deref(), Some("thread-native"));
 
+        connection
+            .execute(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'RELEASED', release_reason = 'TEST_COMPLETE'
+                 WHERE state = 'ACTIVE'",
+                [],
+            )
+            .unwrap();
         connection
             .execute(
                 "UPDATE providers SET base_url = 'https://api.changed.example/v1'
@@ -2119,6 +3472,14 @@ mod tests {
 
         connection
             .execute(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'RELEASED', release_reason = 'TEST_COMPLETE'
+                 WHERE state = 'ACTIVE'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
                 "UPDATE providers
                  SET base_url = 'https://api.changed.example/v1',
                      custom_headers_json = '{\"x-cas\":\"one\"}'
@@ -2220,8 +3581,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(second.decision, "SPAWN");
-        assert_eq!(second.reason_code, "THREAD_CLAIMED");
+        assert_eq!(second.decision, "WAIT");
+        assert_eq!(second.reason_code, "DELEGATION_LEASE_ACTIVE");
 
         // 租约过期后 Thread 重新可复用。
         connection
@@ -2229,6 +3590,14 @@ mod tests {
                 "UPDATE agent_thread_instances
                  SET claimed_until = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 seconds')
                  WHERE id = 'instance-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE runtime_delegation_leases
+                 SET expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 seconds')
+                 WHERE state = 'ACTIVE'",
                 [],
             )
             .unwrap();
@@ -2336,7 +3705,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(duplicate_spawn.decision, "WAIT");
-        assert_eq!(duplicate_spawn.reason_code, "SPAWN_RESERVED");
+        assert_eq!(duplicate_spawn.reason_code, "DELEGATION_LEASE_ACTIVE");
 
         // bind 固化任务键并释放对应 SPAWN 预留；后续异键 bind 被拒绝。
         insert_native_child(&home, "thread-native", "thread-root", 10, "open");
@@ -2667,6 +4036,37 @@ mod tests {
                     PRIMARY KEY (
                         agent_id, parent_thread_id, workspace_scope_key, task_scope_key
                     )
+                 );
+                 CREATE TABLE runtime_delegation_leases (
+                    id TEXT PRIMARY KEY,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    parent_thread_id TEXT NOT NULL,
+                    codex_agent_id TEXT,
+                    workspace_scope_key TEXT NOT NULL,
+                    task_scope_key TEXT,
+                    schedule_decision_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    released_at TEXT,
+                    release_reason TEXT
+                 );
+                 CREATE TABLE runtime_hook_turns (
+                    turn_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    agent_id TEXT,
+                    agent_type TEXT NOT NULL,
+                    orchestration_phase TEXT,
+                    codex_agent_id TEXT,
+                    lease_id TEXT,
+                    workspace_scope_key TEXT,
+                    task_scope_key TEXT,
+                    lease_state TEXT,
+                    lease_expires_at TEXT,
+                    stopped_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                  );
                  INSERT INTO agents (
                     id, agent_key, role_key, enabled, reuse_strategy,

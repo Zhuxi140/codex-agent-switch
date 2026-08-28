@@ -8,3 +8,4 @@ cas-scheduler = { path = "../crates/cas-scheduler" }
 cas-native-lifecycle = { path = "../crates/cas-native-lifecycle" }
 cas-secret-store = { path = "../crates/cas-secret-store" }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde_json = "1"

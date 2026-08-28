@@ -164,6 +164,13 @@ pub fn normalize_workspace_scope_key(value: &str) -> Option<String> {
     .then_some(value)
 }
 
+pub fn workspace_is_within(workspace: &str, root: &str) -> bool {
+    workspace == root
+        || workspace
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
 pub fn normalize_task_scope_key(value: &str) -> Option<String> {
     let value = value.trim();
     let mut bytes = value.bytes();

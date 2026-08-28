@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const FEATURE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNTIME_OVERRIDE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const MINIMUM_MULTI_AGENT_VERSION: ClientVersion = ClientVersion(0, 144, 0);
 #[cfg(windows)]
@@ -36,6 +37,8 @@ const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 static AGENT_EXECUTION_CAPABILITY_CACHE: Mutex<
     Option<HashMap<(PathBuf, String), SchemaCapability>>,
 > = Mutex::new(None);
+static RUNTIME_HOOK_CAPABILITY_CACHE: Mutex<Option<HashMap<(PathBuf, String), bool>>> =
+    Mutex::new(None);
 
 fn cached_agent_execution_capability(executable: &Path, version: &str) -> SchemaCapability {
     let mut guard = AGENT_EXECUTION_CAPABILITY_CACHE
@@ -49,6 +52,20 @@ fn cached_agent_execution_capability(executable: &Path, version: &str) -> Schema
     let probed = probe_schema_capabilities(executable, &env::temp_dir()).agent_execution;
     cache.insert(key, probed);
     probed
+}
+
+fn cached_runtime_hook_capability(executable: &Path, version: &str) -> bool {
+    let mut guard = RUNTIME_HOOK_CAPABILITY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    let key = (executable.to_path_buf(), version.to_owned());
+    if let Some(cached) = cache.get(&key) {
+        return *cached;
+    }
+    let supported = probe_runtime_hook_capability(executable).unwrap_or(false);
+    cache.insert(key, supported);
+    supported
 }
 
 /// 无法证明能力时 Fail Closed：仅 Supported 视为可用，其余给出具体缺失项。
@@ -83,6 +100,7 @@ pub(crate) struct CodexEnvironment {
     pub(crate) configuration_readable: bool,
     pub(crate) configuration_writable: bool,
     pub(crate) multi_agent_available: bool,
+    pub(crate) runtime_hooks_available: bool,
     pub(crate) issues: Vec<DiagnosticIssue>,
 }
 
@@ -208,6 +226,19 @@ pub(crate) fn detect_with_codex_home(custom_codex_home: Option<PathBuf>) -> Code
         capability == SchemaCapability::Supported
     };
 
+    let runtime_hooks_available = supported
+        && executable
+            .as_ref()
+            .zip(version.as_deref())
+            .is_some_and(|(path, version)| cached_runtime_hook_capability(path, version));
+    if supported && !runtime_hooks_available {
+        issues.push(issue(
+            "CODEX_RUNTIME_HOOKS_UNAVAILABLE",
+            DiagnosticSeverity::Warning,
+            "当前 Codex 未声明可用的 hooks 能力；CAS 仍会使用指令、Agent 配置与沙箱，但无法启用本地工具调用 Guard。",
+        ));
+    }
+
     CodexEnvironment {
         detected: executable.is_some(),
         executable_path: executable.map(path_to_string),
@@ -217,6 +248,7 @@ pub(crate) fn detect_with_codex_home(custom_codex_home: Option<PathBuf>) -> Code
         configuration_readable,
         configuration_writable,
         multi_agent_available,
+        runtime_hooks_available,
         issues,
     }
 }
@@ -226,6 +258,10 @@ pub(crate) fn clear_capability_cache() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard = None;
+    let mut hook_guard = RUNTIME_HOOK_CAPABILITY_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *hook_guard = None;
 }
 
 pub(crate) fn restart_required(last_applied_at_ms: i64) -> bool {
@@ -570,6 +606,46 @@ fn probe_codex_version(executable: &Path) -> Result<String, String> {
     extract_version(output).ok_or_else(|| "Codex 版本输出无法解析。".to_owned())
 }
 
+fn probe_runtime_hook_capability(executable: &Path) -> Result<bool, String> {
+    let mut child = Command::new(executable)
+        .args(["features", "list"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("无法启动 Codex Hook 能力探测：{error}"))?;
+    let deadline = Instant::now() + FEATURE_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Codex Hook 能力探测超过 2 秒。".to_owned());
+            }
+            Err(error) => return Err(format!("Codex Hook 能力探测失败：{error}")),
+        }
+    };
+    let stdout = read_pipe(child.stdout.take());
+    let stderr = read_pipe(child.stderr.take());
+    if !status.success() {
+        return Err(if stderr.trim().is_empty() {
+            format!("Codex Hook 能力探测退出码：{status}")
+        } else {
+            format!("Codex Hook 能力探测失败：{}", stderr.trim())
+        });
+    }
+    Ok(parse_feature_enabled(&stdout, "hooks"))
+}
+
+fn parse_feature_enabled(output: &str, feature: &str) -> bool {
+    output.lines().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        fields.first() == Some(&feature) && fields.last() == Some(&"true")
+    })
+}
+
 fn read_pipe(pipe: Option<impl Read>) -> String {
     let mut output = String::new();
     if let Some(mut pipe) = pipe {
@@ -644,6 +720,14 @@ mod tests {
     fn compares_multi_agent_baseline() {
         assert!(parse_client_version("0.144.0").unwrap() >= MINIMUM_MULTI_AGENT_VERSION);
         assert!(parse_client_version("0.143.9").unwrap() < MINIMUM_MULTI_AGENT_VERSION);
+    }
+
+    #[test]
+    fn detects_enabled_hook_feature_without_version_assumptions() {
+        let output = "code_mode stable false\nhooks stable true\nmulti_agent experimental true\n";
+        assert!(parse_feature_enabled(output, "hooks"));
+        assert!(!parse_feature_enabled(output, "code_mode"));
+        assert!(!parse_feature_enabled(output, "missing"));
     }
 
     #[test]

@@ -441,6 +441,7 @@ dependencies = [
  "cas-scheduler",
  "cas-secret-store",
  "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

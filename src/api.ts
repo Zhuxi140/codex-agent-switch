@@ -4,6 +4,7 @@ export interface CodexEnvironmentSummary {
   detected: boolean;
   version: string | null;
   multiAgentAvailable: boolean;
+  runtimeHooksAvailable: boolean;
 }
 
 export type DiagnosticSeverity = "INFO" | "WARNING" | "ERROR";
@@ -905,6 +906,34 @@ export function listAgentScheduleDecisions(
   request: { limit?: number } = {},
 ): Promise<ScheduleDecisionResponse[]> {
   return invoke<ScheduleDecisionResponse[]>("agent_schedule_decision_list", { request });
+}
+
+export interface RuntimeEnforcementEventResponse {
+  id: string;
+  createdAt: string;
+  sessionId: string;
+  turnId: string;
+  agentId: string | null;
+  agentNameSnapshot: string | null;
+  agentType: string | null;
+  orchestrationPhase: string | null;
+  codexAgentId: string | null;
+  leaseId: string | null;
+  workspaceScopeKey: string | null;
+  taskScopeKey: string | null;
+  leaseState: string | null;
+  leaseExpiresAt: string | null;
+  toolName: string;
+  decision: "ALLOW" | "WARN" | "DENY" | string;
+  reasonCode: string;
+  cwd: string | null;
+  message: string;
+}
+
+export function listRuntimeEnforcementEvents(
+  request: { limit?: number } = {},
+): Promise<RuntimeEnforcementEventResponse[]> {
+  return invoke<RuntimeEnforcementEventResponse[]>("runtime_enforcement_event_list", { request });
 }
 
 export function setAgentThreadInstanceWorkspaceScope(

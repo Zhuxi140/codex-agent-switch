@@ -666,6 +666,26 @@ h2 {
   font-size: 10px;
 }
 
+.runtime-hook-capability {
+  display: inline-flex;
+  align-items: center;
+  min-height: 20px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.runtime-hook-capability.ready {
+  color: hsl(var(--success));
+  background: hsl(var(--success) / 0.11);
+}
+
+.runtime-hook-capability.degraded {
+  color: hsl(var(--warning));
+  background: hsl(var(--warning) / 0.12);
+}
+
 .baseline-indicator {
   display: inline-grid;
   width: 18px;
@@ -2193,6 +2213,33 @@ code,
 
 .reuse-recommendation.spawn strong {
   color: hsl(var(--info));
+}
+
+.reuse-recommendation.allow {
+  border-color: hsl(var(--success) / 0.3);
+  background: hsl(var(--success) / 0.07);
+}
+
+.reuse-recommendation.allow strong {
+  color: hsl(var(--success));
+}
+
+.reuse-recommendation.warn {
+  border-color: hsl(var(--warning) / 0.32);
+  background: hsl(var(--warning) / 0.08);
+}
+
+.reuse-recommendation.warn strong {
+  color: hsl(var(--warning));
+}
+
+.reuse-recommendation.deny {
+  border-color: hsl(var(--danger) / 0.3);
+  background: hsl(var(--danger) / 0.07);
+}
+
+.reuse-recommendation.deny strong {
+  color: hsl(var(--danger));
 }
 
 .reuse-execute-button {

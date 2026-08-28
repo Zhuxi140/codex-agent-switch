@@ -31,6 +31,7 @@ import {
   getUsageMonitorStatus,
   listAgentPresets,
   listAgentScheduleDecisions,
+  listRuntimeEnforcementEvents,
   listAgentThreadInstances,
   listAgentThreadProjects,
   listAgents,
@@ -90,6 +91,7 @@ import {
   type ReasoningPolicy,
   type RuntimeModeResponse,
   type RuntimeBridgeStatusResponse,
+  type RuntimeEnforcementEventResponse,
   type SandboxPolicy,
   type ScheduleDecisionResponse,
   type SnapshotSummary,
@@ -463,6 +465,7 @@ export function App() {
                   detected: result.detected,
                   version: result.version,
                   multiAgentAvailable: result.multiAgentAvailable,
+                  runtimeHooksAvailable: result.runtimeHooksAvailable,
                 },
               }
             : current,
@@ -934,7 +937,7 @@ function OverviewPage({
               <div className="runtime-mode-title">
                 <label htmlFor="runtime-mode-subagent"><strong>使用子 Agent</strong></label>
                 <InfoTip
-                  label={`不同 Role 可以同时运行，同一 Role 只能选择一个 Agent。Primary 负责规划、审查与收束；子 Agent 继承 Primary 的实时权限。切换后需完全退出并重启 Codex，再新建任务，并保持 Auto 或 Workspace。当前失败策略：${failurePolicy === "STRICT_STOP" ? "Strict Stop，委派失败后停止" : "Primary Fallback，警告后由 Primary 接管"}。`}
+                  label={`不同 Role 可以同时运行，同一 Role 只能选择一个 Agent。Primary 负责规划、审查与收束；子 Agent 继承 Primary 的启动权限，CAS 再通过角色配置与 Hook Guard 收紧明确的本地工具写入。切换后需完全退出并重启 Codex，再新建任务，并保持 Auto 或 Workspace。当前失败策略：${failurePolicy === "STRICT_STOP" ? "Strict Stop，委派失败后停止" : "Primary Fallback，警告后由 Primary 接管"}。`}
                 />
               </div>
               <small>按 Role 配置 Agent；同一 Role 只启用一个。</small>
@@ -1012,8 +1015,8 @@ function OverviewPage({
           {policySaving && <small role="status">正在保存失败策略…</small>}
           {failurePolicy === "PRIMARY_FALLBACK" && (
             <div className="orchestration-warning" role="alert">
-              Primary 与子 Agent 都需要 Auto 或 Workspace 权限。该回退依赖编排指令约束，
-              不是文件权限隔离。
+              Primary 与子 Agent 都需要 Auto 或 Workspace 权限。Hook Guard 会对明确写入发出警告并记录审计；
+              未覆盖的工具路径仍依赖编排指令与 Codex 沙箱，不是绝对权限隔离。
             </div>
           )}
         </div>
@@ -2087,6 +2090,7 @@ function UsagePage() {
       )}
       <UsageMonitorCard />
       <AgentThreadInstancesPanel />
+      <RuntimeEnforcementPanel />
       <ScheduleDecisionsPanel />
       <AgentUsagePanel agents={agents} />
     </>
@@ -2192,6 +2196,72 @@ function ScheduleDecisionsPanel() {
                 <InfoTip
                   label={`Primary：${decision.parentThreadId ?? "未知"}\n候选：${decision.candidateThreadId ?? "—"}\n指纹：${decision.runtimeFingerprint ?? "未知"}`}
                 />
+              </span>
+            </article>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function RuntimeEnforcementPanel() {
+  const [events, setEvents] = useState<RuntimeEnforcementEventResponse[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
+    setError(null);
+    try {
+      setEvents(await listRuntimeEnforcementEvents({ limit: 30 }));
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  return (
+    <section className="agent-instance-card" aria-labelledby="runtime-enforcement-title">
+      <header>
+        <div>
+          <span className="eyebrow">Runtime Enforcement</span>
+          <h2 id="runtime-enforcement-title">运行时约束记录</h2>
+          <p>记录 CAS Hook Guard 对明确本地写入作出的放行、警告与拒绝；它不是完整的权限沙箱。</p>
+        </div>
+        <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </header>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {!loading && !error && events.length === 0 && (
+        <div className="usage-empty">尚无运行时约束记录；启用子 Agent 模式并触发明确写入后才会出现。</div>
+      )}
+      {!error && events.length > 0 && (
+        <div className="usage-record-list">
+          {events.map((event) => (
+            <article className={`reuse-recommendation ${event.decision.toLowerCase()}`} key={event.id}>
+              <strong>{event.decision}</strong>
+              <span>{event.reasonCode}</span>
+              <span className="reuse-recommendation-meta">
+                {formatUsageDate(event.createdAt)}
+                {" · "}{event.agentNameSnapshot ?? event.agentType ?? "Primary"}
+                {event.orchestrationPhase ? ` · ${event.orchestrationPhase}` : ""}
+                {event.leaseState ? ` · 租约 ${event.leaseState}` : ""}
+                {` · ${event.toolName}`}
+                {event.cwd ? ` · ${event.cwd}` : ""}
+              </span>
+              <span className="schedule-decision-actions">
+                <CopyIconButton label="复制 Turn ID" value={event.turnId} />
+                {event.codexAgentId && <CopyIconButton label="复制原生 Agent ID" value={event.codexAgentId} />}
+                <InfoTip label={`${event.message}\nSession：${event.sessionId}\nTurn：${event.turnId}\n原生 Agent：${event.codexAgentId ?? "-"}\n租约：${event.leaseId ?? "-"}\nWorkspace Scope：${event.workspaceScopeKey ?? "-"}\nTask Scope：${event.taskScopeKey ?? "-"}\n租约到期：${event.leaseExpiresAt ? formatUsageDate(event.leaseExpiresAt) : "-"}`} />
               </span>
             </article>
           ))}
@@ -6315,6 +6385,17 @@ function EnvironmentDetails({
             : "至少一项 Codex 版本、Multi-Agent 能力或配置目录访问检查未通过；请查看下方问题。"}
         />
         <small>{configAccess}</small>
+        <Tooltip
+          content={environment.runtimeHooksAvailable
+            ? "当前 Codex 声明 hooks 能力；启用子 Agent 模式后，CAS 可投影本地工具调用 Guard。"
+            : "当前 Codex 未声明可用 hooks；CAS 会降级为指令、Agent 配置与沙箱保护。"}
+          focusable
+          label={`Hook Guard 能力：${environment.runtimeHooksAvailable ? "可用" : "降级"}`}
+        >
+          <span className={`runtime-hook-capability ${environment.runtimeHooksAvailable ? "ready" : "degraded"}`}>
+            Hook {environment.runtimeHooksAvailable ? "可用" : "降级"}
+          </span>
+        </Tooltip>
       </div>
       <div className="baseline-home">
         <span>CODEX_HOME</span>

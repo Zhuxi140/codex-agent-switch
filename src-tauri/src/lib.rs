@@ -54,7 +54,8 @@ use usage::{
     AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
     AgentThreadInstanceResponse, AgentThreadInstanceReuseStateRequest,
     AgentThreadInstanceWorkspaceScopeRequest, AgentThreadProjectListResponse,
-    AgentThreadProjectSummaryResponse, NativeSubagentSyncResponse, ScheduleDecisionResponse,
+    AgentThreadProjectSummaryResponse, NativeSubagentSyncResponse,
+    RuntimeEnforcementEventListRequest, RuntimeEnforcementEventResponse, ScheduleDecisionResponse,
     UsageListRequest, UsageQueryRequest, UsageRecordResponse, UsageService, UsageSummaryResponse,
 };
 
@@ -131,6 +132,7 @@ struct CodexEnvironmentSummary {
     detected: bool,
     version: Option<String>,
     multi_agent_available: bool,
+    runtime_hooks_available: bool,
 }
 
 #[tauri::command]
@@ -143,11 +145,12 @@ fn app_get_bootstrap(
 
     Ok(AppBootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        ipc_schema_version: 3,
+        ipc_schema_version: 4,
         codex: CodexEnvironmentSummary {
             detected: environment.detected,
             version: environment.version,
             multi_agent_available: environment.multi_agent_available,
+            runtime_hooks_available: environment.runtime_hooks_available,
         },
         configuration_status: configuration.status,
         running_operation_id: state.running_operation_id(),
@@ -676,6 +679,14 @@ fn agent_schedule_decision_list(
 }
 
 #[tauri::command]
+fn runtime_enforcement_event_list(
+    state: tauri::State<'_, UsageService>,
+    request: RuntimeEnforcementEventListRequest,
+) -> Result<Vec<RuntimeEnforcementEventResponse>, ApiError> {
+    state.list_runtime_enforcement_events(request)
+}
+
+#[tauri::command]
 fn agent_thread_instance_execute(
     bridge: tauri::State<'_, RuntimeBridgeService>,
     request: AgentThreadExecutionRequest,
@@ -833,6 +844,7 @@ pub fn run() {
             project_monitor_set_always_on_top,
             project_monitor_focus_main,
             agent_schedule_decision_list,
+            runtime_enforcement_event_list,
             agent_thread_instance_set_workspace_scope,
             agent_thread_instance_set_reuse_state,
             agent_thread_instance_cleanup,

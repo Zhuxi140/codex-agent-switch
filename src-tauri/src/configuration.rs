@@ -8,7 +8,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use cas_scheduler::{
     effective_model_default_reasoning, effective_model_reasoning_efforts,
-    normalize_workspace_scope_key, resolve_agent_reasoning_effort,
+    normalize_workspace_scope_key, resolve_agent_reasoning_effort, workspace_is_within,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, exists as secret_exists};
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
@@ -29,7 +29,7 @@ use crate::codex_config::{
     render_agent_projection, restore_model_catalog_projection, restore_orchestration_projection,
     restore_project_exclusion_projection, restore_provider_projection,
     upgrade_orchestration_baseline, upsert_model_catalog_projection,
-    upsert_orchestration_projection, upsert_project_exclusion_projection,
+    upsert_orchestration_projection_with_hooks, upsert_project_exclusion_projection,
     upsert_provider_projection,
 };
 use crate::codex_environment::{self, CodexEnvironment};
@@ -291,9 +291,11 @@ impl ConfigurationService {
         let connection = open_database(&self.database_path)?;
         let checked_at = now(&connection)?;
         let environment = self.diagnose_environment()?;
+        let runtime_hooks_available =
+            self.fixed_codex_home.is_some() || self.environment()?.runtime_hooks_available;
         let database = diagnose_database(&connection)?;
         let configuration = diagnose_configuration(self.get_status());
-        let orchestration = diagnose_orchestration(&connection)?;
+        let orchestration = diagnose_orchestration(&connection, runtime_hooks_available)?;
         let providers = diagnose_providers(&connection, request.include_network_checks)?;
         let agents = diagnose_agents(&connection)?;
         let sections = vec![
@@ -1034,6 +1036,9 @@ impl ConfigurationService {
     fn compile_preview(&self) -> Result<CompiledPreview, ConfigurationError> {
         let codex_home = self.codex_home()?;
         let helper_path = self.helper_path()?;
+        let runtime_hooks_available =
+            self.fixed_codex_home.is_some() || self.environment()?.runtime_hooks_available;
+        let runtime_hook_command = runtime_hook_command(&helper_path, &self.database_path);
         let config_path = codex_home.join(CONFIG_RELATIVE_PATH);
         reject_symlink(&config_path)?;
         let existing_config = read_optional_utf8(&config_path)?;
@@ -1045,8 +1050,13 @@ impl ConfigurationService {
         let orchestration_baseline = load_orchestration_baseline_json(&connection)?
             .map(|json| serde_json::from_str::<OrchestrationBaseline>(&json))
             .transpose()?;
-        let (mut desired, mut blockers, mut warnings) =
-            load_desired_resources(&connection, &codex_home, &helper_path)?;
+        let (mut desired, mut blockers, mut warnings) = load_desired_resources(
+            &connection,
+            &codex_home,
+            &helper_path,
+            &self.database_path,
+            runtime_hooks_available,
+        )?;
         desired.sort_by(|left, right| {
             left.resource_type
                 .cmp(&right.resource_type)
@@ -1070,10 +1080,10 @@ impl ConfigurationService {
                 .as_slice(),
         );
 
-        if desired
-            .iter()
-            .any(|resource| resource.resource_type == PROVIDER_RESOURCE)
-            && (!helper_path.is_absolute() || !helper_path.is_file())
+        if desired.iter().any(|resource| {
+            resource.resource_type == PROVIDER_RESOURCE
+                || (runtime_hooks_available && resource.resource_type == ORCHESTRATION_RESOURCE)
+        }) && (!helper_path.is_absolute() || !helper_path.is_file())
         {
             blockers.push(DiagnosticIssue::error(
                 "HELPER_NOT_AVAILABLE",
@@ -1129,7 +1139,7 @@ impl ConfigurationService {
                         .expect("session catalog resource must have a path"),
                 )?;
             } else if resource.resource_type == ORCHESTRATION_RESOURCE {
-                final_config = upsert_orchestration_projection(
+                final_config = upsert_orchestration_projection_with_hooks(
                     &final_config,
                     resource
                         .content
@@ -1140,6 +1150,7 @@ impl ConfigurationService {
                             "ORCHESTRATION_BASELINE_MISSING".to_owned(),
                         )
                     })?,
+                    runtime_hooks_available.then_some(runtime_hook_command.as_str()),
                 )?;
             }
         }
@@ -2097,10 +2108,24 @@ type DesiredLoad = (
     Vec<DiagnosticIssue>,
 );
 
+fn runtime_hook_command(helper_path: &Path, database_path: &Path) -> String {
+    format!(
+        "{} hook {} cas-runtime-enforcement-v1",
+        quote_command_argument(helper_path),
+        quote_command_argument(database_path)
+    )
+}
+
+fn quote_command_argument(path: &Path) -> String {
+    format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""))
+}
+
 fn load_desired_resources(
     connection: &Connection,
     codex_home: &Path,
     helper_path: &Path,
+    database_path: &Path,
+    runtime_hooks_available: bool,
 ) -> Result<DesiredLoad, ConfigurationError> {
     let bindings = load_active_agent_bindings(connection)?;
     let failure_policy = read_settings(connection)?.orchestration_failure_policy;
@@ -2296,7 +2321,11 @@ fn load_desired_resources(
             resources.extend(mixed_resources);
             warnings.push(DiagnosticIssue::warning(
                 "SUBAGENT_RUNTIME_RESTART_REQUIRED",
-                "CAS 已配置 V1 明文委派与 Workspace 权限。请完全退出并重启 Codex，再新建任务；现有任务不会原地切换 Multi-Agent 版本或权限。",
+                if runtime_hooks_available {
+                    "CAS 已配置 V1 明文委派、Workspace 权限与 Hook Guard。请完全退出并重启 Codex，再新建任务；首次加载 Hook 时请核对命令指向 cas-helper 后再确认信任。"
+                } else {
+                    "CAS 已配置 V1 明文委派与 Workspace 权限。请完全退出并重启 Codex，再新建任务；现有任务不会原地切换 Multi-Agent 版本或权限。"
+                },
             ));
         }
         Err(issue) => blockers.push(issue),
@@ -2440,7 +2469,13 @@ fn load_desired_resources(
         let exclusions = load_project_exclusions(connection)?;
         let instructions =
             render_orchestration_instructions(&agents, &exclusions, failure_policy, helper_path);
-        let rendered = upsert_orchestration_projection("", &instructions, &baseline)?;
+        let hook_command = runtime_hook_command(helper_path, database_path);
+        let rendered = upsert_orchestration_projection_with_hooks(
+            "",
+            &instructions,
+            &baseline,
+            runtime_hooks_available.then_some(hook_command.as_str()),
+        )?;
         let semantic = orchestration_projection_semantic(&rendered)?
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         resources.push(DesiredResource {
@@ -2459,6 +2494,17 @@ fn load_desired_resources(
             provider: None,
             session_catalog_path: None,
         });
+        if !runtime_hooks_available {
+            warnings.push(DiagnosticIssue::warning(
+                "RUNTIME_ENFORCEMENT_HOOKS_UNAVAILABLE",
+                "当前 Codex 不支持可用的 hooks；CAS 编排仍会生效，但 Primary/角色工具写入约束已降级为指令、Agent 配置与沙箱保护。",
+            ));
+        } else if codex_home.join("hooks.json").is_file() {
+            warnings.push(DiagnosticIssue::warning(
+                "RUNTIME_HOOKS_MIXED_SOURCE",
+                "CODEX_HOME 已存在 hooks.json；Codex 会合并它与 CAS 的 config.toml Hook，并可能在启动时提示同层存在两种 Hook 来源。",
+            ));
+        }
     }
 
     if !bindings.is_empty()
@@ -3555,6 +3601,14 @@ fn replace_active_agent_bindings(
 ) -> Result<(), ConfigurationError> {
     let transaction = connection.transaction()?;
     transaction.execute("DELETE FROM active_agent_bindings", [])?;
+    transaction.execute(
+        "UPDATE runtime_delegation_leases
+         SET state = 'REVOKED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+             release_reason = 'RUNTIME_MODE_CHANGED'
+         WHERE state IN ('PENDING', 'ACTIVE')",
+        [],
+    )?;
     let timestamp = now(&transaction)?;
     for binding in bindings {
         transaction.execute(
@@ -3687,6 +3741,7 @@ fn diagnose_configuration(status: ConfigurationStatusResponse) -> DiagnosticSect
 
 fn diagnose_orchestration(
     connection: &Connection,
+    runtime_hooks_available: bool,
 ) -> Result<DiagnosticSection, ConfigurationError> {
     let bindings = load_active_agent_bindings(connection)?;
     let legacy_agent_id = load_active_agent_id(connection)?;
@@ -3709,9 +3764,24 @@ fn diagnose_orchestration(
         ),
         OrchestrationFailurePolicy::PrimaryFallback => DiagnosticIssue::warning(
             "ORCHESTRATION_PRIMARY_FALLBACK",
-            "失败策略为 Primary Fallback：子 Agent 失败后 Primary 可在显式警告后接管。该策略依赖指令约束，无法像权限隔离一样强制。",
+            if runtime_hooks_available {
+                "失败策略为 Primary Fallback：子 Agent 失败后 Primary 可在显式警告后接管。Hook Guard 会审计明确的本地写入，但未覆盖路径仍不是权限隔离。"
+            } else {
+                "失败策略为 Primary Fallback：子 Agent 失败后 Primary 可在显式警告后接管。当前无 Hook Guard，只能依赖指令与 Codex 沙箱。"
+            },
         ),
     }];
+    issues.push(if runtime_hooks_available {
+        DiagnosticIssue::info(
+            "RUNTIME_ENFORCEMENT_HOOKS_READY",
+            "当前 Codex 支持 hooks；CAS 可在编排模式下投影本地工具调用 Guard。",
+        )
+    } else {
+        DiagnosticIssue::warning(
+            "RUNTIME_ENFORCEMENT_HOOKS_UNAVAILABLE",
+            "当前 Codex 不支持可用的 hooks；运行时写入约束将降级为指令、Agent 配置与沙箱保护。",
+        )
+    });
 
     let has_execution_binding = bindings.iter().any(|binding| binding.phase == "EXECUTION")
         || legacy_agent_id
@@ -4444,13 +4514,6 @@ fn normalized_project_path(path: &Path) -> String {
     {
         value
     }
-}
-
-fn workspace_is_within(workspace: &str, excluded: &str) -> bool {
-    workspace == excluded
-        || workspace
-            .strip_prefix(excluded)
-            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn restore_file_exact(path: &Path, existed: bool, content: &str) -> Result<(), ConfigurationError> {
@@ -5558,6 +5621,40 @@ mod tests {
             .service
             .apply(ConfigurationApplyRequest::default())
             .unwrap();
+        let connection = open_database(&context.database).unwrap();
+        let agent_id: String = connection
+            .query_row("SELECT id FROM agents LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_schedule_decisions (
+                    id, created_at, source, agent_id, workspace_scope_key,
+                    parent_thread_id, decision, reason_code, cache_hint, claimed,
+                    task_scope_key
+                 ) VALUES (
+                    'decision-default-switch', '2026-08-11T10:00:00Z', 'HELPER', ?1,
+                    'c:/workspace', 'primary-1', 'SPAWN', 'NO_IDLE_THREAD',
+                    'UNKNOWN', 1, 'task-1'
+                 )",
+                [&agent_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id,
+                    workspace_scope_key, task_scope_key, schedule_decision_id,
+                    state, expires_at
+                 ) VALUES (
+                    'lease-default-switch', '2026-08-11T10:00:00Z',
+                    '2026-08-11T10:00:00Z', ?1, 'primary-1', 'c:/workspace',
+                    'task-1', 'decision-default-switch', 'ACTIVE',
+                    '2099-08-11T11:00:00Z'
+                 )",
+                [&agent_id],
+            )
+            .unwrap();
+        drop(connection);
 
         let switched = context
             .service
@@ -5591,6 +5688,17 @@ mod tests {
         );
         assert!(config.get("model_catalog_json").is_none());
         assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
+        let connection = open_database(&context.database).unwrap();
+        let (lease_state, release_reason): (String, Option<String>) = connection
+            .query_row(
+                "SELECT state, release_reason FROM runtime_delegation_leases
+                 WHERE id = 'lease-default-switch'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease_state, "REVOKED");
+        assert_eq!(release_reason.as_deref(), Some("RUNTIME_MODE_CHANGED"));
     }
 
     #[test]
