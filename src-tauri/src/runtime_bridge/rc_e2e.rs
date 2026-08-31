@@ -7,6 +7,7 @@ use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
+use crate::codex_config::ORCHESTRATION_RUNTIME_CONTRACT;
 use crate::configuration::{ConfigurationService, RuntimeModeSwitchRequest};
 use cas_native_lifecycle::rollout_state;
 use cas_scheduler::normalize_workspace_scope_key;
@@ -122,14 +123,16 @@ fn active_agent(connection: &Connection) -> Result<ActiveAgent, Rc1Failure> {
         connection
             .query_row(
                 "SELECT a.id, a.agent_key, a.name, m.model_id, p.provider_key
-                 FROM active_agent_bindings active
-                 JOIN agents a ON a.id = active.agent_id AND a.enabled = 1
+                 FROM agents a
+                 LEFT JOIN active_agent_bindings active ON active.agent_id = a.id
                  JOIN agent_model_bindings binding
                    ON binding.agent_id = a.id AND binding.enabled = 1
                  JOIN models m ON m.id = binding.model_id AND m.enabled = 1
                  JOIN providers p ON p.id = m.provider_id AND p.enabled = 1
-                 WHERE (?1 IS NULL OR a.agent_key = ?1)
-                 ORDER BY CASE a.orchestration_phase WHEN 'EXECUTION' THEN 0 ELSE 1 END,
+                 WHERE a.enabled = 1
+                   AND ((?1 IS NULL AND active.agent_id IS NOT NULL) OR a.agent_key = ?1)
+                 ORDER BY CASE WHEN active.agent_id IS NOT NULL THEN 0 ELSE 1 END,
+                          CASE a.orchestration_phase WHEN 'EXECUTION' THEN 0 ELSE 1 END,
                           a.agent_key
                  LIMIT 1",
                 [requested.as_deref()],
@@ -151,7 +154,7 @@ fn active_agent(connection: &Connection) -> Result<ActiveAgent, Rc1Failure> {
             "ACTIVE_AGENT_UNAVAILABLE",
             requested.map_or_else(
                 || "没有可用于真实 E2E 的活动 Agent".to_owned(),
-                |key| format!("Agent {key} 未启用或未处于活动绑定"),
+                |key| format!("Agent {key} 不存在、未启用或缺少可用模型绑定"),
             ),
         )
     })?;
@@ -199,9 +202,27 @@ fn timeout_evidence(database_path: &Path, parent_thread_id: &str) -> String {
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .unwrap_or_default();
+    let hooks = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(group_concat(decision || ':' || reason_code, ','), '')
+             FROM runtime_enforcement_events WHERE session_id = ?1",
+            [parent_thread_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap_or_default();
+    let leases = connection
+        .query_row(
+            "SELECT COUNT(*), COALESCE(group_concat(
+                 state || ':admitted=' || (admission_tool_use_id IS NOT NULL)
+                 || ':confirmed=' || (admission_confirmed_at IS NOT NULL), ','), '')
+             FROM runtime_delegation_leases WHERE parent_thread_id = ?1",
+            [parent_thread_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .unwrap_or_default();
     format!(
-        "decisions={} [{}], children={} [{}]",
-        decisions.0, decisions.1, children.0, children.1
+        "decisions={} [{}], children={} [{}], hooks={} [{}], leases={} [{}]",
+        decisions.0, decisions.1, children.0, children.1, hooks.0, hooks.1, leases.0, leases.1
     )
 }
 
@@ -955,7 +976,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     )?;
     let outcome = (|| {
         stage(
-            bridge.start_inner(Path::new(&executable), &codex_home, None),
+            bridge.start_inner_for_e2e(Path::new(&executable), &codex_home, None),
             "BRIDGE_START_FAILED",
         )?;
         let helper_probe = stage(
@@ -1099,6 +1120,36 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             ),
             "EVIDENCE_QUERY_FAILED",
         )?;
+        let native_bind_count: i64 = stage(
+            connection.query_row(
+                "SELECT COUNT(*) FROM runtime_enforcement_events
+                 WHERE session_id = ?1
+                   AND reason_code = 'DELEGATION_NATIVE_BIND_CONFIRMED'",
+                [&primary_thread_id],
+                |row| row.get(0),
+            ),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        let native_idle_release_count: i64 = stage(
+            connection.query_row(
+                "SELECT COUNT(*) FROM runtime_enforcement_events
+                 WHERE session_id = ?1
+                   AND reason_code = 'DELEGATION_LEASE_NATIVE_IDLE_RELEASED'",
+                [&primary_thread_id],
+                |row| row.get(0),
+            ),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        let native_reuse_count: i64 = stage(
+            connection.query_row(
+                "SELECT COUNT(*) FROM runtime_enforcement_events
+                 WHERE session_id = ?1
+                   AND reason_code = 'DELEGATION_NATIVE_REUSE_CONFIRMED'",
+                [&primary_thread_id],
+                |row| row.get(0),
+            ),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
         let spawn = decisions
             .iter()
             .find(|(decision, _, _)| decision == "SPAWN");
@@ -1137,6 +1188,14 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
                 "没有找到归属于目标 Agent 的有效 Token 记录",
             ));
         }
+        if native_bind_count != 1 || native_idle_release_count != 1 || native_reuse_count != 1 {
+            return Err(Rc1Failure::new(
+                "RUNTIME_ENFORCEMENT_EVIDENCE_MISSING",
+                format!(
+                    "兼容准入证据不完整：bind={native_bind_count}, idleRelease={native_idle_release_count}, reuse={native_reuse_count}"
+                ),
+            ));
+        }
         drop(connection);
 
         let rc2 = if include_rc2_matrix {
@@ -1153,6 +1212,77 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
         } else {
             None
         };
+        stage(bridge.stop_inner(), "BRIDGE_STOP_FAILED")?;
+        let default_request: RuntimeModeSwitchRequest = stage(
+            serde_json::from_value(json!({ "activeAgentIds": [] })),
+            "CONFIGURATION_REQUEST_FAILED",
+        )?;
+        stage(
+            configuration.switch_runtime_mode(default_request),
+            "DEFAULT_MODE_APPLY_FAILED",
+        )?;
+        let default_config = stage(
+            fs::read_to_string(codex_home.join("config.toml")),
+            "DEFAULT_MODE_CONFIG_READ_FAILED",
+        )?;
+        let connection = stage(Connection::open(&database_path), "EVIDENCE_DATABASE_FAILED")?;
+        let default_bindings: i64 = stage(
+            connection.query_row("SELECT COUNT(*) FROM active_agent_bindings", [], |row| {
+                row.get(0)
+            }),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        let default_live_leases: i64 = stage(
+            connection.query_row(
+                "SELECT COUNT(*) FROM runtime_delegation_leases
+                 WHERE state IN ('PENDING', 'ACTIVE')",
+                [],
+                |row| row.get(0),
+            ),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        drop(connection);
+        if default_bindings != 0
+            || default_live_leases != 0
+            || default_config.contains(ORCHESTRATION_RUNTIME_CONTRACT)
+            || default_config.contains("cas-runtime-enforcement-v1")
+        {
+            return Err(Rc1Failure::new(
+                "DEFAULT_MODE_CLEANUP_FAILED",
+                format!(
+                    "Default 清理不完整：bindings={default_bindings}, liveLeases={default_live_leases}"
+                ),
+            ));
+        }
+        let restore_request: RuntimeModeSwitchRequest = stage(
+            serde_json::from_value(json!({ "activeAgentIds": [agent.id.clone()] })),
+            "CONFIGURATION_REQUEST_FAILED",
+        )?;
+        stage(
+            configuration.switch_runtime_mode(restore_request),
+            "AGENT_MODE_RESTORE_FAILED",
+        )?;
+        let restored_config = stage(
+            fs::read_to_string(codex_home.join("config.toml")),
+            "AGENT_MODE_CONFIG_READ_FAILED",
+        )?;
+        let connection = stage(Connection::open(&database_path), "EVIDENCE_DATABASE_FAILED")?;
+        let restored_bindings: i64 = stage(
+            connection.query_row("SELECT COUNT(*) FROM active_agent_bindings", [], |row| {
+                row.get(0)
+            }),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        drop(connection);
+        if restored_bindings != 1
+            || !restored_config.contains(ORCHESTRATION_RUNTIME_CONTRACT)
+            || !restored_config.contains("cas-runtime-enforcement-v1")
+        {
+            return Err(Rc1Failure::new(
+                "AGENT_MODE_RESTORE_FAILED",
+                format!("Agent 恢复不完整：bindings={restored_bindings}"),
+            ));
+        }
         let mut result = json!({
             "status": "PASS",
             "agentKey": agent.key,
@@ -1171,6 +1301,10 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             "firstTotalTokens": first_instance.total_tokens,
             "finalTotalTokens": final_instance.total_tokens,
             "usageAttributed": true,
+            "nativeBindEvidenceCount": native_bind_count,
+            "nativeIdleReleaseEvidenceCount": native_idle_release_count,
+            "nativeReuseEvidenceCount": native_reuse_count,
+            "modeRoundTripVerified": true,
             "duplicateChildCount": child_count - 1,
             "decisionCount": decisions.len()
         });

@@ -152,6 +152,26 @@ impl RuntimeBridgeService {
         codex_home: &Path,
         codex_version: Option<String>,
     ) -> Result<RuntimeBridgeStatusResponse, RuntimeBridgeError> {
+        self.start_inner_with_hook_trust(executable, codex_home, codex_version, false)
+    }
+
+    #[cfg(test)]
+    fn start_inner_for_e2e(
+        &self,
+        executable: &Path,
+        codex_home: &Path,
+        codex_version: Option<String>,
+    ) -> Result<RuntimeBridgeStatusResponse, RuntimeBridgeError> {
+        self.start_inner_with_hook_trust(executable, codex_home, codex_version, true)
+    }
+
+    fn start_inner_with_hook_trust(
+        &self,
+        executable: &Path,
+        codex_home: &Path,
+        codex_version: Option<String>,
+        bypass_hook_trust: bool,
+    ) -> Result<RuntimeBridgeStatusResponse, RuntimeBridgeError> {
         let mut worker_slot = self.worker()?;
         if let Some(worker) = worker_slot.as_mut() {
             if worker.is_running()? {
@@ -183,7 +203,11 @@ impl RuntimeBridgeService {
             };
         }
 
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        if bypass_hook_trust {
+            command.arg("--dangerously-bypass-hook-trust");
+        }
+        let mut child = command
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())

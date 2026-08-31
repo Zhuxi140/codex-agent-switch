@@ -2634,17 +2634,17 @@ fn render_orchestration_instructions(
 - 当前目录位于下列路径时按 Default 运行，不委派；仅在 trusted 项目的新任务生效：\n{excluded_projects}\n\n\
 可用 Agent\n{active_agents}\n\n\
 硬规则\n\
-1. 本编排规则只约束 Primary/root；Child 执行父任务，禁止再次编排或递归创建同职责 Agent。Primary 负责规划、审查与收束。\n\
-2. {write_rule} 分析/方案任务不得写入；探索、验证、审查优先交给对应 phase。`schedule` / `bind` 只更新 CAS 调度元数据，是 Primary 必须亲自执行的控制面操作，不算任务写入或外部状态变更；不得在调用前拒绝。\n\
-3. 新独立任务首次委派前用 Shell 运行一次：`{scheduling_command}`。helper 读取 CAS 数据库、当前目录和 `CODEX_THREAD_ID`。未产生 `commandExecution` 时严禁自行声称被权限或策略阻止；仅工具返回的具体错误算失败。可提取稳定任务键时传 `[task-key]`（格式 `[a-z0-9][a-z0-9_-]{{0,63}}`）；只有完全同键 Thread 可复用，无键不复用有键 Thread。不得用模糊分类或猜测历史来编造任务键；不确定就省略。固定判断由 CAS 完成，Primary 不得自行读取 Thread、Token 或 Cache。\n\
-4. 只接受一行 `CAS1|<REUSE、SPAWN或WAIT>|<thread-id或->|<reason>`；零行或多行均失败：\n\
-   - `REUSE`：用 `followup_task` 向返回 Thread 发完整任务；不得 spawn/bind。\n\
-   - `SPAWN`：按第 5 条创建；随后运行 `{bind_command}`，task-key 与预检一致；bind 成功才算完成。\n\
+1. 规则只约束 Primary/root；Child 执行父任务，禁止再次编排或递归创建同职责 Agent。Primary 规划、审查、收束。\n\
+2. {write_rule} 分析任务不得写入；探索、验证、审查优先对应 phase。`schedule` / `bind` 是 Primary 的 CAS 控制面命令，不算任务写入，不得预先拒绝。\n\
+3. 首次委派用 Shell 运行：`{scheduling_command}`；helper 读取数据库、cwd 和 `CODEX_THREAD_ID`。无 `commandExecution` 不得称失败；只认工具错误。有稳定任务键则传 `[task-key]`（`[a-z0-9][a-z0-9_-]{{0,63}}`）；仅完全同键复用，无键不复用有键 Thread。禁止猜任务键，不确定就省略。判断由 CAS 完成，Primary 不读 Thread、Token、Cache。\n\
+4. 只接受单行 `CAS1|<REUSE、SPAWN或WAIT>|<thread-id或->|<reason>`；否则失败：\n\
+   - `REUSE`：向返回 Thread `followup_task` 完整任务，再以同参数 `{bind_command}`；不得 spawn。\n\
+   - `SPAWN`：按第 5 条创建，再以同参数 `{bind_command}`。无生命周期 Hook 时，bind 仅凭匹配租约、原生 Thread 身份和 SPAWN 精确预留兼容准入。\n\
    - `WAIT`：同键 SPAWN 已预留；不得重复创建，稍后同参数重试。\n\
-   - 命令、协议、bind 失败或 WAIT 持续无进展：执行第 8 条失败规则。\n\
-5. spawn：`agent_type=<name>`、`fork_turns=\"none\"`；prompt 仅含：`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`。`TOOLS` 列名；空项 `-`，不附对话或工具说明。不得显式覆盖 `model` 或 `reasoning_effort`。\n\
-6. 同一具体任务同一时刻只允许一个对应子 Agent。pending/running 或可 follow-up 时复用；单次等待超时只表示尚未返回。旧 Thread 已终止、不可达或上下文耗尽且不再运行时，方可创建 replacement Thread；prompt 携带原任务、已完成改动、验证/失败、剩余工作和约束，同任务续作不再 schedule。不设置“只创建一次”的固定上限；连续替换无可验证进展则失败。REUSE 缺少 Thread、目标不可达或返回无法续接时同样处理。\n\
-7. Child 首行必须是 `RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED`。Primary 等待并审查改动与证据，再按状态处理：DONE 接受或向同一 Thread 交付下一单元；NEEDS_DECISION 决策后 follow-up；PARTIAL/BLOCKED 按剩余工作、阻塞证据和第 8 条处理。不得未经审查连续追加任务。成功后保留 Thread，严禁调用 `close_agent`；CAS 同步为 IDLE。仅用户要求、Agent 停用/移除、Thread 异常或 CAS 判定不可复用时可关闭。写入串行；独立只读可并行。\n\
+   - bind 成功才完成；命令、协议、bind 失败或 WAIT 无进展：执行第 8 条。\n\
+5. spawn 用 `agent_type=<name>`、`fork_turns=\"none\"`；prompt 仅含 `GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`。`TOOLS` 只列名，空项 `-`；不附对话/工具说明，不覆盖 `model` / `reasoning_effort`。\n\
+6. 同一任务同时只运行一个对应 Child；pending/running/可 follow-up 时复用，单次等待超时不等于失败。仅旧 Thread 终止、不可达或上下文耗尽且未运行时创建 replacement；prompt 携带任务、已完成、验证/失败、剩余工作和约束，同任务续作不再 schedule。不限制创建次数，但连续替换无进展即失败；REUSE 不可达同样处理。\n\
+7. Child 首行：`RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED`。Primary 等待并审查证据：DONE 接受或交付同一 Thread 下一单元；NEEDS_DECISION 决策后 follow-up；PARTIAL/BLOCKED 按剩余工作、证据和第 8 条处理。禁止未审查就追加。成功保留 Thread，严禁 `close_agent`，CAS 同步 IDLE；仅用户要求、Agent 停用/移除、Thread 异常或 CAS 判定不可复用时关闭。写入串行，独立只读可并行。\n\
 8. {failure_rule} 所有路径必须显式报告。"
     )
 }
@@ -3782,6 +3782,12 @@ fn diagnose_orchestration(
             "当前 Codex 不支持可用的 hooks；运行时写入约束将降级为指令、Agent 配置与沙箱保护。",
         )
     });
+    if runtime_hooks_available {
+        issues.push(DiagnosticIssue::info(
+            "RUNTIME_HOOKS_TRUST_REVIEW",
+            "Codex 首次发现或检测到 CAS Hook 变化时可能要求审核；请在新任务中用 /hooks 确认 CAS Runtime Enforcement 已受信任。",
+        ));
+    }
 
     let has_execution_binding = bindings.iter().any(|binding| binding.phase == "EXECUTION")
         || legacy_agent_id
@@ -5954,24 +5960,24 @@ mod tests {
         let active_global =
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert_eq!(active_global, "# 用户全局规则\n\n保留这段内容。\n");
-        assert!(primary_instructions.contains("本编排规则只约束 Primary/root"));
+        assert!(primary_instructions.contains("规则只约束 Primary/root"));
         assert!(primary_instructions.contains("model=`deepseek-v4-flash`"));
         assert!(primary_instructions.contains("reasoning_effort=`high`"));
-        assert!(primary_instructions.contains("spawn：`agent_type=<name>`"));
+        assert!(primary_instructions.contains("spawn 用 `agent_type=<name>`"));
         assert!(primary_instructions.contains("`fork_turns=\"none\"`"));
-        assert!(primary_instructions.contains("不得显式覆盖 `model` 或 `reasoning_effort`"));
+        assert!(primary_instructions.contains("不覆盖 `model` / `reasoning_effort`"));
         assert!(primary_instructions.contains("prompt 仅含"));
         assert!(primary_instructions.contains("`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`"));
-        assert!(primary_instructions.contains("`TOOLS` 列名"));
-        assert!(primary_instructions.contains("不附对话或工具说明"));
+        assert!(primary_instructions.contains("`TOOLS` 只列名"));
+        assert!(primary_instructions.contains("不附对话/工具说明"));
         assert!(primary_instructions.contains("RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED"));
-        assert!(primary_instructions.contains("不得未经审查连续追加任务"));
-        assert!(primary_instructions.contains("严禁调用 `close_agent`"));
-        assert!(primary_instructions.contains("成功后保留 Thread"));
-        assert!(primary_instructions.contains("CAS 同步为 IDLE"));
+        assert!(primary_instructions.contains("禁止未审查就追加"));
+        assert!(primary_instructions.contains("严禁 `close_agent`"));
+        assert!(primary_instructions.contains("成功保留 Thread"));
+        assert!(primary_instructions.contains("CAS 同步 IDLE"));
         assert!(primary_instructions.contains("CAS1|<REUSE、SPAWN或WAIT>"));
         assert!(primary_instructions.contains("CODEX_THREAD_ID"));
-        assert!(primary_instructions.contains("Primary 不得自行读取 Thread、Token 或 Cache"));
+        assert!(primary_instructions.contains("Primary 不读 Thread、Token、Cache"));
         assert!(primary_instructions.contains("cas-helper.exe\" schedule <agent-key> [task-key]"));
         assert!(
             primary_instructions
@@ -5979,7 +5985,7 @@ mod tests {
         );
         assert!(primary_instructions.contains("bind 成功"));
         assert!(primary_instructions.contains("task-key"));
-        assert!(primary_instructions.contains("不得用模糊分类或猜测历史来编造任务键"));
+        assert!(primary_instructions.contains("禁止猜任务键"));
         assert!(primary_instructions.contains(ORCHESTRATION_RUNTIME_CONTRACT));
         assert!(primary_instructions.contains("父任务必须使用 Auto 或 Workspace"));
         assert!(!primary_instructions.contains("显式传入 model"));
@@ -6045,14 +6051,14 @@ mod tests {
         );
         assert!(strict.contains("当前失败策略：Strict Stop"));
         assert!(strict.contains("严禁 Primary 自行接管写入"));
-        assert!(strict.contains("是 Primary 必须亲自执行的控制面操作"));
-        assert!(strict.contains("未产生 `commandExecution` 时严禁自行声称"));
-        assert!(strict.contains("同一具体任务同一时刻只允许一个对应子 Agent"));
-        assert!(strict.contains("单次等待超时只表示尚未返回"));
+        assert!(strict.contains("是 Primary 的 CAS 控制面命令"));
+        assert!(strict.contains("无 `commandExecution` 不得称失败"));
+        assert!(strict.contains("同一任务同时只运行一个对应 Child"));
+        assert!(strict.contains("单次等待超时不等于失败"));
         assert!(strict.contains("上下文耗尽"));
-        assert!(strict.contains("replacement Thread"));
-        assert!(strict.contains("不设置“只创建一次”的固定上限"));
-        assert!(strict.contains("REUSE 缺少 Thread、目标不可达或返回无法续接时"));
+        assert!(strict.contains("创建 replacement"));
+        assert!(strict.contains("不限制创建次数"));
+        assert!(strict.contains("REUSE 不可达同样处理"));
 
         open_database(&context.database)
             .unwrap()

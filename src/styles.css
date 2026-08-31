@@ -2125,6 +2125,16 @@ code,
   font-size: 10px;
 }
 
+.runtime-event-category {
+  flex: 0 0 auto;
+  padding: 2px 5px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 999px;
+  color: hsl(var(--foreground));
+  background: hsl(var(--background) / 0.55);
+  font-size: 9px;
+}
+
 .reuse-recommendation code {
   margin-left: auto;
   font-size: 10px;

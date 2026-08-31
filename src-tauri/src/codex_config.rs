@@ -14,12 +14,16 @@ const AUTH_REFRESH_INTERVAL_MS: i64 = 300_000;
 const ORCHESTRATION_BEGIN: &str = "<<< CAS ORCHESTRATION v1 >>>";
 const ORCHESTRATION_END: &str = "<<< END CAS ORCHESTRATION v1 >>>";
 const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
-const RUNTIME_HOOK_EVENTS: [(&str, &str); 3] = [
+const RUNTIME_HOOK_EVENTS: [(&str, &str); 4] = [
     ("SubagentStart", ".*"),
     ("SubagentStop", ".*"),
     (
         "PreToolUse",
-        "^(Bash|shell_command|exec_command|apply_patch|Edit|Write)$",
+        "^(Bash|shell_command|exec_command|apply_patch|Edit|Write|spawn_agent|Agent|followup_task|send_input)$",
+    ),
+    (
+        "PostToolUse",
+        "^(spawn_agent|Agent|followup_task|send_input)$",
     ),
 ];
 const GLOBAL_ORCHESTRATION_BEGIN: &str = "<!-- CAS ORCHESTRATION v1 BEGIN -->";
@@ -1325,7 +1329,10 @@ command = "user-hook --check"
         )
         .unwrap();
         assert!(active.contains("user-hook --check"));
-        assert_eq!(active.matches(RUNTIME_HOOK_MARKER).count(), 6);
+        assert_eq!(active.matches(RUNTIME_HOOK_MARKER).count(), 8);
+        assert!(active.contains("spawn_agent"));
+        assert!(active.contains("followup_task"));
+        assert!(active.contains("send_input"));
         assert!(
             orchestration_projection_semantic(&active)
                 .unwrap()

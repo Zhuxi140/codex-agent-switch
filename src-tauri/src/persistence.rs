@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 30;
+const LATEST_SCHEMA_VERSION: i64 = 32;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -148,6 +148,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         30,
         "runtime_delegation_leases",
         include_str!("../migrations/0030_runtime_delegation_leases.sql"),
+    ),
+    (
+        31,
+        "runtime_delegation_admission",
+        include_str!("../migrations/0031_runtime_delegation_admission.sql"),
+    ),
+    (
+        32,
+        "runtime_delegation_confirmation",
+        include_str!("../migrations/0032_runtime_delegation_confirmation.sql"),
     ),
 ];
 

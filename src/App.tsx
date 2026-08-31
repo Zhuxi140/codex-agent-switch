@@ -2205,6 +2205,15 @@ function ScheduleDecisionsPanel() {
   );
 }
 
+function runtimeEnforcementCategory(toolName: string) {
+  const normalized = toolName.toLowerCase();
+  if (["subagentstart", "subagentstop", "native_state"].includes(normalized)) return "生命周期";
+  if (["spawn_agent", "agent", "followup_task", "send_input", "delegation_admission", "native_bind"].includes(normalized)) {
+    return "委派入口";
+  }
+  return "工具写入";
+}
+
 function RuntimeEnforcementPanel() {
   const [events, setEvents] = useState<RuntimeEnforcementEventResponse[]>([]);
   const [loading, setLoading] = useState(true);
@@ -2234,7 +2243,7 @@ function RuntimeEnforcementPanel() {
         <div>
           <span className="eyebrow">Runtime Enforcement</span>
           <h2 id="runtime-enforcement-title">运行时约束记录</h2>
-          <p>记录 CAS Hook Guard 对明确本地写入作出的放行、警告与拒绝；它不是完整的权限沙箱。</p>
+          <p>记录 CAS Hook Guard 对子 Agent 委派、生命周期与明确本地写入作出的放行、警告和拒绝。</p>
         </div>
         <button className="secondary-button" disabled={loading} onClick={() => void load()} type="button">
           {loading ? "刷新中…" : "刷新"}
@@ -2242,13 +2251,14 @@ function RuntimeEnforcementPanel() {
       </header>
       {error && <div className="inline-error" role="alert">{error}</div>}
       {!loading && !error && events.length === 0 && (
-        <div className="usage-empty">尚无运行时约束记录；启用子 Agent 模式并触发明确写入后才会出现。</div>
+        <div className="usage-empty">尚无运行时约束记录；启用子 Agent 模式并触发委派或明确写入后才会出现。</div>
       )}
       {!error && events.length > 0 && (
         <div className="usage-record-list">
           {events.map((event) => (
             <article className={`reuse-recommendation ${event.decision.toLowerCase()}`} key={event.id}>
               <strong>{event.decision}</strong>
+              <span className="runtime-event-category">{runtimeEnforcementCategory(event.toolName)}</span>
               <span>{event.reasonCode}</span>
               <span className="reuse-recommendation-meta">
                 {formatUsageDate(event.createdAt)}
