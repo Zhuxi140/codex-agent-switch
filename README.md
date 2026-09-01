@@ -73,21 +73,22 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
 
-### 当前主分支开发验证（2026-08-24）
+### 当前主分支开发验证（2026-09-01）
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 189 passed、0 failed、5 ignored |
+| Rust Workspace 测试 | 201 passed、0 failed、8 ignored |
 | 前端生产构建 | 通过 |
 | Diff 检查 | 通过 |
 | Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
 | Codex Native RC-2：并发与失配调度矩阵 | 通过（`gpt-5.6-terra`） |
-| Codex Native Phase 6：App Server 断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`） |
+| Codex Native Phase 12：空闲/运行中断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`，原 Turn 未重放） |
+| Phase 12：启动失败 / 连续恢复失败上限 | 通过（`FAILED` 状态闭环、3 次硬上限） |
 | Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 6 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。启动失败不会残留伪 `STARTING` 状态；无法证明 Schema 能力时统一 Fail Closed。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
 
-当前 workspace 的 5 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试，以及 4 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
+当前 workspace 的 8 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 5 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
 ### v0.4.1 发布验证
 
@@ -105,7 +106,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 | 链路 | 状态 | 覆盖边界 |
 | --- | --- | --- |
-| Codex Native `gpt-5.6-terra` 子 Agent | RC-1、RC-2、Phase 6 自动化通过 | 同一 Primary 下完成 SPAWN → bind → IDLE → REUSE；并发与失配矩阵通过；空闲断流后恢复同一 Primary，显式停止后不自动拉起 |
+| Codex Native `gpt-5.6-terra` 子 Agent | RC-1、RC-2、Phase 12 自动化通过 | 同一 Primary 下完成 SPAWN → bind → IDLE → REUSE；并发与失配矩阵通过；空闲及运行中断流均恢复同一 Primary，原 Turn 未重放，显式停止后不自动拉起 |
 | DeepSeek Responses 子 Agent | 已有成功实测 | 仅说明该实测配置可运行，不外推至其他 Provider 或模型 |
 | 外部配置 E2E 自动化 | 已提供独立命令，未纳入默认测试 | 依赖当前 Codex 登录、活动 Agent、真实 Provider 与模型；失败会保留 JSON 证据 |
 | 阿里及其他 Provider | 待测试 | 不声明已通过 |
@@ -114,7 +115,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 同日 RC-2 在另一条真实 Codex Native 父子链路上通过：两个相同 Task Scope 的并发预检严格得到 1 个 `SPAWN` 与 1 个 `WAIT / SPAWN_RESERVED`；更换 Workspace、Runtime Fingerprint 以及把临时原生 rollout 的当前 Context 合成到 100% 时，分别稳定得到 `NO_WORKSPACE_SCOPE_MATCH`、`RUNTIME_FINGERPRINT_MISMATCH` 与 `CONTEXT_PRESSURE`。矩阵探针只执行预检，结束后 Child 记录仍为 1。Context 项明确是隔离 rollout 的合成状态探针，不是额外消耗 258,400 Token 的模型运行。
 
-Phase 6 使用原生 `gpt-5.6-terra` 先完成一个文本 Turn，再强制终止 App Server。CAS 随后恢复了相同的 Primary Thread ID，Session 回到 `IDLE`；显式停止 Bridge 后，状态轮询没有再次启动进程。该样本证明空闲断流恢复链路，不替代运行中 Turn、中断风暴与多 Codex 版本的完整恢复矩阵。
+2026-09-01 的 Phase 12 使用原生 `gpt-5.6-terra` 分别验证空闲和运行中断流。空闲样本恢复了相同的 Primary Thread ID，Session 回到 `IDLE`，显式停止后保持停止；运行中样本先通过 `thread/read` 确认原 Turn 已持久化，再强制终止 App Server，恢复后仍是同一 Primary，原生 Thread 只有 1 个 Turn，原 Turn ID 只出现 1 次，因此没有自动重放。确定性场景还验证了启动失败进入 `FAILED` 且不保留伪 Launch，以及连续恢复失败稳定停在 3 次上限。Schema Fixture 覆盖当前字段、未来可选字段、缺失字段和新增必填字段；真实多版本仍需使用用户本地已有的不同 Codex 可执行文件逐个运行，不据单版本外推。
 
 ### 效率对比（待持续实测）
 
@@ -223,7 +224,7 @@ Primary 专属的调度协议只写入 `config.toml` 的 `developer_instructions
 
 - **真实编排闭环（RC-1 已完成）**：Codex Native 已固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token 与决策日志。
 - **并发与失配矩阵（RC-2 已完成）**：同任务并发返回唯一 SPAWN 与 WAIT；Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定拒绝旧 Thread，并给出 SPAWN 建议。
-- **恢复能力**：覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和 Runtime Bridge 断流恢复。
+- **恢复能力（Runtime Bridge 当前版本矩阵已完成）**：空闲/运行中断流、启动失败与恢复上限已闭环；继续覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和本地多 Codex 版本样本。
 - **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
 - **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
 
@@ -246,8 +247,15 @@ npm.cmd run bundle:windows
 ```powershell
 npm.cmd run e2e:orchestration -- -AgentKey <agent-key> -TimeoutSeconds 180
 npm.cmd run e2e:orchestration:matrix -- -AgentKey <codex-native-agent-key> -TimeoutSeconds 180
-npm.cmd run e2e:runtime-recovery -- -TimeoutSeconds 120
+npm.cmd run e2e:runtime-recovery -- -Scenario Idle -TimeoutSeconds 120
+npm.cmd run e2e:runtime-recovery -- -Scenario Running -TimeoutSeconds 120
+npm.cmd run e2e:runtime-recovery -- -Scenario Storm
+npm.cmd run e2e:runtime-recovery -- -Scenario StartupFailure
 ```
+
+多版本验证不自动下载 Codex。对用户已经安装的其他版本重复传入
+`-CodexExecutable <path-to-codex.exe>`；CAS 以实际 Schema 能力判定支持、未声明、不兼容或未能证明，
+不按版本号猜测功能。
 
 ## 系统要求
 

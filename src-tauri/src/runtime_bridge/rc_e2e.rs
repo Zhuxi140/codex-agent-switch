@@ -293,6 +293,18 @@ fn primary_summary(bridge: &RuntimeBridgeService, thread_id: &str) -> String {
     format!("primaryMessage={summary}{command}")
 }
 
+fn thread_turn_evidence(thread: &Value, turn_id: &str) -> Option<(usize, usize)> {
+    let thread = find_object(thread, &["thread"]).unwrap_or(thread);
+    let turns = thread.get("turns").and_then(Value::as_array)?;
+    let occurrences = turns
+        .iter()
+        .filter(|candidate| {
+            find_string(candidate, &["id", "turnId", "turn_id"]).as_deref() == Some(turn_id)
+        })
+        .count();
+    Some((turns.len(), occurrences))
+}
+
 fn verify_output(
     bridge: &RuntimeBridgeService,
     database_path: &Path,
@@ -1329,7 +1341,7 @@ fn managed_session_rc2_scheduling_matrix() {
     run_e2e_test(true, "CAS_RC2_RESULT");
 }
 
-fn run_phase6_recovery_e2e() -> Result<Value, Rc1Failure> {
+fn run_phase6_idle_recovery_e2e() -> Result<Value, Rc1Failure> {
     let root = required_path("CAS_E2E_ROOT")?;
     let _cleanup = TempRoot(root.clone());
     let source_codex_home = required_path("CAS_E2E_SOURCE_CODEX_HOME")?;
@@ -1396,7 +1408,15 @@ fn run_phase6_recovery_e2e() -> Result<Value, Rc1Failure> {
                 _ => {
                     return Err(Rc1Failure::new(
                         "RECOVERY_FIXTURE_TURN_FAILED",
-                        format!("准备 Turn 结束状态为 {session_status:?}"),
+                        format!(
+                            "准备 Turn 结束状态为 {session_status:?}{}；{}",
+                            status
+                                .last_error
+                                .as_deref()
+                                .map(|message| format!("：{message}"))
+                                .unwrap_or_default(),
+                            primary_summary(&bridge, &session.thread_id)
+                        ),
                     ));
                 }
             }
@@ -1474,7 +1494,298 @@ fn run_phase6_recovery_e2e() -> Result<Value, Rc1Failure> {
 #[test]
 #[ignore = "requires Codex login and a real Codex App Server"]
 fn managed_session_phase6_idle_disconnect_recovers_same_primary() {
-    write_e2e_result(run_phase6_recovery_e2e(), "CAS_PHASE6_RESULT");
+    write_e2e_result(run_phase6_idle_recovery_e2e(), "CAS_PHASE6_IDLE_RESULT");
+}
+
+fn run_phase12_running_recovery_e2e() -> Result<Value, Rc1Failure> {
+    let root = required_path("CAS_E2E_ROOT")?;
+    let _cleanup = TempRoot(root.clone());
+    let source_codex_home = required_path("CAS_E2E_SOURCE_CODEX_HOME")?;
+    let database_path = required_path("CAS_DATABASE_PATH")?;
+    let codex_home = root.join("codex-home");
+    let data_home = root.join("cas-data");
+    let workspace = root.join("workspace");
+    stage(fs::create_dir_all(&codex_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&data_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&workspace), "TEMP_DIRECTORY_FAILED")?;
+    copy_runtime_identity(&source_codex_home, &codex_home)?;
+    stage(
+        fs::write(
+            codex_home.join("config.toml"),
+            b"model = \"gpt-5.6-terra\"\napproval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n",
+        ),
+        "NON_INTERACTIVE_CONFIG_FAILED",
+    )?;
+    let executable = env::var("CAS_E2E_CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".to_owned());
+    let bridge = stage(
+        RuntimeBridgeService::open(&database_path, &data_home),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    let outcome = (|| {
+        stage(
+            bridge.start_inner(Path::new(&executable), &codex_home, None),
+            "BRIDGE_START_FAILED",
+        )?;
+        let session = stage(
+            bridge.managed_session_start_inner(ManagedSessionStartRequest {
+                cwd: workspace.to_string_lossy().into_owned(),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox: Some("workspace-write".to_owned()),
+            }),
+            "PRIMARY_START_FAILED",
+        )?;
+        let turn = stage(
+            bridge.managed_turn_start_inner(ManagedTurnStartRequest {
+                thread_id: session.thread_id.clone(),
+                input: "不要调用任何工具。请详细分析多 Agent 编排中重复执行的风险，并给出不少于 3000 字的说明。"
+                    .to_owned(),
+                effort: Some("high".to_owned()),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox_policy: None,
+            }),
+            "RUNNING_RECOVERY_TURN_FAILED",
+        )?;
+        let running = stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?;
+        if !running.managed_session.as_ref().is_some_and(|managed| {
+            managed.status == ManagedSessionStatus::Running
+                && managed.active_turn_id.as_deref() == Some(turn.turn_id.as_str())
+        }) {
+            return Err(Rc1Failure::new(
+                "RUNNING_RECOVERY_TURN_NOT_ACTIVE",
+                format!("Turn 未保持 RUNNING：{running:?}"),
+            ));
+        }
+        let persistence_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?;
+            if !status.managed_session.as_ref().is_some_and(|managed| {
+                managed.status == ManagedSessionStatus::Running
+                    && managed.active_turn_id.as_deref() == Some(turn.turn_id.as_str())
+            }) {
+                return Err(Rc1Failure::new(
+                    "RUNNING_RECOVERY_TURN_COMPLETED_EARLY",
+                    format!("等待持久化时 Turn 已不再运行：{status:?}"),
+                ));
+            }
+            if bridge
+                .request(
+                    "thread/read",
+                    json!({"threadId": session.thread_id, "includeTurns": true}),
+                )
+                .ok()
+                .and_then(|thread| thread_turn_evidence(&thread, &turn.turn_id))
+                .is_some_and(|(_, occurrences)| occurrences == 1)
+            {
+                break;
+            }
+            if Instant::now() >= persistence_deadline {
+                return Err(Rc1Failure::new(
+                    "RUNNING_RECOVERY_ROLLOUT_NOT_PERSISTED",
+                    "运行中 Turn 在 10 秒内未形成可恢复 rollout",
+                ));
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        {
+            let mut workers = stage(bridge.worker(), "BRIDGE_WORKER_UNAVAILABLE")?;
+            let worker = workers
+                .as_mut()
+                .ok_or_else(|| Rc1Failure::new("BRIDGE_WORKER_UNAVAILABLE", "Worker 不存在"))?;
+            let mut child = stage(worker.child.lock(), "BRIDGE_PROCESS_UNAVAILABLE")?;
+            stage(child.kill(), "BRIDGE_PROCESS_KILL_FAILED")?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?.status
+                == RuntimeBridgeStatus::Failed
+            {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(Rc1Failure::new(
+                    "BRIDGE_FAILURE_NOT_OBSERVED",
+                    "App Server 被终止后没有进入 FAILED",
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let recovered = stage(bridge.recover_inner(true), "BRIDGE_RECOVERY_FAILED")?;
+        let recovered_session = recovered
+            .managed_session
+            .as_ref()
+            .ok_or_else(|| Rc1Failure::new("PRIMARY_RECOVERY_FAILED", "恢复后没有托管 Primary"))?;
+        if recovered.status != RuntimeBridgeStatus::Running
+            || recovered_session.thread_id != session.thread_id
+            || recovered_session.origin != ManagedSessionOrigin::Resumed
+            || !matches!(
+                recovered_session.status,
+                ManagedSessionStatus::Idle | ManagedSessionStatus::RecoveryRequired
+            )
+        {
+            return Err(Rc1Failure::new(
+                "PRIMARY_RECOVERY_FAILED",
+                format!("恢复状态不符合预期：{recovered:?}"),
+            ));
+        }
+        if recovered_session.status == ManagedSessionStatus::RecoveryRequired
+            && recovered_session.active_turn_id.as_deref() != Some(turn.turn_id.as_str())
+        {
+            return Err(Rc1Failure::new(
+                "UNCERTAIN_TURN_IDENTITY_LOST",
+                "恢复后未保留原始不确定 Turn ID",
+            ));
+        }
+        let thread = stage(
+            bridge.request(
+                "thread/read",
+                json!({"threadId": session.thread_id, "includeTurns": true}),
+            ),
+            "RUNNING_RECOVERY_THREAD_READ_FAILED",
+        )?;
+        let (thread_turn_count, original_turn_occurrences) =
+            thread_turn_evidence(&thread, &turn.turn_id).ok_or_else(|| {
+                Rc1Failure::new(
+                    "RUNNING_RECOVERY_TURNS_MISSING",
+                    "恢复后的 Thread 没有 turns",
+                )
+            })?;
+        if original_turn_occurrences != 1 || thread_turn_count != 1 {
+            return Err(Rc1Failure::new(
+                "INTERRUPTED_TURN_REPLAYED",
+                format!(
+                    "恢复后 turns={}，原 Turn 出现 {} 次",
+                    thread_turn_count, original_turn_occurrences
+                ),
+            ));
+        }
+        Ok(json!({
+            "status": "PASS",
+            "primaryThreadId": session.thread_id,
+            "recoveredPrimaryThreadId": recovered_session.thread_id,
+            "recoveredOrigin": recovered_session.origin,
+            "recoveredSessionStatus": recovered_session.status,
+            "originalTurnId": turn.turn_id,
+            "recoveredActiveTurnId": recovered_session.active_turn_id,
+            "threadTurnCount": thread_turn_count,
+            "originalTurnOccurrences": original_turn_occurrences,
+            "turnWasNotReplayed": true,
+            "model": "gpt-5.6-terra"
+        }))
+    })();
+    let _ = bridge.stop_inner();
+    outcome
+}
+
+fn run_phase12_startup_failure_e2e() -> Result<Value, Rc1Failure> {
+    let root = required_path("CAS_E2E_ROOT")?;
+    let _cleanup = TempRoot(root.clone());
+    stage(fs::create_dir_all(&root), "TEMP_DIRECTORY_FAILED")?;
+    let bridge = stage(
+        RuntimeBridgeService::open(&root.join("cas.db"), &root),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    let missing = root.join("missing-codex.exe");
+    let error = bridge
+        .start_inner(&missing, &root, Some("missing".to_owned()))
+        .expect_err("missing executable must fail");
+    if !matches!(error, RuntimeBridgeError::Spawn(_)) {
+        return Err(Rc1Failure::new(
+            "STARTUP_FAILURE_CLASSIFICATION_INVALID",
+            error.to_string(),
+        ));
+    }
+    let status = stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?;
+    if status.status != RuntimeBridgeStatus::Failed
+        || status.last_error.is_none()
+        || !stage(bridge.launch(), "BRIDGE_LAUNCH_STATE_FAILED")?.is_none()
+    {
+        return Err(Rc1Failure::new(
+            "STARTUP_FAILURE_STATE_INVALID",
+            format!("启动失败后状态不符合预期：{status:?}"),
+        ));
+    }
+    Ok(json!({
+        "status": "PASS",
+        "bridgeStatus": status.status,
+        "lastError": status.last_error,
+        "launchStatePersisted": false
+    }))
+}
+
+fn run_phase12_recovery_storm_e2e() -> Result<Value, Rc1Failure> {
+    let root = required_path("CAS_E2E_ROOT")?;
+    let _cleanup = TempRoot(root.clone());
+    stage(fs::create_dir_all(&root), "TEMP_DIRECTORY_FAILED")?;
+    let bridge = stage(
+        RuntimeBridgeService::open(&root.join("cas.db"), &root),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    *stage(bridge.launch(), "BRIDGE_LAUNCH_STATE_FAILED")? = Some(RuntimeBridgeLaunch {
+        executable: root.join("missing-codex.exe"),
+        codex_home: root.clone(),
+        codex_version: Some("missing".to_owned()),
+    });
+    stage(bridge.state(), "BRIDGE_STATUS_FAILED")?.status = RuntimeBridgeStatus::Failed;
+    for expected_attempt in 1..=MAX_AUTO_RECOVERY_ATTEMPTS {
+        let error = bridge
+            .recover_inner(false)
+            .expect_err("missing executable must fail recovery");
+        if !matches!(error, RuntimeBridgeError::Spawn(_)) {
+            return Err(Rc1Failure::new(
+                "RECOVERY_FAILURE_CLASSIFICATION_INVALID",
+                error.to_string(),
+            ));
+        }
+        let status = stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?;
+        if status.status != RuntimeBridgeStatus::Failed
+            || status.recovery_attempt_count != expected_attempt
+        {
+            return Err(Rc1Failure::new(
+                "RECOVERY_ATTEMPT_STATE_INVALID",
+                format!("第 {expected_attempt} 次恢复状态不符合预期：{status:?}"),
+            ));
+        }
+    }
+    let exhausted = stage(bridge.recover_inner(false), "BRIDGE_STATUS_FAILED")?;
+    if !exhausted.auto_recovery_exhausted
+        || exhausted.recovery_attempt_count != MAX_AUTO_RECOVERY_ATTEMPTS
+    {
+        return Err(Rc1Failure::new(
+            "RECOVERY_RETRY_CEILING_BYPASSED",
+            format!("恢复上限状态不符合预期：{exhausted:?}"),
+        ));
+    }
+    Ok(json!({
+        "status": "PASS",
+        "bridgeStatus": exhausted.status,
+        "recoveryAttemptCount": exhausted.recovery_attempt_count,
+        "maxAutoRecoveryAttempts": exhausted.max_auto_recovery_attempts,
+        "autoRecoveryExhausted": exhausted.auto_recovery_exhausted
+    }))
+}
+
+#[test]
+#[ignore = "requires Codex login and a real Codex App Server"]
+fn managed_session_phase12_running_disconnect_is_not_replayed() {
+    write_e2e_result(
+        run_phase12_running_recovery_e2e(),
+        "CAS_PHASE12_RUNNING_RESULT",
+    );
+}
+
+#[test]
+#[ignore = "writes structured Phase 12 startup-failure evidence"]
+fn managed_session_phase12_startup_failure_is_terminal() {
+    write_e2e_result(
+        run_phase12_startup_failure_e2e(),
+        "CAS_PHASE12_STARTUP_RESULT",
+    );
+}
+
+#[test]
+#[ignore = "writes structured Phase 12 retry-ceiling evidence"]
+fn managed_session_phase12_recovery_storm_stops_at_ceiling() {
+    write_e2e_result(run_phase12_recovery_storm_e2e(), "CAS_PHASE12_STORM_RESULT");
 }
 
 fn run_e2e_test(include_rc2_matrix: bool, result_label: &str) {

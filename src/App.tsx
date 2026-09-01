@@ -92,6 +92,7 @@ import {
   type RuntimeModeResponse,
   type RuntimeBridgeStatusResponse,
   type RuntimeEnforcementEventResponse,
+  type SchemaCapability,
   type SandboxPolicy,
   type ScheduleDecisionResponse,
   type SnapshotSummary,
@@ -2308,6 +2309,28 @@ function RuntimeBridgeSummary({ monitor }: { monitor: RuntimeBridgeStatusRespons
   );
 }
 
+function schemaCapabilityLabel(capability: SchemaCapability): string {
+  return {
+    SUPPORTED: "已确认支持",
+    NOT_DECLARED: "未声明",
+    INCOMPATIBLE: "不兼容",
+    UNAVAILABLE: "未能证明",
+  }[capability];
+}
+
+function schemaCapabilityDescription(
+  managedSession: SchemaCapability,
+  agentExecution: SchemaCapability,
+): string {
+  const capability = agentExecution !== "SUPPORTED" ? agentExecution : managedSession;
+  return {
+    SUPPORTED: "当前 Codex 已通过 Runtime Bridge 能力探测。",
+    NOT_DECLARED: "当前 Codex Schema 未声明所需接口，CAS 已停止托管执行。",
+    INCOMPATIBLE: "当前 Codex Schema 的字段契约不兼容，CAS 已停止托管执行。",
+    UNAVAILABLE: "Schema 探测失败或超时，能力无法证明；请重新检测 Codex 后再试。",
+  }[capability];
+}
+
 function UsageMonitorCard() {
   const [monitor, setMonitor] = useState<RuntimeBridgeStatusResponse | null>(null);
   const [busy, setBusy] = useState(false);
@@ -2334,7 +2357,7 @@ function UsageMonitorCard() {
     try {
       setMonitor(running ? await startUsageMonitor() : await stopUsageMonitor());
     } catch (reason: unknown) {
-      setError(errorMessage(reason));
+      setError(runtimeBridgeErrorMessage(reason));
       await refresh();
     } finally {
       setBusy(false);
@@ -2347,7 +2370,7 @@ function UsageMonitorCard() {
     try {
       setMonitor(await recoverUsageMonitor());
     } catch (reason: unknown) {
-      setError(errorMessage(reason));
+      setError(runtimeBridgeErrorMessage(reason));
       await refresh();
     } finally {
       setBusy(false);
@@ -2369,7 +2392,7 @@ function UsageMonitorCard() {
       await resolveManagedSessionRecovery(threadId, abandonUncertainTurn);
       await refresh();
     } catch (reason: unknown) {
-      setError(errorMessage(reason));
+      setError(runtimeBridgeErrorMessage(reason));
       await refresh();
     } finally {
       setBusy(false);
@@ -2414,6 +2437,15 @@ function UsageMonitorCard() {
       {monitor && (
         <dl className="runtime-monitor-grid">
           <EnvironmentField label="Bridge" value={monitor.status} />
+          <EnvironmentField label="Codex" value={monitor.codexVersion ?? monitor.serverUserAgent} />
+          <EnvironmentField
+            label="托管会话能力"
+            value={schemaCapabilityLabel(monitor.managedSessionCapability)}
+          />
+          <EnvironmentField
+            label="Agent 执行能力"
+            value={schemaCapabilityLabel(monitor.agentExecutionCapability)}
+          />
           <EnvironmentField label="Primary Thread" value={monitor.managedSession?.threadId ?? null} />
           <EnvironmentField label="Session" value={monitor.managedSession?.status ?? null} />
           <EnvironmentField label="最近事件" value={monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : null} />
@@ -2442,6 +2474,17 @@ function UsageMonitorCard() {
           事件流已断开或降级；生命周期与 Token 数据停留在最近事件（
           {monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : "未知"}
           ），恢复前不得当作当前事实。
+        </small>
+      )}
+      {monitor && (
+        monitor.managedSessionCapability !== "SUPPORTED"
+        || monitor.agentExecutionCapability !== "SUPPORTED"
+      ) && (
+        <small className="runtime-monitor-warning">
+          {schemaCapabilityDescription(
+            monitor.managedSessionCapability,
+            monitor.agentExecutionCapability,
+          )}
         </small>
       )}
       {monitor?.lastError && <ExpandableMessage className="runtime-monitor-warning" text={monitor.lastError} />}
@@ -6570,6 +6613,15 @@ function errorMessage(reason: unknown): string {
       ? reason.details.blockerCode
       : null;
   return blockerCode ? `${message}（${blockerCode}）` : message;
+}
+
+function runtimeBridgeErrorMessage(reason: unknown): string {
+  const message = errorMessage(reason);
+  const code = errorCode(reason);
+  if (!code || typeof reason !== "object" || reason === null || !("retryable" in reason)) {
+    return message;
+  }
+  return `${message}（${code}，${reason.retryable === true ? "可以重试" : "需要检查配置或兼容性"}）`;
 }
 
 function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 10_000): Promise<T> {

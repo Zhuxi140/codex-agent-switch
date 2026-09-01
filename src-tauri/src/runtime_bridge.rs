@@ -207,26 +207,51 @@ impl RuntimeBridgeService {
         if bypass_hook_trust {
             command.arg("--dangerously-bypass-hook-trust");
         }
-        let mut child = command
+        let mut child = match command
             .args(["app-server", "--listen", "stdio://"])
             .env("CODEX_HOME", codex_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(RuntimeBridgeError::Spawn)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(RuntimeBridgeError::MissingPipe("stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(RuntimeBridgeError::MissingPipe("stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(RuntimeBridgeError::MissingPipe("stderr"))?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                let error = RuntimeBridgeError::Spawn(error);
+                self.set_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                let error = RuntimeBridgeError::MissingPipe("stdin");
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                let error = RuntimeBridgeError::MissingPipe("stdout");
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                let error = RuntimeBridgeError::MissingPipe("stderr");
+                let _ = child.kill();
+                let _ = child.wait();
+                self.set_failed(error.to_string());
+                return Err(error);
+            }
+        };
         let child = Arc::new(Mutex::new(child));
         let stopping = Arc::new(AtomicBool::new(false));
         let (initialize_tx, initialize_rx) = mpsc::sync_channel(1);
@@ -276,6 +301,7 @@ impl RuntimeBridgeService {
         });
         if let Err(error) = write_shared_message(&stdin, &initialize) {
             cleanup_unstarted_worker(child, stopping, stdout_thread, stderr_thread);
+            self.set_failed(error.to_string());
             return Err(error);
         }
 
@@ -721,19 +747,15 @@ impl RuntimeBridgeService {
 
     fn ensure_managed_session_supported(&self) -> Result<(), RuntimeBridgeError> {
         match self.state()?.managed_session_capability {
-            SchemaCapability::NotDeclared | SchemaCapability::Incompatible => {
-                Err(RuntimeBridgeError::ManagedSessionUnsupported)
-            }
-            SchemaCapability::Supported | SchemaCapability::Unavailable => Ok(()),
+            SchemaCapability::Supported => Ok(()),
+            capability => Err(RuntimeBridgeError::ManagedSessionUnsupported(capability)),
         }
     }
 
     fn ensure_agent_execution_supported(&self) -> Result<(), RuntimeBridgeError> {
         match self.state()?.agent_execution_capability {
-            SchemaCapability::NotDeclared | SchemaCapability::Incompatible => {
-                Err(RuntimeBridgeError::AgentExecutionUnsupported)
-            }
-            SchemaCapability::Supported | SchemaCapability::Unavailable => Ok(()),
+            SchemaCapability::Supported => Ok(()),
+            capability => Err(RuntimeBridgeError::AgentExecutionUnsupported(capability)),
         }
     }
 
@@ -2244,12 +2266,22 @@ impl From<RuntimeBridgeError> for ApiError {
                 "请先启动 Token Usage 监控。",
                 false,
             ),
-            RuntimeBridgeError::ManagedSessionUnsupported => (
+            RuntimeBridgeError::ManagedSessionUnsupported(SchemaCapability::Unavailable) => (
+                "APP_SERVER_MANAGED_SESSION_UNPROVED",
+                "无法证明当前 Codex App Server 支持 CAS 托管会话，请重新检测 Codex。",
+                true,
+            ),
+            RuntimeBridgeError::ManagedSessionUnsupported(_) => (
                 "APP_SERVER_MANAGED_SESSION_UNSUPPORTED",
                 "当前 Codex App Server Schema 不支持 CAS 托管会话。",
                 false,
             ),
-            RuntimeBridgeError::AgentExecutionUnsupported => (
+            RuntimeBridgeError::AgentExecutionUnsupported(SchemaCapability::Unavailable) => (
+                "APP_SERVER_AGENT_EXECUTION_UNPROVED",
+                "无法证明当前 Codex App Server 支持安全指定 Agent，请重新检测 Codex。",
+                true,
+            ),
+            RuntimeBridgeError::AgentExecutionUnsupported(_) => (
                 "APP_SERVER_AGENT_EXECUTION_UNSUPPORTED",
                 "当前 Codex App Server Schema 不支持安全指定 Agent 的 Provider、Model 与 Instructions。",
                 false,
@@ -2357,6 +2389,19 @@ impl From<RuntimeBridgeError> for ApiError {
             RuntimeBridgeError::InvalidProtocolResponse(field) => {
                 Some(BTreeMap::from([("field", field.to_owned())]))
             }
+            RuntimeBridgeError::ManagedSessionUnsupported(capability)
+            | RuntimeBridgeError::AgentExecutionUnsupported(capability) => {
+                Some(BTreeMap::from([(
+                    "capability",
+                    format!("{capability:?}").to_ascii_uppercase(),
+                )]))
+            }
+            RuntimeBridgeError::Spawn(details)
+            | RuntimeBridgeError::Process(details)
+            | RuntimeBridgeError::ProtocolWrite(details)
+            | RuntimeBridgeError::SchemaProbe(details) => {
+                Some(BTreeMap::from([("reason", details.to_string())]))
+            }
             _ => None,
         };
         ApiError::new(code, message, retryable, details)
@@ -2371,8 +2416,8 @@ pub(crate) enum RuntimeBridgeError {
     InitializeTimeout,
     InitializeRejected(String),
     NotRunning,
-    ManagedSessionUnsupported,
-    AgentExecutionUnsupported,
+    ManagedSessionUnsupported(SchemaCapability),
+    AgentExecutionUnsupported(SchemaCapability),
     InvalidCwd,
     InvalidThreadId,
     InvalidInput,
@@ -2406,11 +2451,16 @@ impl fmt::Display for RuntimeBridgeError {
                 write!(formatter, "app server initialize rejected: {message}")
             }
             Self::NotRunning => formatter.write_str("runtime bridge is not running"),
-            Self::ManagedSessionUnsupported => {
-                formatter.write_str("managed sessions are not supported by the detected schema")
+            Self::ManagedSessionUnsupported(capability) => {
+                write!(
+                    formatter,
+                    "managed sessions are not supported by the detected schema: {capability:?}"
+                )
             }
-            Self::AgentExecutionUnsupported => formatter
-                .write_str("managed agent execution is not supported by the detected schema"),
+            Self::AgentExecutionUnsupported(capability) => write!(
+                formatter,
+                "managed agent execution is not supported by the detected schema: {capability:?}"
+            ),
             Self::InvalidCwd => formatter.write_str("managed session cwd is invalid"),
             Self::InvalidThreadId => formatter.write_str("managed session thread id is invalid"),
             Self::InvalidInput => formatter.write_str("managed turn input is invalid"),
@@ -2756,6 +2806,84 @@ mod tests {
         state.status = RuntimeBridgeStatus::Stopped;
         state.recovery_attempt_count = 0;
         assert!(!auto_recovery_allowed(&state));
+    }
+
+    #[test]
+    fn unavailable_schema_fails_closed_for_managed_sessions_and_agent_execution() {
+        let root = std::env::temp_dir().join(format!("cas-runtime-schema-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        {
+            let mut state = bridge.state().unwrap();
+            state.managed_session_capability = SchemaCapability::Unavailable;
+            state.agent_execution_capability = SchemaCapability::Unavailable;
+        }
+
+        assert!(matches!(
+            bridge.ensure_managed_session_supported(),
+            Err(RuntimeBridgeError::ManagedSessionUnsupported(
+                SchemaCapability::Unavailable
+            ))
+        ));
+        assert!(matches!(
+            bridge.ensure_agent_execution_supported(),
+            Err(RuntimeBridgeError::AgentExecutionUnsupported(
+                SchemaCapability::Unavailable
+            ))
+        ));
+
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_failure_does_not_leave_bridge_starting() {
+        let root = std::env::temp_dir().join(format!("cas-runtime-start-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        let missing = root.join("missing-codex.exe");
+
+        assert!(matches!(
+            bridge.start_inner(&missing, &root, Some("missing".to_owned())),
+            Err(RuntimeBridgeError::Spawn(_))
+        ));
+        let status = bridge.status_inner().unwrap();
+        assert_eq!(status.status, RuntimeBridgeStatus::Failed);
+        assert!(status.last_error.is_some());
+        assert!(bridge.launch().unwrap().is_none());
+
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn consecutive_recovery_failures_stop_at_the_retry_ceiling() {
+        let root = std::env::temp_dir().join(format!("cas-runtime-storm-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        *bridge.launch().unwrap() = Some(RuntimeBridgeLaunch {
+            executable: root.join("missing-codex.exe"),
+            codex_home: root.clone(),
+            codex_version: Some("missing".to_owned()),
+        });
+        bridge.state().unwrap().status = RuntimeBridgeStatus::Failed;
+
+        for expected_attempt in 1..=MAX_AUTO_RECOVERY_ATTEMPTS {
+            assert!(matches!(
+                bridge.recover_inner(false),
+                Err(RuntimeBridgeError::Spawn(_))
+            ));
+            let status = bridge.status_inner().unwrap();
+            assert_eq!(status.status, RuntimeBridgeStatus::Failed);
+            assert_eq!(status.recovery_attempt_count, expected_attempt);
+        }
+        let exhausted = bridge.recover_inner(false).unwrap();
+        assert_eq!(exhausted.status, RuntimeBridgeStatus::Failed);
+        assert_eq!(exhausted.recovery_attempt_count, MAX_AUTO_RECOVERY_ATTEMPTS);
+        assert!(exhausted.auto_recovery_exhausted);
+
+        drop(bridge);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

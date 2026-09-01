@@ -61,29 +61,29 @@ pub(crate) fn probe_schema_capabilities(executable: &Path, data_home: &Path) -> 
         if !succeeded {
             return Some(SchemaCapabilities::default());
         }
-        let usage = if find_schema_file(&probe_root, "ThreadTokenUsageUpdatedNotification.json")
-            .is_some()
-        {
-            SchemaCapability::Supported
-        } else {
-            SchemaCapability::NotDeclared
-        };
-        let managed_session = managed_session_schema_capability(&probe_root);
-        let agent_execution = agent_execution_schema_capability(&probe_root);
-        Some(SchemaCapabilities {
-            usage,
-            managed_session,
-            agent_execution,
-        })
+        Some(inspect_schema_capabilities(&probe_root))
     })()
     .unwrap_or_default();
     let _ = fs::remove_dir_all(&probe_root);
     result
 }
 
+fn inspect_schema_capabilities(probe_root: &Path) -> SchemaCapabilities {
+    SchemaCapabilities {
+        usage: if find_schema_file(probe_root, "ThreadTokenUsageUpdatedNotification.json").is_some()
+        {
+            SchemaCapability::Supported
+        } else {
+            SchemaCapability::NotDeclared
+        },
+        managed_session: managed_session_schema_capability(probe_root),
+        agent_execution: agent_execution_schema_capability(probe_root),
+    }
+}
+
 fn managed_session_schema_capability(probe_root: &Path) -> SchemaCapability {
     let schemas = [
-        ("ThreadStartParams.json", &[][..]),
+        ("ThreadStartParams.json", &["cwd"][..]),
         ("ThreadResumeParams.json", &["threadId"][..]),
         ("TurnStartParams.json", &["input", "threadId"][..]),
     ];
@@ -126,6 +126,7 @@ fn agent_execution_schema_capability(probe_root: &Path) -> SchemaCapability {
                 "developerInstructions",
                 "sandbox",
             ][..],
+            &["cwd", "model", "developerInstructions", "sandbox"][..],
         ),
         (
             "ThreadResumeParams.json",
@@ -137,10 +138,21 @@ fn agent_execution_schema_capability(probe_root: &Path) -> SchemaCapability {
                 "developerInstructions",
                 "sandbox",
             ][..],
+            &[
+                "threadId",
+                "cwd",
+                "model",
+                "developerInstructions",
+                "sandbox",
+            ][..],
         ),
-        ("TurnStartParams.json", &["threadId", "input", "effort"][..]),
+        (
+            "TurnStartParams.json",
+            &["threadId", "input", "effort"][..],
+            &["threadId", "input", "effort"][..],
+        ),
     ];
-    for (name, properties) in schemas {
+    for (name, properties, supported_required) in schemas {
         let Some(path) = find_schema_file(probe_root, name) else {
             return SchemaCapability::NotDeclared;
         };
@@ -150,12 +162,14 @@ fn agent_execution_schema_capability(probe_root: &Path) -> SchemaCapability {
         let Ok(schema) = serde_json::from_str::<Value>(&contents) else {
             return SchemaCapability::Incompatible;
         };
-        if !properties.iter().all(|property| {
-            schema
-                .get("properties")
-                .and_then(Value::as_object)
-                .is_some_and(|declared| declared.contains_key(*property))
-        }) {
+        if !schema_requires_only(&schema, supported_required)
+            || !properties.iter().all(|property| {
+                schema
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|declared| declared.contains_key(*property))
+            })
+        {
             return SchemaCapability::Incompatible;
         }
     }
@@ -196,6 +210,64 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn fixture_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("cas-schema-fixture-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_schema(root: &Path, name: &str, required: &[&str], properties: &[&str]) {
+        let properties = properties
+            .iter()
+            .map(|name| ((*name).to_owned(), json!({})))
+            .collect::<serde_json::Map<_, _>>();
+        fs::write(
+            root.join(name),
+            serde_json::to_vec(&json!({
+                "required": required,
+                "properties": properties
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_supported_fixture(root: &Path) {
+        write_schema(
+            root,
+            "ThreadStartParams.json",
+            &["cwd"],
+            &[
+                "cwd",
+                "model",
+                "modelProvider",
+                "developerInstructions",
+                "sandbox",
+                "futureOptionalField",
+            ],
+        );
+        write_schema(
+            root,
+            "ThreadResumeParams.json",
+            &["threadId"],
+            &[
+                "threadId",
+                "cwd",
+                "model",
+                "modelProvider",
+                "developerInstructions",
+                "sandbox",
+            ],
+        );
+        write_schema(
+            root,
+            "TurnStartParams.json",
+            &["threadId", "input"],
+            &["threadId", "input", "effort"],
+        );
+        fs::write(root.join("ThreadTokenUsageUpdatedNotification.json"), b"{}").unwrap();
+    }
+
     #[test]
     fn schema_requires_only_accepts_known_required_fields() {
         assert!(schema_requires_only(
@@ -206,5 +278,57 @@ mod tests {
             &json!({"required": ["input", "threadId", "approvalPolicy"]}),
             &["input", "threadId"],
         ));
+    }
+
+    #[test]
+    fn schema_fixture_matrix_is_capability_driven() {
+        let supported = fixture_root();
+        write_supported_fixture(&supported);
+        let capabilities = inspect_schema_capabilities(&supported);
+        assert_eq!(capabilities.usage, SchemaCapability::Supported);
+        assert_eq!(capabilities.managed_session, SchemaCapability::Supported);
+        assert_eq!(capabilities.agent_execution, SchemaCapability::Supported);
+
+        write_schema(
+            &supported,
+            "ThreadStartParams.json",
+            &["cwd"],
+            &["cwd", "developerInstructions", "sandbox"],
+        );
+        let missing_agent_field = inspect_schema_capabilities(&supported);
+        assert_eq!(
+            missing_agent_field.managed_session,
+            SchemaCapability::Supported
+        );
+        assert_eq!(
+            missing_agent_field.agent_execution,
+            SchemaCapability::Incompatible
+        );
+
+        write_schema(
+            &supported,
+            "ThreadStartParams.json",
+            &["cwd", "newRequiredField"],
+            &[
+                "cwd",
+                "model",
+                "modelProvider",
+                "developerInstructions",
+                "sandbox",
+                "newRequiredField",
+            ],
+        );
+        let incompatible = inspect_schema_capabilities(&supported);
+        assert_eq!(incompatible.managed_session, SchemaCapability::Incompatible);
+        assert_eq!(incompatible.agent_execution, SchemaCapability::Incompatible);
+
+        let missing = fixture_root();
+        let undeclared = inspect_schema_capabilities(&missing);
+        assert_eq!(undeclared.usage, SchemaCapability::NotDeclared);
+        assert_eq!(undeclared.managed_session, SchemaCapability::NotDeclared);
+        assert_eq!(undeclared.agent_execution, SchemaCapability::NotDeclared);
+
+        let _ = fs::remove_dir_all(supported);
+        let _ = fs::remove_dir_all(missing);
     }
 }
