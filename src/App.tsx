@@ -598,24 +598,25 @@ function OverviewPage({
     useState<SettingsResponse["orchestrationFailurePolicy"]>("STRICT_STOP");
 
   const reloadConfiguration = useCallback(async () => {
-    const [statusResult, modeResult, agentsResult, historyResult, settingsResult] = await Promise.allSettled([
+    const [statusResult, agentsResult, historyResult, settingsResult] = await Promise.allSettled([
       withTimeout(getConfigurationStatus(), "读取配置状态"),
-      withTimeout(getRuntimeMode(), "读取运行模式"),
       withTimeout(listAgents(), "读取 Agent"),
       withTimeout(listSnapshots(6), "读取 Snapshot"),
       withTimeout(getSettings(), "读取编排设置"),
     ]);
 
-    if (statusResult.status === "fulfilled") setConfiguration(statusResult.value);
+    if (statusResult.status === "fulfilled") {
+      setConfiguration(statusResult.value);
+      setRuntimeMode(statusResult.value.runtimeMode);
+    }
     if (agentsResult.status === "fulfilled") setAgents(agentsResult.value);
     if (historyResult.status === "fulfilled") setSnapshots(historyResult.value.items);
     if (settingsResult.status === "fulfilled") {
       setFailurePolicy(settingsResult.value.orchestrationFailurePolicy);
     }
 
-    if (modeResult.status === "fulfilled") {
-      const mode = modeResult.value;
-      setRuntimeMode(mode);
+    if (statusResult.status === "fulfilled" && statusResult.value.runtimeMode) {
+      const mode = statusResult.value.runtimeMode;
       const currentBindings = Object.fromEntries(
         mode.activeBindings.map((binding) => [binding.roleKey, binding.agentId]),
       );
@@ -637,7 +638,7 @@ function OverviewPage({
       });
     }
 
-    const failure = [statusResult, modeResult, agentsResult, historyResult, settingsResult]
+    const failure = [statusResult, agentsResult, historyResult, settingsResult]
       .find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
   }, []);

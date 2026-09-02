@@ -145,7 +145,7 @@ fn app_get_bootstrap(
 
     Ok(AppBootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        ipc_schema_version: 4,
+        ipc_schema_version: 5,
         codex: CodexEnvironmentSummary {
             detected: environment.detected,
             version: environment.version,
@@ -153,7 +153,7 @@ fn app_get_bootstrap(
             runtime_hooks_available: environment.runtime_hooks_available,
         },
         configuration_status: configuration.status,
-        running_operation_id: state.running_operation_id(),
+        running_operation_id: configuration.active_operation_id.clone(),
         recovery_required,
     })
 }

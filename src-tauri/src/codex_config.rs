@@ -54,6 +54,8 @@ pub(crate) struct OrchestrationBaseline {
     pub(crate) global_instructions_existed: bool,
     #[serde(default)]
     pub(crate) global_instructions_content: Option<String>,
+    #[serde(default)]
+    pub(crate) model_providers_existed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +146,7 @@ pub(crate) fn upsert_provider_projection(
 pub(crate) fn remove_provider_projection(
     existing: &str,
     provider_id: &str,
+    remove_empty_parent: bool,
 ) -> Result<String, ConfigError> {
     let mut document = existing.parse::<DocumentMut>()?;
     if document.contains_key("model_providers") {
@@ -151,6 +154,9 @@ pub(crate) fn remove_provider_projection(
             .as_table_mut()
             .ok_or(ConfigError::InvalidStructure("model_providers"))?;
         providers.remove(provider_id);
+        if remove_empty_parent && providers.is_empty() {
+            document.remove("model_providers");
+        }
     }
     Ok(render_document(document, existing))
 }
@@ -161,6 +167,7 @@ pub(crate) fn restore_provider_projection(
     provider_id: &str,
 ) -> Result<String, ConfigError> {
     let snapshot = snapshot.parse::<DocumentMut>()?;
+    let parent_existed = snapshot.contains_key("model_providers");
     let fragment = snapshot
         .get("model_providers")
         .and_then(Item::as_table)
@@ -182,6 +189,9 @@ pub(crate) fn restore_provider_projection(
             None => {
                 providers.remove(provider_id);
             }
+        }
+        if !parent_existed && providers.is_empty() {
+            document.remove("model_providers");
         }
     }
     Ok(render_document(document, original))
@@ -282,6 +292,7 @@ pub(crate) fn capture_orchestration_baseline(
         global_instructions_path: None,
         global_instructions_existed: false,
         global_instructions_content: None,
+        model_providers_existed: Some(document.contains_key("model_providers")),
     })
 }
 
@@ -1222,6 +1233,45 @@ command = "keep-me"
     }
 
     #[test]
+    fn provider_cleanup_restores_parent_table_ownership_exactly() {
+        let projection = ProviderProjection {
+            provider_id: "cas_example",
+            display_name: "Example",
+            base_url: "https://example.com/",
+            helper_command: "cas-helper",
+            credential_id: "credential",
+        };
+        let without_parent = "user_setting = 'keep-me'\n";
+        let active = upsert_provider_projection(without_parent, &projection).unwrap();
+        assert_eq!(
+            remove_provider_projection(&active, projection.provider_id, true).unwrap(),
+            without_parent
+        );
+
+        let with_empty_parent = "user_setting = 'keep-me'\n\n[model_providers]\n";
+        let active = upsert_provider_projection(with_empty_parent, &projection).unwrap();
+        assert_eq!(
+            remove_provider_projection(&active, projection.provider_id, false).unwrap(),
+            with_empty_parent
+        );
+    }
+
+    #[test]
+    fn legacy_orchestration_baseline_keeps_unknown_provider_parent_state() {
+        let baseline: OrchestrationBaseline = serde_json::from_str(
+            r#"{
+                "permissionStyle": "DEFAULT_PERMISSIONS",
+                "defaultPermissions": ":workspace",
+                "sandboxMode": null,
+                "agentsEnabled": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(baseline.model_providers_existed, None);
+    }
+
+    #[test]
     fn renders_agent_from_base_binding() {
         let agent = Agent::new(
             "executor",
@@ -1380,6 +1430,7 @@ command = "user-hook --check"
             global_instructions_path: None,
             global_instructions_existed: false,
             global_instructions_content: None,
+            model_providers_existed: None,
         };
 
         assert!(

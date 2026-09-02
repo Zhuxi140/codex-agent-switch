@@ -77,16 +77,17 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 201 passed、0 failed、8 ignored |
+| Rust Workspace 测试 | 205 passed、0 failed、8 ignored |
 | 前端生产构建 | 通过 |
 | Diff 检查 | 通过 |
 | Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
 | Codex Native RC-2：并发与失配调度矩阵 | 通过（`gpt-5.6-terra`） |
 | Codex Native Phase 12：空闲/运行中断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`，原 Turn 未重放） |
 | Phase 12：启动失败 / 连续恢复失败上限 | 通过（`FAILED` 状态闭环、3 次硬上限） |
+| Phase 13A / 13B：配置同源状态与 Default 往返 | 隔离回归通过（两轮往返、重复 Default、用户文件逐字节保留） |
 | Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。启动失败不会残留伪 `STARTING` 状态；无法证明 Schema 能力时统一 Fail Closed。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Phase 13A/13B 进一步让概览从一个后端响应读取配置状态、运行模式与活动事务，并补齐 Default 往返的精确保留回归。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。启动失败不会残留伪 `STARTING` 状态；无法证明 Schema 能力时统一 Fail Closed。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
 
 当前 workspace 的 8 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 5 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
@@ -224,7 +225,7 @@ Primary 专属的调度协议只写入 `config.toml` 的 `developer_instructions
 
 - **真实编排闭环（RC-1 已完成）**：Codex Native 已固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token 与决策日志。
 - **并发与失配矩阵（RC-2 已完成）**：同任务并发返回唯一 SPAWN 与 WAIT；Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定拒绝旧 Thread，并给出 SPAWN 建议。
-- **恢复能力（Runtime Bridge 当前版本矩阵已完成）**：空闲/运行中断流、启动失败与恢复上限已闭环；继续覆盖 Default 往返、项目排除、配置冲突、凭据清理重试、旧数据库升级和本地多 Codex 版本样本。
+- **恢复能力（Runtime Bridge 当前版本矩阵已完成）**：空闲/运行中断流、启动失败与恢复上限已闭环；Default 往返已完成隔离文件系统回归，继续覆盖真实干净目录、项目排除、配置冲突、凭据清理重试、旧数据库升级和本地多 Codex 版本样本。
 - **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
 - **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
 

@@ -117,6 +117,8 @@ export interface ConfigurationStatusResponse {
   driftCount: number;
   conflictCount: number;
   restartRecommended: boolean;
+  runtimeMode: RuntimeModeResponse | null;
+  activeOperationId: string | null;
   issues: DiagnosticIssue[];
 }
 

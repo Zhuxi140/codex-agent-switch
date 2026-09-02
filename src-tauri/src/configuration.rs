@@ -140,9 +140,23 @@ impl ConfigurationService {
     pub(crate) fn get_status(&self) -> ConfigurationStatusResponse {
         let connection = match open_database(&self.database_path) {
             Ok(connection) => connection,
-            Err(_) => return unavailable_status("DATABASE_UNAVAILABLE", "CAS 数据库当前不可用。"),
+            Err(_) => {
+                return unavailable_status("DATABASE_UNAVAILABLE", "CAS 数据库当前不可用。", None);
+            }
         };
-        if let Ok(Some(transaction)) = active_transaction(&connection) {
+        let runtime_mode = match runtime_mode_from_connection(&connection) {
+            Ok(runtime_mode) => runtime_mode,
+            Err(error) => {
+                return unavailable_status(error.code(), error.user_message(), None);
+            }
+        };
+        let active_operation = match active_transaction(&connection) {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                return unavailable_status(error.code(), error.user_message(), Some(runtime_mode));
+            }
+        };
+        if let Some(transaction) = active_operation {
             let recovery_required = transaction.status == "RECOVERY_REQUIRED";
             return ConfigurationStatusResponse {
                 status: if recovery_required {
@@ -155,6 +169,8 @@ impl ConfigurationService {
                 drift_count: 0,
                 conflict_count: 0,
                 restart_recommended: false,
+                runtime_mode: Some(runtime_mode),
+                active_operation_id: Some(transaction.id.clone()),
                 issues: vec![if recovery_required {
                     DiagnosticIssue::error(
                         "APPLY_RECOVERY_REQUIRED",
@@ -208,6 +224,8 @@ impl ConfigurationService {
                     drift_count,
                     conflict_count,
                     restart_recommended,
+                    runtime_mode: Some(runtime_mode),
+                    active_operation_id: None,
                     issues: preview
                         .blockers
                         .into_iter()
@@ -215,7 +233,9 @@ impl ConfigurationService {
                         .collect(),
                 }
             }
-            Err(error) => unavailable_status(error.code(), error.user_message()),
+            Err(error) => {
+                unavailable_status(error.code(), error.user_message(), Some(runtime_mode))
+            }
         }
     }
 
@@ -314,13 +334,6 @@ impl ConfigurationService {
         })
     }
 
-    pub(crate) fn running_operation_id(&self) -> Option<String> {
-        open_database(&self.database_path)
-            .ok()
-            .and_then(|connection| active_transaction(&connection).ok().flatten())
-            .map(|transaction| transaction.id)
-    }
-
     pub(crate) fn preview_apply(&self) -> Result<ConfigurationApplyPreview, ConfigurationError> {
         let preview = self.compile_preview()?;
         Ok(ConfigurationApplyPreview {
@@ -334,10 +347,7 @@ impl ConfigurationService {
 
     pub(crate) fn runtime_mode(&self) -> Result<RuntimeModeResponse, ConfigurationError> {
         let connection = open_database(&self.database_path)?;
-        Ok(RuntimeModeResponse {
-            active_bindings: load_active_agent_bindings(&connection)?,
-            legacy_active_agent_id: load_active_agent_id(&connection)?,
-        })
+        runtime_mode_from_connection(&connection)
     }
 
     pub(crate) fn list_project_exclusions(
@@ -1210,7 +1220,12 @@ impl ConfigurationService {
             if resource.resource_type == PROVIDER_RESOURCE
                 && let Some(provider_id) = resource.logical_key.strip_prefix("model_providers.")
             {
-                final_config = remove_provider_projection(&final_config, provider_id)?;
+                let remove_empty_parent = orchestration_baseline
+                    .as_ref()
+                    .and_then(|baseline| baseline.model_providers_existed)
+                    == Some(false);
+                final_config =
+                    remove_provider_projection(&final_config, provider_id, remove_empty_parent)?;
             } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
                 final_config = remove_model_catalog_projection(&final_config)?;
             } else if resource.resource_type == ORCHESTRATION_RESOURCE {
@@ -1475,6 +1490,8 @@ pub(crate) struct ConfigurationStatusResponse {
     drift_count: usize,
     conflict_count: usize,
     restart_recommended: bool,
+    runtime_mode: Option<RuntimeModeResponse>,
+    pub(crate) active_operation_id: Option<String>,
     issues: Vec<DiagnosticIssue>,
 }
 
@@ -1597,7 +1614,7 @@ pub(crate) struct ConfigurationApplyRequest {
     expected_desired_state_hash: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RuntimeModeResponse {
     active_bindings: Vec<ActiveAgentBinding>,
@@ -3521,6 +3538,15 @@ fn load_active_agent_bindings(
         .collect::<Result<Vec<_>, _>>()?)
 }
 
+fn runtime_mode_from_connection(
+    connection: &Connection,
+) -> Result<RuntimeModeResponse, ConfigurationError> {
+    Ok(RuntimeModeResponse {
+        active_bindings: load_active_agent_bindings(connection)?,
+        legacy_active_agent_id: load_active_agent_id(connection)?,
+    })
+}
+
 fn orchestration_is_active(connection: &Connection) -> Result<bool, ConfigurationError> {
     Ok(!load_active_agent_bindings(connection)?.is_empty()
         || load_active_agent_id(connection)?.is_some())
@@ -4615,6 +4641,7 @@ fn hash_bytes(value: &[u8]) -> String {
 fn unavailable_status(
     code: impl Into<String>,
     message: impl Into<String>,
+    runtime_mode: Option<RuntimeModeResponse>,
 ) -> ConfigurationStatusResponse {
     ConfigurationStatusResponse {
         status: ConfigurationStatus::Unavailable,
@@ -4623,6 +4650,8 @@ fn unavailable_status(
         drift_count: 0,
         conflict_count: 0,
         restart_recommended: false,
+        runtime_mode,
+        active_operation_id: None,
         issues: vec![DiagnosticIssue::error(code, message)],
     }
 }
@@ -4797,7 +4826,7 @@ impl Drop for ProcessLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use toml_edit::value;
+    use toml_edit::{Item, Table, value};
 
     struct TestContext {
         root: PathBuf,
@@ -5499,6 +5528,8 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         config["mcp_servers"]["example"]["command"] = value("later");
+        config["model_providers"]["user_added"] = Item::Table(Table::new());
+        config["model_providers"]["user_added"]["base_url"] = value("https://user.example.com/");
         fs::write(&config_path, config.to_string()).unwrap();
         context
             .service
@@ -5517,6 +5548,10 @@ mod tests {
             restored["model_providers"]
                 .as_table()
                 .is_some_and(|providers| !providers.contains_key("cas_deepseek"))
+        );
+        assert_eq!(
+            restored["model_providers"]["user_added"]["base_url"].as_str(),
+            Some("https://user.example.com/")
         );
         assert!(restored.get("model_catalog_json").is_none());
         assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
@@ -6018,6 +6053,138 @@ mod tests {
         assert_eq!(
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap(),
             "# 用户全局规则\n\n保留这段内容。\n"
+        );
+    }
+
+    #[test]
+    fn runtime_mode_round_trip_is_idempotent_and_preserves_user_files_exactly() {
+        let context = TestContext::new();
+        let executor_id = executor_id(&context.database);
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        fs::write(
+            &config_path,
+            "user_setting = 'keep-me'\n[mcp_servers.user]\ncommand = 'user-command'\n",
+        )
+        .unwrap();
+        context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: Vec::new(),
+            })
+            .unwrap();
+
+        let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+        let user_agent_path = context.codex_home.join("agents/user-agent.toml");
+        let user_skill_path = context.codex_home.join("skills/user-skill/SKILL.md");
+        fs::create_dir_all(user_agent_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(user_skill_path.parent().unwrap()).unwrap();
+        fs::write(
+            &global_path,
+            b"# User rules\r\n\r\nkeep trailing spaces  \r\n",
+        )
+        .unwrap();
+        fs::write(&user_agent_path, b"name = 'user-agent'\r\n").unwrap();
+        fs::write(&user_skill_path, b"# User skill\r\n").unwrap();
+
+        let baseline_config = fs::read(&config_path).unwrap();
+        let baseline_global = fs::read(&global_path).unwrap();
+        let baseline_agent = fs::read(&user_agent_path).unwrap();
+        let baseline_skill = fs::read(&user_skill_path).unwrap();
+
+        for _ in 0..2 {
+            let active = context
+                .service
+                .switch_runtime_mode(RuntimeModeSwitchRequest {
+                    active_agent_ids: vec![executor_id.clone()],
+                })
+                .unwrap();
+            assert!(matches!(
+                active.status,
+                ApplyStatus::Applied | ApplyStatus::NoChanges
+            ));
+            assert!(
+                context
+                    .codex_home
+                    .join("agents/cas-executor.toml")
+                    .is_file()
+            );
+            let status = context.service.get_status();
+            assert!(status.active_operation_id.is_none());
+            let mode = status.runtime_mode.as_ref().unwrap();
+            assert_eq!(mode.active_bindings.len(), 1);
+            assert_eq!(mode.active_bindings[0].agent_id, executor_id);
+
+            let default = context
+                .service
+                .switch_runtime_mode(RuntimeModeSwitchRequest {
+                    active_agent_ids: Vec::new(),
+                })
+                .unwrap();
+            assert!(matches!(
+                default.status,
+                ApplyStatus::Applied | ApplyStatus::NoChanges
+            ));
+            assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
+            assert_eq!(fs::read(&config_path).unwrap(), baseline_config);
+            assert_eq!(fs::read(&global_path).unwrap(), baseline_global);
+            assert_eq!(fs::read(&user_agent_path).unwrap(), baseline_agent);
+            assert_eq!(fs::read(&user_skill_path).unwrap(), baseline_skill);
+            let status = context.service.get_status();
+            assert!(status.active_operation_id.is_none());
+            let mode = status.runtime_mode.as_ref().unwrap();
+            assert!(mode.active_bindings.is_empty());
+            assert!(mode.legacy_active_agent_id.is_none());
+        }
+
+        let repeated_default = context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(repeated_default.status, ApplyStatus::NoChanges));
+        assert_eq!(fs::read(&config_path).unwrap(), baseline_config);
+        assert_eq!(fs::read(&global_path).unwrap(), baseline_global);
+        assert_eq!(fs::read(&user_agent_path).unwrap(), baseline_agent);
+        assert_eq!(fs::read(&user_skill_path).unwrap(), baseline_skill);
+    }
+
+    #[test]
+    fn configuration_status_reports_runtime_mode_and_active_operation_together() {
+        let context = TestContext::new();
+        let connection = open_database(&context.database).unwrap();
+        let expected_mode = runtime_mode_from_connection(&connection).unwrap();
+        insert_apply_transaction(
+            &connection,
+            "active-operation",
+            None,
+            &context.codex_home,
+            Some("sha256:desired"),
+        )
+        .unwrap();
+        drop(connection);
+
+        let status = context.service.get_status();
+        assert!(matches!(status.status, ConfigurationStatus::PendingChanges));
+        assert_eq!(
+            status.active_operation_id.as_deref(),
+            Some("active-operation")
+        );
+        let mode = status.runtime_mode.as_ref().unwrap();
+        assert_eq!(
+            mode.active_bindings
+                .iter()
+                .map(|binding| (&binding.role_key, &binding.agent_id))
+                .collect::<Vec<_>>(),
+            expected_mode
+                .active_bindings
+                .iter()
+                .map(|binding| (&binding.role_key, &binding.agent_id))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            mode.legacy_active_agent_id,
+            expected_mode.legacy_active_agent_id
         );
     }
 
