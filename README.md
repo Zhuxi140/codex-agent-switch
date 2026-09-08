@@ -12,7 +12,7 @@
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
 > [!WARNING]
-> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 会改写 Codex 的 `config.toml` 相关片段并投影 Agent、模型目录与 Skill 资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 会改写 Codex 的 `config.toml` 相关片段、在当前生效的全局 `AGENTS.md` 或 `AGENTS.override.md` 中维护一段 CAS Primary 编排协议，并投影 Agent、模型目录与 Skill 资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
 ## 核心理念
 
@@ -65,7 +65,8 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 2. 启动应用后检查 Codex 可执行文件与 `CODEX_HOME`；Windows Store 版如无法解析命令，可将 `%USERPROFILE%\.codex\.sandbox-bin\codex.exe` 复制到 `%USERPROFILE%\.local\bin\`。
 3. 在 Provider 页面选择 **Codex Native (ChatGPT)**，或添加第三方 Responses Provider；Native Provider 使用当前 Codex 登录，第三方密钥由 Windows 凭据管理器保存。
 4. 在 Models 与 Agents 页面绑定模型；可为每个 Agent 选择 CAS 内置 Skill、完整禁用指定 MCP Server，或按工具名配置“仅允许 / 禁用”规则；随后在运行模式中启用编排配置并 Apply。
-5. 在用量页面查看原生子 Agent Thread 的生命周期（基于 rollout 事实）、当前上下文与 Token 统计。
+5. 若 CAS 显示 Runtime Hook 待处理，完全重启 Codex，在新任务中用 `/hooks` 核对并信任命令包含 `cas-runtime-enforcement-v1` 的 CAS Hook，再回到 CAS 重新核验。CAS 不会自动写入信任或绕过审核。
+6. 在用量页面查看原生子 Agent Thread 的生命周期（基于 rollout 事实）、当前上下文与 Token 统计。
 
 安装包当前未进行代码签名；Windows SmartScreen 可能显示警告，请按组织安全策略核验 Release 的 SHA-256。
 
@@ -73,11 +74,11 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
 
-### 当前主分支开发验证（2026-09-01）
+### 当前主分支开发验证（2026-09-02）
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 205 passed、0 failed、8 ignored |
+| Rust Workspace 测试 | 210 passed、0 failed、8 ignored |
 | 前端生产构建 | 通过 |
 | Diff 检查 | 通过 |
 | Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
@@ -85,9 +86,10 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 | Codex Native Phase 12：空闲/运行中断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`，原 Turn 未重放） |
 | Phase 12：启动失败 / 连续恢复失败上限 | 通过（`FAILED` 状态闭环、3 次硬上限） |
 | Phase 13A / 13B：配置同源状态与 Default 往返 | 隔离回归通过（两轮往返、重复 Default、用户文件逐字节保留） |
+| 子 Agent 自动委派协议与 Hook 信任状态 | 完整 AGENTS 协议投影、V1 Feature 和 Default 精确恢复回归通过；真实模型委派 E2E 待重新同步并重启后复验 |
 | Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Phase 13A/13B 进一步让概览从一个后端响应读取配置状态、运行模式与活动事务，并补齐 Default 往返的精确保留回归。Runtime Bridge 断流后最多自动恢复 3 次，恢复时 Resume 原 Primary；不确定 Turn 不会被自动重放。启动失败不会残留伪 `STARTING` 状态；无法证明 Schema 能力时统一 Fail Closed。原生 Thread 观察现在由应用级服务持续同步，不再依赖用户停留在用量页面；项目监控浮窗可独立展示所选项目的编排状态、活跃 Thread、累计 Token 与观察增量。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Phase 13A/13B 进一步让概览从一个后端响应读取配置状态、运行模式与活动事务，并补齐 Default 往返的精确保留回归。本次开发修复把可独立执行的完整 Primary 协议同步到全局 AGENTS，以兼容 Codex Desktop 覆盖配置级 `developer_instructions` 的场景；同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态。只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件，避免 PATH 旧副本代表桌面客户端。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。它仍是开发快照，不应当作新的 Release 安装包分发。
 
 当前 workspace 的 8 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 5 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
@@ -172,7 +174,7 @@ CAS 不复制或改写用户全局 MCP 的命令、环境变量、凭据与 OAut
 
 静态配置仍不替代单次任务授权：CAS 写入 Child 指令的 `TOOLS` 契约，只允许调用 TASK `TOOLS` 明列且完成验收必需的外部工具；`TOOLS: -` 表示禁用，外部写入还必须同时获得 `ALLOW` 明确许可。Discovery 与 Review 的外部工具保持只读，Verification 也不得制造未授权外部状态。CAS 选中的内置 Skill 通过 `skills.config` 投影，并按任务匹配和 Agent 显式绑定规则渐进加载；Primary 不把完整 Skill 内容复制进委派 prompt。
 
-Primary 专属的调度协议只写入 `config.toml` 的 `developer_instructions`；CAS 不再把完整协议写入全局 `AGENTS.md`。用户已有的全局和项目 `AGENTS.md` 仍由 Codex 正常加载，对 Primary 与 Child 共同生效；Child 另由 `agents/cas-*.toml` 接收职责边界。升级后首次 Apply 会移除旧版本留下的 CAS 全局编排块，并保留用户原有内容。
+Primary 专属协议会同步到两个位置：`config.toml` 的 `developer_instructions` 服务于 CLI 和保留该字段的客户端；当前真正生效的全局 `AGENTS.md` 或 `AGENTS.override.md` 则携带一份可独立执行的完整协议，覆盖 Codex Desktop 用宿主指令遮蔽配置字段的场景。两份投影来自同一个渲染结果，不允许漂移。整个 CAS 管理块都明确限定为 Primary/root 专用；Child 必须忽略它，并继续只执行 `agents/cas-*.toml` 中更高优先级的职责边界。CAS 会保留用户原有内容，切回 Default 时只移除带标记的 CAS 管理块并逐字节恢复基线。
 
 失败策略可选：
 
@@ -219,7 +221,7 @@ Primary 专属的调度协议只写入 `config.toml` 的 `developer_instructions
 
 配置采用 Preview → Apply 流程，含冲突检测、快照、回读校验和失败回滚。`cas-helper` 负责凭据交付与调度预检；Provider 密钥存入 Windows 凭据管理器，Codex 配置仅引用凭据标识。删除 Provider 时先在 CAS 数据库记录待清理凭据，再删除并回查 Windows 凭据；清理未完成会保留队列并在后续启动重试。
 
-编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段，并删除 `agents/cas-*.toml`、`cas/bundled-skills/*` 等 CAS 托管资源。新版不会向全局 `AGENTS.md` 写入 Primary 协议；若检测到旧版 CAS 托管块，则只移除该块并保留用户内容。关闭应用时自动执行同一清理路径。
+编排投影的清理边界：只有 Apply / 运行模式切换会改写 `.codex`；切回 Default 时按 baseline 精确还原 `config.toml` 相关片段与原有 `features.multi_agent` 值，移除全局 AGENTS 中带标记的 CAS Primary 协议，并删除 `agents/cas-*.toml`、`cas/bundled-skills/*` 等 CAS 托管资源。用户自己的全局 AGENTS 内容不会被清空或替换。关闭 CAS 只关闭管理界面，不改变已选择的运行模式；只有用户显式切到 Default 才执行清理。
 
 ## Roadmap（下一阶段：v0.5 RC）
 

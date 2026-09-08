@@ -23,7 +23,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -517,6 +518,16 @@ fn is_codex_process_name(buffer: &[u16]) -> bool {
 }
 
 #[cfg(windows)]
+fn is_codex_cli_process_name(buffer: &[u16]) -> bool {
+    // ChatGPT.exe 参与 Codex 重启判断，但不能用于 CLI 版本、Schema 或 Hook 能力探测。
+    let length = buffer
+        .iter()
+        .position(|character| *character == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..length]).eq_ignore_ascii_case("codex.exe")
+}
+
+#[cfg(windows)]
 fn filetime_to_unix_ms(value: FILETIME) -> i64 {
     let ticks = (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime);
     (ticks.saturating_sub(WINDOWS_TO_UNIX_EPOCH_100NS) / 10_000) as i64
@@ -539,6 +550,11 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 }
 
 fn find_codex_executable() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(executable) = running_codex_executables().into_iter().next() {
+        return Some(executable);
+    }
+
     let mut directories = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect::<Vec<_>>())
         .unwrap_or_default();
@@ -561,6 +577,56 @@ fn find_codex_executable() -> Option<PathBuf> {
         .iter()
         .flat_map(|directory| names.iter().map(move |name| directory.join(name)))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(windows)]
+fn running_codex_executables() -> Vec<PathBuf> {
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Vec::new();
+        }
+
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut executables = Vec::new();
+        let mut has_entry = Process32FirstW(snapshot, &mut entry) != 0;
+        while has_entry {
+            if is_codex_cli_process_name(&entry.szExeFile) {
+                let process =
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.th32ProcessID);
+                if !process.is_null() {
+                    let mut buffer = vec![0u16; 32_768];
+                    let mut length = buffer.len() as u32;
+                    if QueryFullProcessImageNameW(
+                        process,
+                        PROCESS_NAME_WIN32,
+                        buffer.as_mut_ptr(),
+                        &mut length,
+                    ) != 0
+                    {
+                        let path =
+                            PathBuf::from(String::from_utf16_lossy(&buffer[..length as usize]));
+                        if path.is_file()
+                            && !executables.iter().any(|existing: &PathBuf| {
+                                existing
+                                    .to_string_lossy()
+                                    .eq_ignore_ascii_case(&path.to_string_lossy())
+                            })
+                        {
+                            executables.push(path);
+                        }
+                    }
+                    CloseHandle(process);
+                }
+            }
+            has_entry = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+        executables
+    }
 }
 
 fn probe_codex_version(executable: &Path) -> Result<String, String> {
@@ -789,6 +855,14 @@ mod tests {
             name[index] = character;
         }
         assert!(is_codex_process_name(&name));
+        assert!(!is_codex_cli_process_name(&name));
+
+        let mut cli_name = [0u16; 260];
+        for (index, character) in "CODEX.EXE".encode_utf16().enumerate() {
+            cli_name[index] = character;
+        }
+        assert!(is_codex_process_name(&cli_name));
+        assert!(is_codex_cli_process_name(&cli_name));
 
         let unix_epoch = FILETIME {
             dwLowDateTime: WINDOWS_TO_UNIX_EPOCH_100NS as u32,

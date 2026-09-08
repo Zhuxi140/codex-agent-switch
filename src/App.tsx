@@ -25,6 +25,7 @@ import {
   getCodexEnvironment,
   getConfigurationStatus,
   getRuntimeMode,
+  getRuntimeHookStatus,
   getProvider,
   getSettings,
   getUsageSummary,
@@ -90,6 +91,7 @@ import {
   type ProjectExclusion,
   type ReasoningPolicy,
   type RuntimeModeResponse,
+  type RuntimeHookStatusResponse,
   type RuntimeBridgeStatusResponse,
   type RuntimeEnforcementEventResponse,
   type SchemaCapability,
@@ -596,13 +598,19 @@ function OverviewPage({
   const [conflictError, setConflictError] = useState<string | null>(null);
   const [failurePolicy, setFailurePolicy] =
     useState<SettingsResponse["orchestrationFailurePolicy"]>("STRICT_STOP");
+  const [runtimeHookStatus, setRuntimeHookStatus] =
+    useState<RuntimeHookStatusResponse | null>(null);
+  const [hookReviewOpen, setHookReviewOpen] = useState(false);
+  const [hookChecking, setHookChecking] = useState(false);
 
   const reloadConfiguration = useCallback(async () => {
-    const [statusResult, agentsResult, historyResult, settingsResult] = await Promise.allSettled([
+    const [statusResult, agentsResult, historyResult, settingsResult, hookStatusResult] =
+      await Promise.allSettled([
       withTimeout(getConfigurationStatus(), "读取配置状态"),
       withTimeout(listAgents(), "读取 Agent"),
       withTimeout(listSnapshots(6), "读取 Snapshot"),
       withTimeout(getSettings(), "读取编排设置"),
+      withTimeout(getRuntimeHookStatus(), "核验 Runtime Hook"),
     ]);
 
     if (statusResult.status === "fulfilled") {
@@ -611,6 +619,7 @@ function OverviewPage({
     }
     if (agentsResult.status === "fulfilled") setAgents(agentsResult.value);
     if (historyResult.status === "fulfilled") setSnapshots(historyResult.value.items);
+    if (hookStatusResult.status === "fulfilled") setRuntimeHookStatus(hookStatusResult.value);
     if (settingsResult.status === "fulfilled") {
       setFailurePolicy(settingsResult.value.orchestrationFailurePolicy);
     }
@@ -638,9 +647,10 @@ function OverviewPage({
       });
     }
 
-    const failure = [statusResult, agentsResult, historyResult, settingsResult]
+    const failure = [statusResult, agentsResult, historyResult, settingsResult, hookStatusResult]
       .find((result) => result.status === "rejected");
     if (failure?.status === "rejected") throw failure.reason;
+    return hookStatusResult.status === "fulfilled" ? hookStatusResult.value : null;
   }, []);
 
   useEffect(() => {
@@ -676,14 +686,21 @@ function OverviewPage({
         warning.code === "AGENT_REASONING_DOWNGRADED"
         || warning.code === "AGENT_REASONING_INHERIT_RESOLVED"
       );
+      const nextHookStatus = await reloadConfiguration();
+      if (activeAgentIds.length > 0 && nextHookStatus?.status !== "ACTIVE") {
+        setHookReviewOpen(true);
+      } else if (activeAgentIds.length === 0) {
+        setHookReviewOpen(false);
+      }
       setConfigurationSuccess(
         `${activeAgentIds.length > 0
-          ? `已启用 ${activeAgentIds.length} 个子 Agent。请完全退出并重启 Codex，再新建任务；父任务权限保持 Auto 或 Workspace。`
-          : "已切换到 Default。请在 Codex 中新建任务使模式变更生效。"}${
+          ? nextHookStatus?.status === "ACTIVE"
+            ? `已同步 ${activeAgentIds.length} 个子 Agent，CAS Runtime Hook 已受信任。请完全退出并重启 Codex，再新建任务；父任务权限保持 Auto 或 Workspace。`
+            : `已同步 ${activeAgentIds.length} 个子 Agent，但 Runtime Hook 尚未通过核验。请按弹窗完成处理后重启 Codex 并新建任务。`
+          : "已切换到 Default。后续新任务不再使用 CAS 子 Agent。"}${
           reasoningWarning ? ` ${reasoningWarning.message}` : ""
         }`,
       );
-      await reloadConfiguration();
     } catch (reason: unknown) {
       setConfigurationError(errorMessage(reason));
       await reloadConfiguration();
@@ -727,14 +744,20 @@ function OverviewPage({
             : "配置替换未完成，需要先恢复配置事务。",
         );
       }
+      const keepsSubagentMode = conflictActiveAgentIds.length > 0;
       setConfigurationConflict(null);
       setConflictActiveAgentIds([]);
+      const nextHookStatus = await reloadConfiguration();
+      if (keepsSubagentMode && nextHookStatus?.status !== "ACTIVE") {
+        setHookReviewOpen(true);
+      }
       setConfigurationSuccess(
         strategy === "ADOPT"
           ? "已接管语义一致的现有配置。"
-          : "已有 CAS 配置已备份并替换。请完全退出并重启 Codex，再新建任务。",
+          : keepsSubagentMode && nextHookStatus?.status !== "ACTIVE"
+            ? "已有 CAS 配置已备份并替换，但 Runtime Hook 尚未通过核验。请按弹窗完成处理。"
+            : "已有 CAS 配置已备份并替换。请完全退出并重启 Codex，再新建任务。",
       );
-      await reloadConfiguration();
     } catch (reason: unknown) {
       setConflictError(errorMessage(reason));
     } finally {
@@ -747,12 +770,32 @@ function OverviewPage({
     setConfigurationError(null);
     setConfigurationSuccess(null);
     try {
-      await reloadConfiguration();
+      const nextHookStatus = await reloadConfiguration();
+      if (nextHookStatus?.status === "ACTIVE") setHookReviewOpen(false);
     } catch (reason: unknown) {
       setConfigurationError(errorMessage(reason));
     } finally {
       setRefreshingMode(false);
       setOperation((current) => current === "switch" ? null : current);
+    }
+  }
+
+  async function handleHookRecheck() {
+    setHookChecking(true);
+    setConfigurationError(null);
+    try {
+      const status = await withTimeout(getRuntimeHookStatus(), "核验 Runtime Hook");
+      setRuntimeHookStatus(status);
+      if (status.status === "ACTIVE") {
+        setHookReviewOpen(false);
+        setConfigurationSuccess(
+          "CAS Runtime Hook 已由当前 Codex 确认为启用且受信任。请完全退出并重启 Codex，再新建任务。",
+        );
+      }
+    } catch (reason: unknown) {
+      setConfigurationError(errorMessage(reason));
+    } finally {
+      setHookChecking(false);
     }
   }
 
@@ -836,6 +879,8 @@ function OverviewPage({
     || (selectedAgents.length > 0 && selectedAgents.every((agent) => agent.availability === "READY"));
   const alreadySynchronized = sameMode && configuration?.status === "APPLIED";
   const runtimeUsesSubagents = currentAgentIds.length > 0 || Boolean(runtimeMode?.legacyActiveAgentId);
+  const runtimeHooksNeedResync = runtimeUsesSubagents
+    && ["NOT_INSTALLED", "INCOMPLETE"].includes(runtimeHookStatus?.status ?? "");
   const restartPending = runtimeUsesSubagents && Boolean(configuration?.restartRecommended);
   const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
   const visibleSelectedAgents = selectedAgents.slice(0, 2);
@@ -858,11 +903,23 @@ function OverviewPage({
           onReplace={() => void handleConflictResolution("REPLACE")}
         />
       )}
+      {hookReviewOpen && runtimeHookStatus && (
+        <RuntimeHookReviewDialog
+          checking={hookChecking}
+          codexHome={environment?.codexHome ?? null}
+          onClose={() => {
+            if (!hookChecking) setHookReviewOpen(false);
+          }}
+          onRecheck={() => void handleHookRecheck()}
+          status={runtimeHookStatus}
+        />
+      )}
       {environment && (
         <EnvironmentDetails
           detecting={detecting}
           environment={environment}
           onRedetect={onRedetect}
+          runtimeHookStatus={runtimeHookStatus}
         />
       )}
 
@@ -906,6 +963,24 @@ function OverviewPage({
             <span>
               检测到运行中的 Codex 早于最近一次 CAS 配置同步。请完全退出 Codex，再重新启动并创建全新任务；继续使用当前任务仍会沿用旧的 Multi-Agent 运行时。
             </span>
+          </div>
+        )}
+        {runtimeUsesSubagents
+          && runtimeHookStatus
+          && runtimeHookStatus.status !== "ACTIVE"
+          && runtimeHookStatus.status !== "NOT_REQUIRED" && (
+          <div className="runtime-hook-warning" role="alert">
+            <div>
+              <strong>Runtime Hook 尚未就绪</strong>
+              <span>{runtimeHookStatus.message}</span>
+            </div>
+            <button
+              className="secondary-button"
+              onClick={() => setHookReviewOpen(true)}
+              type="button"
+            >
+              查看处理方法
+            </button>
           </div>
         )}
         <div className="runtime-mode-options" role="radiogroup" aria-label="Codex 运行模式">
@@ -1036,13 +1111,15 @@ function OverviewPage({
 
         <div className="mode-switch-actions">
           <span>
-            {restartPending && alreadySynchronized
-              ? "磁盘配置已同步，但运行中的 Codex 仍在使用旧配置。"
-              : alreadySynchronized
-                ? "当前模式已同步到 Codex。"
-                : sameMode
-                  ? "当前定义或磁盘配置有变化，可重新同步。"
-                  : "确认后将立即切换，并只处理 CAS 拥有的配置。"}
+            {runtimeHooksNeedResync
+              ? "CAS Hook 缺失或不完整，可重新同步当前子 Agent 模式。"
+              : restartPending && alreadySynchronized
+                ? "磁盘配置已同步，但运行中的 Codex 仍在使用旧配置。"
+                : alreadySynchronized
+                  ? "当前模式已同步到 Codex。"
+                  : sameMode
+                    ? "当前定义或磁盘配置有变化，可重新同步。"
+                    : "确认后将立即切换，并只处理 CAS 拥有的配置。"}
           </span>
           <div className="mode-action-buttons">
             <button
@@ -1056,19 +1133,29 @@ function OverviewPage({
             <button
               aria-busy={operation === "switch"}
               className="primary-button"
-              disabled={operation !== null || refreshingMode || !runtimeMode || !modeReady || alreadySynchronized}
+              disabled={
+                operation !== null
+                || refreshingMode
+                || !runtimeMode
+                || !modeReady
+                || (alreadySynchronized && !runtimeHooksNeedResync)
+              }
               onClick={handleModeSwitch}
               type="button"
             >
               {operation === "switch"
                 ? "切换中…"
-                : restartPending && alreadySynchronized
-                  ? "等待重启 Codex"
-                  : alreadySynchronized
-                    ? "当前已启用"
-                    : sameMode
-                      ? "同步当前模式"
-                      : "切换模式"}
+                : runtimeHooksNeedResync
+                  ? "重新同步 Hook"
+                  : restartPending && alreadySynchronized
+                    ? "等待重启 Codex"
+                    : alreadySynchronized
+                      ? runtimeUsesSubagents && runtimeHookStatus?.status !== "ACTIVE"
+                        ? "配置已同步"
+                        : "当前已启用"
+                      : sameMode
+                        ? "同步当前模式"
+                        : "切换模式"}
             </button>
           </div>
         </div>
@@ -1261,6 +1348,119 @@ function ConfigurationConflictDialog({
             type="button"
           >
             {busy ? "处理中…" : "备份并替换"}
+          </button>
+        </footer>
+      </section>
+    </dialog>
+  );
+}
+
+function RuntimeHookReviewDialog({
+  checking,
+  codexHome,
+  onClose,
+  onRecheck,
+  status,
+}: {
+  checking: boolean;
+  codexHome: string | null;
+  onClose: () => void;
+  onRecheck: () => void;
+  status: RuntimeHookStatusResponse;
+}) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const canReviewInCodex = [
+    "PENDING_TRUST",
+    "MODIFIED",
+    "DISABLED",
+    "INCOMPLETE",
+    "NOT_INSTALLED",
+  ].includes(status.status);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    dialog?.showModal();
+    return () => dialog?.close();
+  }, []);
+
+  return (
+    <dialog
+      aria-labelledby="runtime-hook-review-title"
+      className="runtime-hook-review-dialog"
+      onCancel={(event) => {
+        if (checking) event.preventDefault();
+        else onClose();
+      }}
+      onClick={(event) => {
+        if (!checking && event.target === event.currentTarget) onClose();
+      }}
+      ref={dialogRef}
+    >
+      <section className="runtime-hook-review-card">
+        <header>
+          <div>
+            <span className="eyebrow">Runtime Enforcement</span>
+            <h2 id="runtime-hook-review-title">
+              {status.status === "ACTIVE" ? "CAS Hook 已就绪" : "子 Agent 模式还差一步"}
+            </h2>
+            <p>{status.message}</p>
+          </div>
+          <IconButton
+            disabled={checking}
+            icon="close"
+            label="关闭 Runtime Hook 提示"
+            onClick={onClose}
+          />
+        </header>
+
+        {codexHome && (
+          <div className="conflict-home">
+            <span>当前 CODEX_HOME</span>
+            <div className="copyable-code">
+              <Tooltip content={codexHome} focusable label={`CODEX_HOME：${codexHome}`}>
+                <code>{codexHome}</code>
+              </Tooltip>
+              <CopyIconButton label="复制 CODEX_HOME" value={codexHome} />
+            </div>
+          </div>
+        )}
+
+        {canReviewInCodex ? (
+          <ol className="runtime-hook-review-steps">
+            <li>完全退出所有 Codex 窗口和 CLI 会话，再重新启动 Codex。</li>
+            <li>
+              在新任务中输入 <code>/hooks</code>，找到命令包含{" "}
+              <code>cas-runtime-enforcement-v1</code> 的 CAS Hook。
+            </li>
+            <li>核对命令指向当前 CAS 安装的 cas-helper 后，只信任这些 CAS Hook。</li>
+            <li>回到这里点击“重新核验”；全部项目显示已启用且受信任后，再新建正式任务。</li>
+          </ol>
+        ) : (
+          <div className="orchestration-warning" role="note">
+            当前 Codex 无法提供可验证的 Hook 状态。请先确认“设置”中的 CODEX_HOME、
+            重新检测 Codex，并升级到声明 hooks/list 的版本；CAS 不会把“无法核验”当作已生效。
+          </div>
+        )}
+
+        <div className="runtime-hook-security-note">
+          <UiIcon name="info" />
+          <span>
+            Hook 信任是 Codex 的用户安全边界。CAS 只读取当前 Codex 报告的状态，不会自动写入信任记录或绕过审核。
+          </span>
+        </div>
+
+        <footer>
+          <button className="secondary-button" disabled={checking} onClick={onClose} type="button">
+            稍后处理
+          </button>
+          <button
+            aria-busy={checking || undefined}
+            className="primary-button"
+            disabled={checking}
+            onClick={onRecheck}
+            type="button"
+          >
+            {checking ? "核验中…" : "重新核验"}
           </button>
         </footer>
       </section>
@@ -6415,15 +6615,35 @@ function EnvironmentDetails({
   detecting,
   environment,
   onRedetect,
+  runtimeHookStatus,
 }: {
   detecting: boolean;
   environment: CodexEnvironmentResponse;
   onRedetect: () => void;
+  runtimeHookStatus: RuntimeHookStatusResponse | null;
 }) {
   const configAccess =
     environment.configurationReadable && environment.configurationWritable
       ? "配置可读写"
       : `${environment.configurationReadable ? "可读" : "不可读"} / ${environment.configurationWritable ? "可写" : "不可写"}`;
+  const hookLabel = !environment.runtimeHooksAvailable
+    ? "Hook 不支持"
+    : runtimeHookStatus?.status === "ACTIVE"
+      ? "Hook 已信任"
+      : runtimeHookStatus?.status === "NOT_REQUIRED"
+        ? "Hook 未启用"
+        : runtimeHookStatus
+          ? "Hook 待处理"
+          : "Hook 检查中";
+  const hookTone = runtimeHookStatus?.status === "ACTIVE"
+    ? "ready"
+    : runtimeHookStatus?.status === "NOT_REQUIRED"
+      ? "neutral"
+      : "degraded";
+  const hookDescription = runtimeHookStatus?.message
+    ?? (environment.runtimeHooksAvailable
+      ? "当前 Codex 声明 hooks 能力，正在核验 CAS Hook 是否已安装、启用并受信任。"
+      : "当前 Codex 未声明可用 hooks；CAS 会降级为指令、Agent 配置与沙箱保护。");
 
   return (
     <section className="environment-card overview-environment-card">
@@ -6440,14 +6660,12 @@ function EnvironmentDetails({
         />
         <small>{configAccess}</small>
         <Tooltip
-          content={environment.runtimeHooksAvailable
-            ? "当前 Codex 声明 hooks 能力；启用子 Agent 模式后，CAS 可投影本地工具调用 Guard。"
-            : "当前 Codex 未声明可用 hooks；CAS 会降级为指令、Agent 配置与沙箱保护。"}
+          content={hookDescription}
           focusable
-          label={`Hook Guard 能力：${environment.runtimeHooksAvailable ? "可用" : "降级"}`}
+          label={`Hook Guard 状态：${hookLabel}`}
         >
-          <span className={`runtime-hook-capability ${environment.runtimeHooksAvailable ? "ready" : "degraded"}`}>
-            Hook {environment.runtimeHooksAvailable ? "可用" : "降级"}
+          <span className={`runtime-hook-capability ${hookTone}`}>
+            {hookLabel}
           </span>
         </Tooltip>
       </div>

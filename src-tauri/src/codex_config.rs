@@ -13,8 +13,8 @@ const AUTH_TIMEOUT_MS: i64 = 5_000;
 const AUTH_REFRESH_INTERVAL_MS: i64 = 300_000;
 const ORCHESTRATION_BEGIN: &str = "<<< CAS ORCHESTRATION v1 >>>";
 const ORCHESTRATION_END: &str = "<<< END CAS ORCHESTRATION v1 >>>";
-const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
-const RUNTIME_HOOK_EVENTS: [(&str, &str); 4] = [
+pub(crate) const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
+pub(crate) const RUNTIME_HOOK_EVENTS: [(&str, &str); 4] = [
     ("SubagentStart", ".*"),
     ("SubagentStop", ".*"),
     (
@@ -44,6 +44,10 @@ pub(crate) struct OrchestrationBaseline {
     pub(crate) default_permissions: Option<String>,
     pub(crate) sandbox_mode: Option<String>,
     pub(crate) agents_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) multi_agent_enabled: Option<bool>,
+    #[serde(default)]
+    pub(crate) multi_agent_captured: bool,
     #[serde(default)]
     pub(crate) multi_agent_v2_enabled: Option<bool>,
     #[serde(default)]
@@ -281,12 +285,15 @@ pub(crate) fn capture_orchestration_baseline(
         })
         .transpose()?
         .flatten();
-    let multi_agent_v2_enabled = optional_multi_agent_v2(&document)?;
+    let multi_agent_enabled = optional_feature_bool(&document, "multi_agent")?;
+    let multi_agent_v2_enabled = optional_feature_bool(&document, "multi_agent_v2")?;
     Ok(OrchestrationBaseline {
         permission_style,
         default_permissions,
         sandbox_mode,
         agents_enabled,
+        multi_agent_enabled,
+        multi_agent_captured: true,
         multi_agent_v2_enabled,
         multi_agent_v2_captured: true,
         global_instructions_path: None,
@@ -300,13 +307,21 @@ pub(crate) fn upgrade_orchestration_baseline(
     existing: &str,
     baseline: &mut OrchestrationBaseline,
 ) -> Result<bool, ConfigError> {
-    if baseline.multi_agent_v2_captured {
-        return Ok(false);
+    let mut changed = false;
+    if !baseline.multi_agent_captured || !baseline.multi_agent_v2_captured {
+        let document = existing.parse::<DocumentMut>()?;
+        if !baseline.multi_agent_captured {
+            baseline.multi_agent_enabled = optional_feature_bool(&document, "multi_agent")?;
+            baseline.multi_agent_captured = true;
+            changed = true;
+        }
+        if !baseline.multi_agent_v2_captured {
+            baseline.multi_agent_v2_enabled = optional_feature_bool(&document, "multi_agent_v2")?;
+            baseline.multi_agent_v2_captured = true;
+            changed = true;
+        }
     }
-    let document = existing.parse::<DocumentMut>()?;
-    baseline.multi_agent_v2_enabled = optional_multi_agent_v2(&document)?;
-    baseline.multi_agent_v2_captured = true;
-    Ok(true)
+    Ok(changed)
 }
 
 pub(crate) fn capture_project_exclusion_baseline(
@@ -447,7 +462,8 @@ pub(crate) fn upsert_orchestration_projection_with_hooks(
     }
     ensure_agents_table(&mut document)?;
     document["agents"]["enabled"] = value(true);
-    set_multi_agent_v2(&mut document, false)?;
+    set_feature_bool(&mut document, "multi_agent", true)?;
+    set_feature_bool(&mut document, "multi_agent_v2", false)?;
     remove_runtime_hooks(&mut document)?;
     if let Some(command) = runtime_hook_command {
         append_runtime_hooks(&mut document, command)?;
@@ -487,7 +503,12 @@ pub(crate) fn remove_orchestration_projection(
         }
     }
     restore_agents_enabled(&mut document, baseline.agents_enabled)?;
-    restore_multi_agent_v2(&mut document, baseline.multi_agent_v2_enabled)?;
+    restore_feature_bool(&mut document, "multi_agent", baseline.multi_agent_enabled)?;
+    restore_feature_bool(
+        &mut document,
+        "multi_agent_v2",
+        baseline.multi_agent_v2_enabled,
+    )?;
     remove_runtime_hooks(&mut document)?;
     Ok(render_document(document, existing))
 }
@@ -530,7 +551,16 @@ pub(crate) fn restore_orchestration_projection(
         .and_then(Item::as_value)
         .and_then(TomlValue::as_bool);
     restore_agents_enabled(&mut document, snapshot_agents_enabled)?;
-    restore_multi_agent_v2(&mut document, optional_multi_agent_v2(&snapshot_document)?)?;
+    restore_feature_bool(
+        &mut document,
+        "multi_agent",
+        optional_feature_bool(&snapshot_document, "multi_agent")?,
+    )?;
+    restore_feature_bool(
+        &mut document,
+        "multi_agent_v2",
+        optional_feature_bool(&snapshot_document, "multi_agent_v2")?,
+    )?;
     remove_runtime_hooks(&mut document)?;
     restore_runtime_hooks(&mut document, &snapshot_document)?;
     Ok(render_document(document, current))
@@ -556,7 +586,8 @@ pub(crate) fn orchestration_projection_semantic(
             .and_then(TomlValue::as_bool),
     });
     if block.contains(ORCHESTRATION_RUNTIME_CONTRACT) {
-        semantic["multiAgentV2"] = optional_multi_agent_v2(&document)?.into();
+        semantic["multiAgent"] = optional_feature_bool(&document, "multi_agent")?.into();
+        semantic["multiAgentV2"] = optional_feature_bool(&document, "multi_agent_v2")?.into();
         semantic["runtimeHooks"] = runtime_hooks_semantic(&document).into();
     }
     Ok(Some(
@@ -697,7 +728,6 @@ fn runtime_hooks_semantic(document: &DocumentMut) -> String {
     format!("[{}]", entries.join(","))
 }
 
-#[cfg(test)]
 pub(crate) fn upsert_global_orchestration_projection(
     existing: &str,
     instructions: &str,
@@ -778,18 +808,21 @@ fn ensure_agents_table(document: &mut DocumentMut) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn optional_multi_agent_v2(document: &DocumentMut) -> Result<Option<bool>, ConfigError> {
+fn optional_feature_bool(
+    document: &DocumentMut,
+    key: &'static str,
+) -> Result<Option<bool>, ConfigError> {
     document
         .get("features")
         .map(|item| {
             item.as_table()
                 .ok_or(ConfigError::InvalidStructure("features"))?
-                .get("multi_agent_v2")
+                .get(key)
                 .map(|enabled| {
                     enabled
                         .as_value()
                         .and_then(TomlValue::as_bool)
-                        .ok_or(ConfigError::InvalidStructure("features.multi_agent_v2"))
+                        .ok_or(ConfigError::InvalidStructure(key))
                 })
                 .transpose()
         })
@@ -807,24 +840,29 @@ fn ensure_features_table(document: &mut DocumentMut) -> Result<(), ConfigError> 
     Ok(())
 }
 
-fn set_multi_agent_v2(document: &mut DocumentMut, enabled: bool) -> Result<(), ConfigError> {
+fn set_feature_bool(
+    document: &mut DocumentMut,
+    key: &'static str,
+    enabled: bool,
+) -> Result<(), ConfigError> {
     ensure_features_table(document)?;
-    document["features"]["multi_agent_v2"] = value(enabled);
+    document["features"][key] = value(enabled);
     Ok(())
 }
 
-fn restore_multi_agent_v2(
+fn restore_feature_bool(
     document: &mut DocumentMut,
+    key: &'static str,
     original: Option<bool>,
 ) -> Result<(), ConfigError> {
     match original {
-        Some(original) => set_multi_agent_v2(document, original),
+        Some(original) => set_feature_bool(document, key, original),
         None => {
             if let Some(features) = document.get_mut("features") {
                 let features = features
                     .as_table_mut()
                     .ok_or(ConfigError::InvalidStructure("features"))?;
-                features.remove("multi_agent_v2");
+                features.remove(key);
                 if features.is_empty() {
                     document.remove("features");
                 }
@@ -1324,6 +1362,7 @@ enabled = false
 max_threads = 6
 
 [features]
+multi_agent = false
 multi_agent_v2 = true
 "#;
         let baseline = capture_orchestration_baseline(existing).unwrap();
@@ -1336,12 +1375,13 @@ multi_agent_v2 = true
         assert!(active.get("default_permissions").is_none());
         assert_eq!(active["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(active["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(active["features"]["multi_agent"].as_bool(), Some(true));
         assert_eq!(active["features"]["multi_agent_v2"].as_bool(), Some(false));
         let active_semantic = orchestration_projection_semantic(&active.to_string()).unwrap();
         assert!(
             active_semantic
                 .as_deref()
-                .is_some_and(|value| value.contains("\"multiAgentV2\":false"))
+                .is_some_and(|value| value.contains("\"multiAgent\":true"))
         );
 
         let restored = remove_orchestration_projection(&active.to_string(), &baseline)
@@ -1355,6 +1395,7 @@ multi_agent_v2 = true
         );
         assert_eq!(restored["agents"]["enabled"].as_bool(), Some(false));
         assert_eq!(restored["agents"]["max_threads"].as_integer(), Some(6));
+        assert_eq!(restored["features"]["multi_agent"].as_bool(), Some(false));
         assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
     }
 
@@ -1419,12 +1460,14 @@ command = "user-hook --check"
     }
 
     #[test]
-    fn legacy_orchestration_baseline_captures_multi_agent_v2_once() {
+    fn legacy_orchestration_baseline_captures_multi_agent_flags_once() {
         let mut baseline = OrchestrationBaseline {
             permission_style: PermissionStyle::DefaultPermissions,
             default_permissions: Some(":workspace".to_owned()),
             sandbox_mode: None,
             agents_enabled: None,
+            multi_agent_enabled: None,
+            multi_agent_captured: false,
             multi_agent_v2_enabled: None,
             multi_agent_v2_captured: false,
             global_instructions_path: None,
@@ -1434,15 +1477,24 @@ command = "user-hook --check"
         };
 
         assert!(
-            upgrade_orchestration_baseline("[features]\nmulti_agent_v2 = true\n", &mut baseline)
-                .unwrap()
+            upgrade_orchestration_baseline(
+                "[features]\nmulti_agent = false\nmulti_agent_v2 = true\n",
+                &mut baseline
+            )
+            .unwrap()
         );
+        assert_eq!(baseline.multi_agent_enabled, Some(false));
+        assert!(baseline.multi_agent_captured);
         assert_eq!(baseline.multi_agent_v2_enabled, Some(true));
         assert!(baseline.multi_agent_v2_captured);
         assert!(
-            !upgrade_orchestration_baseline("[features]\nmulti_agent_v2 = false\n", &mut baseline)
-                .unwrap()
+            !upgrade_orchestration_baseline(
+                "[features]\nmulti_agent = true\nmulti_agent_v2 = false\n",
+                &mut baseline
+            )
+            .unwrap()
         );
+        assert_eq!(baseline.multi_agent_enabled, Some(false));
         assert_eq!(baseline.multi_agent_v2_enabled, Some(true));
     }
 

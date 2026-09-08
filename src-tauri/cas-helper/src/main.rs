@@ -58,14 +58,18 @@ fn main() -> ExitCode {
             }
         }
         Ok(Command::Bind {
+            database_path,
             agent_key,
             child_thread_id,
+            scope_key,
             task_scope_key,
         }) => {
-            let database_path = default_database_path();
-            let scope_key = env::current_dir()
-                .ok()
-                .and_then(|path| normalize_workspace_scope_key(&path.to_string_lossy()));
+            let database_path = database_path.or_else(default_database_path);
+            let scope_key = scope_key.or_else(|| {
+                env::current_dir()
+                    .ok()
+                    .and_then(|path| normalize_workspace_scope_key(&path.to_string_lossy()))
+            });
             let parent_thread_id = env::var("CODEX_THREAD_ID")
                 .ok()
                 .and_then(|value| valid_runtime_key(&value));
@@ -91,6 +95,7 @@ fn main() -> ExitCode {
                  cas-helper schedule <agent-key> [task-key]\n  \
                  cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
                  cas-helper bind <agent-key> <child-thread-id> [task-key]\n  \
+                 cas-helper bind <database-path> <agent-key> <child-thread-id> <workspace-scope> [task-key]\n  \
                  cas-helper hook <database-path> cas-runtime-enforcement-v1"
             );
             ExitCode::from(EXIT_INVALID_ARGUMENTS)
@@ -107,8 +112,10 @@ enum Command {
         task_scope_key: Option<String>,
     },
     Bind {
+        database_path: Option<PathBuf>,
         agent_key: String,
         child_thread_id: String,
+        scope_key: Option<String>,
         task_scope_key: Option<String>,
     },
     Hook {
@@ -168,19 +175,47 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         });
     }
     if command == OsStr::new("bind") {
-        let agent_key = valid_argument(args.next().ok_or(())?)?;
-        let child_thread_id =
-            valid_runtime_key(&valid_argument(args.next().ok_or(())?)?).ok_or(())?;
-        let task_scope_key = match args.next() {
-            Some(value) => Some(normalize_task_scope_key(&valid_argument(value)?).ok_or(())?),
-            None => None,
-        };
-        if args.next().is_some() {
+        let remaining = args.collect::<Vec<_>>();
+        if matches!(remaining.len(), 2 | 3) {
+            let agent_key = valid_argument(remaining[0].clone())?;
+            let child_thread_id =
+                valid_runtime_key(&valid_argument(remaining[1].clone())?).ok_or(())?;
+            let task_scope_key = remaining
+                .get(2)
+                .map(|value| valid_argument(value.clone()))
+                .transpose()?
+                .map(|value| normalize_task_scope_key(&value).ok_or(()))
+                .transpose()?;
+            return Ok(Command::Bind {
+                database_path: None,
+                agent_key,
+                child_thread_id,
+                scope_key: None,
+                task_scope_key,
+            });
+        }
+        if !matches!(remaining.len(), 4 | 5) {
+            return Err(());
+        }
+        let database_path = PathBuf::from(&remaining[0]);
+        let agent_key = valid_argument(remaining[1].clone())?;
+        let child_thread_id = valid_runtime_key(&valid_argument(remaining[2].clone())?).ok_or(())?;
+        let scope_key =
+            normalize_workspace_scope_key(&valid_argument(remaining[3].clone())?).ok_or(())?;
+        let task_scope_key = remaining
+            .get(4)
+            .map(|value| valid_argument(value.clone()))
+            .transpose()?
+            .map(|value| normalize_task_scope_key(&value).ok_or(()))
+            .transpose()?;
+        if database_path.as_os_str().is_empty() {
             return Err(());
         }
         return Ok(Command::Bind {
+            database_path: Some(database_path),
             agent_key,
             child_thread_id,
+            scope_key: Some(scope_key),
             task_scope_key,
         });
     }
@@ -1949,8 +1984,8 @@ fn schedule(
             eprintln!("CAS agent is not active.");
             ExitCode::from(EXIT_NOT_FOUND)
         }
-        Err(_) => {
-            eprintln!("CAS scheduling query failed.");
+        Err(error) => {
+            eprintln!("CAS scheduling query failed: {}", error.diagnostic());
             ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
         }
     }
@@ -2000,8 +2035,8 @@ fn bind(
         task_scope_key,
     ) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(_) => {
-            eprintln!("CAS bind verification failed.");
+        Err(error) => {
+            eprintln!("CAS bind verification failed: {}", error.diagnostic());
             ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
         }
     }
@@ -2311,7 +2346,7 @@ fn load_recommendation(
             params![instance_id, format!("+{REUSE_CLAIM_TTL_SECONDS} seconds")],
         )?;
         if changed != 1 {
-            return Err(ScheduleError::Database);
+            return Err(ScheduleError::ClaimConflict);
         }
     }
     if recommendation.decision == "SPAWN"
@@ -2544,15 +2579,30 @@ fn load_active_agent_profile(
 
 #[derive(Debug)]
 enum ScheduleError {
-    Database,
+    Database(rusqlite::Error),
+    ClaimConflict,
     NativeStateUnavailable,
     NativeStateIncompatible,
     BindRejected,
 }
 
 impl From<rusqlite::Error> for ScheduleError {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Database
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl ScheduleError {
+    fn diagnostic(&self) -> String {
+        match self {
+            Self::Database(error) => format!("SQLite error: {error}"),
+            Self::ClaimConflict => {
+                "candidate Thread was claimed concurrently; retry scheduling".to_owned()
+            }
+            Self::NativeStateUnavailable => "Codex native state is unavailable".to_owned(),
+            Self::NativeStateIncompatible => "Codex native state schema is incompatible".to_owned(),
+            Self::BindRejected => "native Thread identity verification was rejected".to_owned(),
+        }
     }
 }
 
@@ -3284,8 +3334,32 @@ mod tests {
             Ok(Command::Bind {
                 agent_key,
                 child_thread_id,
-                task_scope_key: None
+                task_scope_key: None,
+                ..
             }) if agent_key == "executor" && child_thread_id == "thread-child"
+        ));
+        let long = [
+            OsString::from("cas-helper"),
+            OsString::from("bind"),
+            OsString::from(r"C:\CAS Data\cas.db"),
+            OsString::from("executor"),
+            OsString::from("thread-child"),
+            OsString::from(r"C:\Users\tester\.ssh"),
+            OsString::from("create-proof"),
+        ];
+        assert!(matches!(
+            parse_args(long),
+            Ok(Command::Bind {
+                database_path: Some(database_path),
+                agent_key,
+                child_thread_id,
+                scope_key: Some(scope_key),
+                task_scope_key: Some(task_scope_key),
+            }) if database_path == PathBuf::from(r"C:\CAS Data\cas.db")
+                && agent_key == "executor"
+                && child_thread_id == "thread-child"
+                && scope_key == "c:/users/tester/.ssh"
+                && task_scope_key == "create-proof"
         ));
         assert!(
             parse_args([

@@ -686,6 +686,11 @@ h2 {
   background: hsl(var(--warning) / 0.12);
 }
 
+.runtime-hook-capability.neutral {
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--muted) / 0.7);
+}
+
 .baseline-indicator {
   display: inline-grid;
   width: 18px;
@@ -1216,6 +1221,113 @@ code,
   color: hsl(var(--foreground));
   background: transparent;
   box-shadow: 0 24px 80px hsl(var(--shadow) / 0.42);
+}
+
+.runtime-hook-review-dialog {
+  width: min(660px, calc(100vw - 32px));
+  max-height: calc(100vh - 32px);
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid hsl(var(--border));
+  border-radius: 14px;
+  color: hsl(var(--foreground));
+  background: transparent;
+  box-shadow: 0 24px 80px hsl(var(--shadow) / 0.42);
+}
+
+.runtime-hook-review-dialog::backdrop {
+  background: hsl(var(--background) / 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.runtime-hook-review-card {
+  display: grid;
+  max-height: calc(100vh - 32px);
+  gap: 14px;
+  padding: 20px;
+  overflow-y: auto;
+  background: hsl(var(--card-strong));
+}
+
+.runtime-hook-review-card header,
+.runtime-hook-review-card footer {
+  margin: 0;
+}
+
+.runtime-hook-review-card header p {
+  max-width: 58ch;
+  margin-top: 4px;
+}
+
+.runtime-hook-review-steps {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 14px 14px 14px 36px;
+  border: 1px solid hsl(var(--border) / 0.75);
+  border-radius: 10px;
+  color: hsl(var(--muted-foreground));
+  background: hsl(var(--background) / 0.32);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.runtime-hook-review-steps code {
+  color: hsl(var(--foreground));
+}
+
+.runtime-hook-security-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: hsl(var(--muted-foreground));
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.runtime-hook-security-note .ui-icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
+  margin-top: 1px;
+}
+
+.runtime-hook-review-card footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding-top: 14px;
+  border-top: 1px solid hsl(var(--border) / 0.7);
+}
+
+.runtime-hook-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 11px 13px;
+  border: 1px solid hsl(var(--warning) / 0.34);
+  border-radius: 9px;
+  color: hsl(var(--warning));
+  background: hsl(var(--warning) / 0.08);
+}
+
+.runtime-hook-warning > div {
+  display: grid;
+  gap: 3px;
+}
+
+.runtime-hook-warning strong,
+.runtime-hook-warning span {
+  font-size: 12px;
+}
+
+.runtime-hook-warning span {
+  line-height: 1.5;
+}
+
+.runtime-hook-warning .secondary-button {
+  flex: 0 0 auto;
 }
 
 .configuration-conflict-dialog::backdrop {

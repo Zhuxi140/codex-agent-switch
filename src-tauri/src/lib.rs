@@ -1,6 +1,7 @@
 mod agent;
 mod codex_config;
 mod codex_environment;
+mod codex_hooks;
 mod codex_schema_probe;
 mod configuration;
 mod domain;
@@ -23,6 +24,7 @@ use agent::{
     AgentUpdateRequest,
 };
 use codex_environment::CodexEnvironment;
+use codex_hooks::RuntimeHookStatusResponse;
 use configuration::{
     CodexMcpServerResponse, ConfigurationApplyPreview, ConfigurationApplyRequest,
     ConfigurationApplyResponse, ConfigurationService, ConfigurationStatus,
@@ -145,7 +147,7 @@ fn app_get_bootstrap(
 
     Ok(AppBootstrapResponse {
         app_version: env!("CARGO_PKG_VERSION"),
-        ipc_schema_version: 5,
+        ipc_schema_version: 6,
         codex: CodexEnvironmentSummary {
             detected: environment.detected,
             version: environment.version,
@@ -171,6 +173,13 @@ fn codex_redetect(
 ) -> Result<CodexEnvironment, ApiError> {
     codex_environment::clear_capability_cache();
     state.environment().map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn codex_runtime_hook_status(
+    state: tauri::State<'_, ConfigurationService>,
+) -> RuntimeHookStatusResponse {
+    state.runtime_hook_status()
 }
 
 #[tauri::command]
@@ -796,6 +805,7 @@ pub fn run() {
             app_get_bootstrap,
             codex_get_environment,
             codex_redetect,
+            codex_runtime_hook_status,
             codex_mcp_server_list,
             settings_get,
             settings_update,
@@ -859,18 +869,6 @@ pub fn run() {
             usage_managed_session_resolve_recovery,
             usage_managed_turn_start
         ])
-        .build(tauri::generate_context!())
-        .expect("failed to build Codex Agent Switch")
-        .run(|app, event| {
-            // 关闭应用时清理 .codex 下的编排投影：与「切回 Default」走同一恢复路径
-            // （按 baseline 还原 config.toml 片段与 AGENTS.md、删除 agents/cas-*.toml
-            // 等托管资源），保证磁盘与 CAS 状态一致。
-            if let tauri::RunEvent::ExitRequested { .. } = event
-                && let Some(configuration) = app.try_state::<ConfigurationService>()
-                && let Err(error) =
-                    configuration.switch_runtime_mode(RuntimeModeSwitchRequest::default())
-            {
-                eprintln!("退出清理编排投影失败：{error}");
-            }
-        });
+        .run(tauri::generate_context!())
+        .expect("failed to run Codex Agent Switch");
 }

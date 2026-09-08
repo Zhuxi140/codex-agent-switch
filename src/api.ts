@@ -42,6 +42,25 @@ export interface CodexMcpServerResponse {
   enabled: boolean;
 }
 
+export type RuntimeHookStatus =
+  | "NOT_REQUIRED"
+  | "UNSUPPORTED"
+  | "NOT_INSTALLED"
+  | "INCOMPLETE"
+  | "PENDING_TRUST"
+  | "MODIFIED"
+  | "DISABLED"
+  | "ACTIVE"
+  | "UNAVAILABLE";
+
+export interface RuntimeHookStatusResponse {
+  status: RuntimeHookStatus;
+  expectedHookCount: number;
+  installedHookCount: number;
+  trustedHookCount: number;
+  message: string;
+}
+
 export type Appearance = "SYSTEM" | "LIGHT" | "DARK";
 export type OrchestrationFailurePolicy = "STRICT_STOP" | "PRIMARY_FALLBACK";
 
@@ -94,6 +113,10 @@ export function listCodexMcpServers(): Promise<CodexMcpServerResponse[]> {
 
 export function redetectCodex(): Promise<CodexEnvironmentResponse> {
   return invoke<CodexEnvironmentResponse>("codex_redetect");
+}
+
+export function getRuntimeHookStatus(): Promise<RuntimeHookStatusResponse> {
+  return invoke<RuntimeHookStatusResponse>("codex_runtime_hook_status");
 }
 
 export function getSettings(): Promise<SettingsResponse> {

@@ -1,0 +1,4 @@
+default_permissions = ":workspace"
+
+[agents]
+enabled = false

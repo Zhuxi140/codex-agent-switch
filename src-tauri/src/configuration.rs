@@ -28,11 +28,12 @@ use crate::codex_config::{
     remove_model_catalog_projection, remove_orchestration_projection, remove_provider_projection,
     render_agent_projection, restore_model_catalog_projection, restore_orchestration_projection,
     restore_project_exclusion_projection, restore_provider_projection,
-    upgrade_orchestration_baseline, upsert_model_catalog_projection,
-    upsert_orchestration_projection_with_hooks, upsert_project_exclusion_projection,
-    upsert_provider_projection,
+    upgrade_orchestration_baseline, upsert_global_orchestration_projection,
+    upsert_model_catalog_projection, upsert_orchestration_projection_with_hooks,
+    upsert_project_exclusion_projection, upsert_provider_projection,
 };
 use crate::codex_environment::{self, CodexEnvironment};
+use crate::codex_hooks::{RuntimeHookStatus, RuntimeHookStatusResponse, probe_runtime_hook_status};
 use crate::persistence::{PersistenceError, open_database};
 use crate::provider::ApiError;
 use crate::settings::{
@@ -48,9 +49,11 @@ const SESSION_CATALOG_RESOURCE: &str = "CODEX_SESSION_CATALOG";
 const ORCHESTRATION_RESOURCE: &str = "CODEX_ORCHESTRATION";
 const GLOBAL_INSTRUCTIONS_RESOURCE: &str = "CODEX_GLOBAL_INSTRUCTIONS";
 const BUNDLED_SKILL_RESOURCE: &str = "CODEX_BUNDLED_SKILL";
+const EXEC_POLICY_RESOURCE: &str = "CODEX_EXEC_POLICY";
 const CONFIG_RELATIVE_PATH: &str = "config.toml";
 const GLOBAL_INSTRUCTIONS_PATH: &str = "AGENTS.md";
 const GLOBAL_OVERRIDE_INSTRUCTIONS_PATH: &str = "AGENTS.override.md";
+const EXEC_POLICY_RELATIVE_PATH: &str = "rules/cas-runtime.rules";
 const MIXED_CATALOG_KEY: &str = "mixed-v1";
 const ACTIVE_TRANSACTION_STATUSES: [&str; 5] = [
     "PREPARED",
@@ -313,9 +316,11 @@ impl ConfigurationService {
         let environment = self.diagnose_environment()?;
         let runtime_hooks_available =
             self.fixed_codex_home.is_some() || self.environment()?.runtime_hooks_available;
+        let runtime_hook_status = self.runtime_hook_status();
         let database = diagnose_database(&connection)?;
         let configuration = diagnose_configuration(self.get_status());
-        let orchestration = diagnose_orchestration(&connection, runtime_hooks_available)?;
+        let orchestration =
+            diagnose_orchestration(&connection, runtime_hooks_available, &runtime_hook_status)?;
         let providers = diagnose_providers(&connection, request.include_network_checks)?;
         let agents = diagnose_agents(&connection)?;
         let sections = vec![
@@ -348,6 +353,66 @@ impl ConfigurationService {
     pub(crate) fn runtime_mode(&self) -> Result<RuntimeModeResponse, ConfigurationError> {
         let connection = open_database(&self.database_path)?;
         runtime_mode_from_connection(&connection)
+    }
+
+    pub(crate) fn runtime_hook_status(&self) -> RuntimeHookStatusResponse {
+        let connection = match open_database(&self.database_path) {
+            Ok(connection) => connection,
+            Err(error) => {
+                return RuntimeHookStatusResponse::unavailable(format!(
+                    "CAS 数据库不可用，无法判断 Runtime Hook 状态：{error}"
+                ));
+            }
+        };
+        let bindings = match load_active_agent_bindings(&connection) {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                return RuntimeHookStatusResponse::unavailable(format!(
+                    "无法读取当前 Agent 绑定：{error}"
+                ));
+            }
+        };
+        let legacy_agent_id = match load_active_agent_id(&connection) {
+            Ok(agent_id) => agent_id,
+            Err(error) => {
+                return RuntimeHookStatusResponse::unavailable(format!(
+                    "无法读取旧版 Agent 绑定：{error}"
+                ));
+            }
+        };
+        if bindings.is_empty() && legacy_agent_id.is_none() {
+            return RuntimeHookStatusResponse::not_required();
+        }
+
+        #[cfg(test)]
+        if self.fixed_codex_home.is_some() {
+            return RuntimeHookStatusResponse::unavailable(
+                "隔离测试未启动真实 Codex app-server，Hook 状态未核验。",
+            );
+        }
+
+        let environment = match self.environment() {
+            Ok(environment) => environment,
+            Err(error) => {
+                return RuntimeHookStatusResponse::unavailable(format!(
+                    "无法读取 Codex 环境：{error}"
+                ));
+            }
+        };
+        if !environment.runtime_hooks_available {
+            return RuntimeHookStatusResponse::unsupported();
+        }
+        let Some(executable) = environment.executable_path.as_deref() else {
+            return RuntimeHookStatusResponse::unavailable(
+                "未找到当前 Codex 可执行文件，无法核验 Runtime Hook。",
+            );
+        };
+        let Some(codex_home) = environment.codex_home.as_deref() else {
+            return RuntimeHookStatusResponse::unavailable(
+                "未解析出当前 CODEX_HOME，无法核验 Runtime Hook。",
+            );
+        };
+        probe_runtime_hook_status(Path::new(executable), Path::new(codex_home))
     }
 
     pub(crate) fn list_project_exclusions(
@@ -1177,6 +1242,7 @@ impl ConfigurationService {
                         | ORCHESTRATION_RESOURCE
                         | GLOBAL_INSTRUCTIONS_RESOURCE
                         | BUNDLED_SKILL_RESOURCE
+                        | EXEC_POLICY_RESOURCE
                 ) && !desired_keys
                     .contains(&(resource.resource_type.clone(), resource.logical_key.clone()))
             })
@@ -2484,8 +2550,13 @@ fn load_desired_resources(
                     .map_err(ConfigurationError::from)
             })?;
         let exclusions = load_project_exclusions(connection)?;
-        let instructions =
-            render_orchestration_instructions(&agents, &exclusions, failure_policy, helper_path);
+        let instructions = render_orchestration_instructions(
+            &agents,
+            &exclusions,
+            failure_policy,
+            helper_path,
+            database_path,
+        );
         let hook_command = runtime_hook_command(helper_path, database_path);
         let rendered = upsert_orchestration_projection_with_hooks(
             "",
@@ -2511,6 +2582,49 @@ fn load_desired_resources(
             provider: None,
             session_catalog_path: None,
         });
+
+        // Codex Desktop 当前会用宿主提供的 developerInstructions 覆盖 config.toml
+        // 中的同名字段，因此全局 AGENTS 必须携带可独立执行的完整 Primary 协议。
+        // config.toml 投影继续保留，供 CLI 和不覆盖该字段的客户端使用。
+        let relative_path = resolve_global_instructions_path(codex_home)?;
+        let target_path = safe_join(codex_home, &relative_path)?;
+        reject_symlink(&target_path)?;
+        let global_instructions = primary_delegation_gate(&instructions);
+        let content = upsert_global_orchestration_projection(
+            &read_optional_utf8(&target_path)?,
+            &global_instructions,
+        )?;
+        let semantic = global_orchestration_projection_semantic(&content)?
+            .ok_or(ConfigurationError::InvalidSnapshot)?;
+        resources.push(DesiredResource {
+            resource_type: GLOBAL_INSTRUCTIONS_RESOURCE.to_owned(),
+            logical_key: relative_path.clone(),
+            relative_path,
+            target_path,
+            semantic,
+            content: Some(content),
+            summary: "启用 Primary 子 Agent 自动编排协议".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: "primary-delegation-gate".to_owned(),
+            provider: None,
+            session_catalog_path: None,
+        });
+
+        let exec_policy = render_control_plane_exec_policy(helper_path, database_path);
+        resources.push(DesiredResource {
+            resource_type: EXEC_POLICY_RESOURCE.to_owned(),
+            logical_key: EXEC_POLICY_RELATIVE_PATH.to_owned(),
+            relative_path: EXEC_POLICY_RELATIVE_PATH.to_owned(),
+            target_path: safe_join(codex_home, EXEC_POLICY_RELATIVE_PATH)?,
+            semantic: exec_policy.clone(),
+            content: Some(exec_policy),
+            summary: "允许 CAS 调度控制面在沙盒外访问运行时数据库".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: "cas-runtime-exec-policy".to_owned(),
+            provider: None,
+            session_catalog_path: None,
+        });
+
         if !runtime_hooks_available {
             warnings.push(DiagnosticIssue::warning(
                 "RUNTIME_ENFORCEMENT_HOOKS_UNAVAILABLE",
@@ -2584,11 +2698,32 @@ fn explicit_reasoning_effort(reasoning_policy: &str) -> Option<&'static str> {
     }
 }
 
+fn render_control_plane_exec_policy(helper_path: &Path, database_path: &Path) -> String {
+    let helper = serde_json::to_string(&helper_path.to_string_lossy())
+        .expect("serializing helper path cannot fail");
+    let database = serde_json::to_string(&database_path.to_string_lossy())
+        .expect("serializing database path cannot fail");
+    format!(
+        "# Managed by Codex Agent Switch. Remove through CAS Default mode.\n\
+prefix_rule(\n\
+    pattern = [{helper}, \"schedule\", {database}],\n\
+    decision = \"allow\",\n\
+    justification = \"CAS schedule writes only validated orchestration state.\",\n\
+)\n\n\
+prefix_rule(\n\
+    pattern = [{helper}, \"bind\", {database}],\n\
+    decision = \"allow\",\n\
+    justification = \"CAS bind writes only validated orchestration state.\",\n\
+)\n"
+    )
+}
+
 fn render_orchestration_instructions(
     agents: &[ActiveAgentProjectionRow],
     exclusions: &[ProjectExclusionResponse],
     failure_policy: OrchestrationFailurePolicy,
     helper_path: &Path,
+    database_path: &Path,
 ) -> String {
     let active_agents = agents
         .iter()
@@ -2630,14 +2765,10 @@ fn render_orchestration_instructions(
             "缺少所需 phase Agent，或续接/replacement、spawn、bind、验证失败，或连续 replacement 无可验证进展：先显式警告失败阶段、Agent、错误与接管风险，再由 Primary 接管；最终结果必须记录回退原因、Primary 改动与验证，严禁静默 fallback。",
         ),
     };
-    let scheduling_command = format!(
-        "\"{}\" schedule <agent-key> [task-key]",
-        helper_path.to_string_lossy()
-    );
-    let bind_command = format!(
-        "\"{}\" bind <agent-key> <child-thread-id> [task-key]",
-        helper_path.to_string_lossy()
-    );
+    let control_workdir = helper_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(helper_path);
     format!(
         "CAS Primary 编排协议（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\
 当前失败策略：{failure_policy_label}\n\n\
@@ -2652,17 +2783,30 @@ fn render_orchestration_instructions(
 可用 Agent\n{active_agents}\n\n\
 硬规则\n\
 1. 规则只约束 Primary/root；Child 执行父任务，禁止再次编排或递归创建同职责 Agent。Primary 规划、审查、收束。\n\
-2. {write_rule} 分析任务不得写入；探索、验证、审查优先对应 phase。`schedule` / `bind` 是 Primary 的 CAS 控制面命令，不算任务写入，不得预先拒绝。\n\
-3. 首次委派用 Shell 运行：`{scheduling_command}`；helper 读取数据库、cwd 和 `CODEX_THREAD_ID`。无 `commandExecution` 不得称失败；只认工具错误。有稳定任务键则传 `[task-key]`（`[a-z0-9][a-z0-9_-]{{0,63}}`）；仅完全同键复用，无键不复用有键 Thread。禁止猜任务键，不确定就省略。判断由 CAS 完成，Primary 不读 Thread、Token、Cache。\n\
+2. {write_rule} 分析不得写入；探索/验证/审查优先对应 phase。`schedule`/`bind` 是 Primary 的 CAS 控制面命令，非任务写入，不得预先拒绝。\n\
+3. H=`\"{}\"`、D=`\"{}\"`、W=turn context 绝对 `cwd`；替换值。`workdir=\"{}\"`，禁用项目目录。`schedule`/`bind` 以 `sandbox_permissions=require_escalated`（或等价方式）在沙盒外执行；精确 allow 免提示。`H schedule D <agent-key> W [task-key]`；helper读 `CODEX_THREAD_ID`。无 `commandExecution` 不得称失败。`[task-key]` 匹配 `[a-z0-9][a-z0-9_-]{{0,63}}`；仅同键复用，禁止猜任务键。CAS判断，Primary 不读 Thread、Token、Cache。\n\
 4. 只接受单行 `CAS1|<REUSE、SPAWN或WAIT>|<thread-id或->|<reason>`；否则失败：\n\
-   - `REUSE`：向返回 Thread `followup_task` 完整任务，再以同参数 `{bind_command}`；不得 spawn。\n\
-   - `SPAWN`：按第 5 条创建，再以同参数 `{bind_command}`。无生命周期 Hook 时，bind 仅凭匹配租约、原生 Thread 身份和 SPAWN 精确预留兼容准入。\n\
+   - `REUSE`：向返回 Thread `followup_task` 完整任务，再运行 `H bind D <agent-key> <child-thread-id> W [task-key]`；不得 spawn。\n\
+   - `SPAWN`：按第 5 条创建，再运行同一 bind。无 Hook 时，仅凭匹配租约、原生 Thread 身份和 SPAWN 预留准入。\n\
    - `WAIT`：同键 SPAWN 已预留；不得重复创建，稍后同参数重试。\n\
    - bind 成功才完成；命令、协议、bind 失败或 WAIT 无进展：执行第 8 条。\n\
-5. spawn 用 `agent_type=<name>`、`fork_turns=\"none\"`；prompt 仅含 `GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`。`TOOLS` 只列名，空项 `-`；不附对话/工具说明，不覆盖 `model` / `reasoning_effort`。\n\
+        5. spawn 用 `agent_type=<name>`、`fork_turns=\"none\"`；prompt 仅含 `GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`。`TOOLS` 只列名，空项 `-`；不附对话/工具说明，不覆盖 `model` / `reasoning_effort`。\n\
 6. 同一任务同时只运行一个对应 Child；pending/running/可 follow-up 时复用，单次等待超时不等于失败。仅旧 Thread 终止、不可达或上下文耗尽且未运行时创建 replacement；prompt 携带任务、已完成、验证/失败、剩余工作和约束，同任务续作不再 schedule。不限制创建次数，但连续替换无进展即失败；REUSE 不可达同样处理。\n\
 7. Child 首行：`RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED`。Primary 等待并审查证据：DONE 接受或交付同一 Thread 下一单元；NEEDS_DECISION 决策后 follow-up；PARTIAL/BLOCKED 按剩余工作、证据和第 8 条处理。禁止未审查就追加。成功保留 Thread，严禁 `close_agent`，CAS 同步 IDLE；仅用户要求、Agent 停用/移除、Thread 异常或 CAS 判定不可复用时关闭。写入串行，独立只读可并行。\n\
-8. {failure_rule} 所有路径必须显式报告。"
+        8. {failure_rule} 所有路径必须显式报告。",
+        helper_path.to_string_lossy(),
+        database_path.to_string_lossy(),
+        control_workdir.to_string_lossy()
+    )
+}
+
+fn primary_delegation_gate(instructions: &str) -> String {
+    format!(
+        "## CAS Primary delegation gate\n\n\
+- 本段及其后的 CAS Primary 编排协议仅适用于 Primary/root。由 Primary 创建的 Child/子 Agent 必须忽略整个 CAS 管理块，执行自身 Agent 配置，且不得递归委派同职责 Agent。\n\
+- 用户启用 CAS 子 Agent 模式后，本文件显式要求 Primary 执行以下完整协议；不得因为用户没有逐次写出“请使用子 Agent”而跳过委派。\n\
+- 以下协议是独立、可执行的事实来源；即使 Codex Desktop 未加载 `config.toml` 中的 `developer_instructions`，Primary 仍必须遵守。\n\n\
+{instructions}"
     )
 }
 
@@ -3083,7 +3227,10 @@ fn current_semantic(
             None
         });
     }
-    if resource.resource_type == BUNDLED_SKILL_RESOURCE {
+    if matches!(
+        resource.resource_type.as_str(),
+        BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+    ) {
         return Ok(resource
             .target_path
             .is_file()
@@ -3132,7 +3279,7 @@ fn current_managed_semantic(
     }
     if matches!(
         resource.resource_type.as_str(),
-        AGENT_RESOURCE | MODEL_CATALOG_RESOURCE | BUNDLED_SKILL_RESOURCE
+        AGENT_RESOURCE | MODEL_CATALOG_RESOURCE | BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
     ) {
         let relative_path =
             managed_relative_path(resource).ok_or(ConfigurationError::InvalidSnapshot)?;
@@ -3142,7 +3289,10 @@ fn current_managed_semantic(
             let content = fs::read_to_string(path)?;
             return Ok(Some(if resource.resource_type == MODEL_CATALOG_RESOURCE {
                 json_semantic(&content)?
-            } else if resource.resource_type == BUNDLED_SKILL_RESOURCE {
+            } else if matches!(
+                resource.resource_type.as_str(),
+                BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+            ) {
                 content
             } else {
                 document_semantic(&content)?
@@ -3220,6 +3370,7 @@ fn detect_conflict(
 
 fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
     is_config_fragment(&resource.resource_type)
+        || resource.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE
         || (resource.resource_type == AGENT_RESOURCE
             && resource.relative_path.starts_with("agents/cas-")
             && resource.relative_path.ends_with(".toml"))
@@ -3228,6 +3379,8 @@ fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
             && resource.relative_path.ends_with(".json"))
         || (resource.resource_type == BUNDLED_SKILL_RESOURCE
             && resource.relative_path.starts_with("cas/bundled-skills/"))
+        || (resource.resource_type == EXEC_POLICY_RESOURCE
+            && resource.relative_path == EXEC_POLICY_RELATIVE_PATH)
 }
 
 fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
@@ -3240,6 +3393,7 @@ fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
             | AGENT_RESOURCE
             | MODEL_CATALOG_RESOURCE
             | BUNDLED_SKILL_RESOURCE
+            | EXEC_POLICY_RESOURCE
     )
 }
 
@@ -3768,6 +3922,7 @@ fn diagnose_configuration(status: ConfigurationStatusResponse) -> DiagnosticSect
 fn diagnose_orchestration(
     connection: &Connection,
     runtime_hooks_available: bool,
+    runtime_hook_status: &RuntimeHookStatusResponse,
 ) -> Result<DiagnosticSection, ConfigurationError> {
     let bindings = load_active_agent_bindings(connection)?;
     let legacy_agent_id = load_active_agent_id(connection)?;
@@ -3797,23 +3952,40 @@ fn diagnose_orchestration(
             },
         ),
     }];
-    issues.push(if runtime_hooks_available {
-        DiagnosticIssue::info(
-            "RUNTIME_ENFORCEMENT_HOOKS_READY",
-            "当前 Codex 支持 hooks；CAS 可在编排模式下投影本地工具调用 Guard。",
-        )
-    } else {
-        DiagnosticIssue::warning(
+    issues.push(match runtime_hook_status.status {
+        RuntimeHookStatus::Active => DiagnosticIssue::info(
+            "RUNTIME_ENFORCEMENT_HOOKS_ACTIVE",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::PendingTrust => DiagnosticIssue::warning(
+            "RUNTIME_HOOKS_TRUST_REQUIRED",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::Modified => DiagnosticIssue::error(
+            "RUNTIME_HOOKS_TRUST_STALE",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::Disabled => DiagnosticIssue::error(
+            "RUNTIME_HOOKS_DISABLED",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::NotInstalled | RuntimeHookStatus::Incomplete => DiagnosticIssue::error(
+            "RUNTIME_HOOKS_CONFIGURATION_INCOMPLETE",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::Unsupported => DiagnosticIssue::warning(
             "RUNTIME_ENFORCEMENT_HOOKS_UNAVAILABLE",
-            "当前 Codex 不支持可用的 hooks；运行时写入约束将降级为指令、Agent 配置与沙箱保护。",
-        )
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::Unavailable => DiagnosticIssue::warning(
+            "RUNTIME_HOOKS_STATUS_UNVERIFIED",
+            runtime_hook_status.message.clone(),
+        ),
+        RuntimeHookStatus::NotRequired => DiagnosticIssue::warning(
+            "RUNTIME_HOOKS_STATUS_INCONSISTENT",
+            "当前已绑定 Agent，但 Hook 状态被报告为无需启用；请重新检测 Codex 并同步模式。",
+        ),
     });
-    if runtime_hooks_available {
-        issues.push(DiagnosticIssue::info(
-            "RUNTIME_HOOKS_TRUST_REVIEW",
-            "Codex 首次发现或检测到 CAS Hook 变化时可能要求审核；请在新任务中用 /hooks 确认 CAS Runtime Enforcement 已受信任。",
-        ));
-    }
 
     let has_execution_binding = bindings.iter().any(|binding| binding.phase == "EXECUTION")
         || legacy_agent_id
@@ -4111,6 +4283,9 @@ fn managed_relative_path(resource: &ManagedResource) -> Option<String> {
         AGENT_RESOURCE => Some(format!("agents/cas-{}.toml", resource.logical_key)),
         MODEL_CATALOG_RESOURCE => Some(format!("cas/model-catalogs/{}.json", resource.logical_key)),
         BUNDLED_SKILL_RESOURCE => Some(format!("cas/bundled-skills/{}", resource.logical_key)),
+        EXEC_POLICY_RESOURCE if resource.logical_key == EXEC_POLICY_RELATIVE_PATH => {
+            Some(EXEC_POLICY_RELATIVE_PATH.to_owned())
+        }
         GLOBAL_INSTRUCTIONS_RESOURCE
             if matches!(
                 resource.logical_key.as_str(),
@@ -4217,6 +4392,7 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
                     | ORCHESTRATION_RESOURCE
                     | GLOBAL_INSTRUCTIONS_RESOURCE
                     | BUNDLED_SKILL_RESOURCE
+                    | EXEC_POLICY_RESOURCE
             )
         {
             return Err(ConfigurationError::InvalidSnapshot);
@@ -4252,6 +4428,12 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
                 resource.relative_path.as_str(),
                 GLOBAL_INSTRUCTIONS_PATH | GLOBAL_OVERRIDE_INSTRUCTIONS_PATH
             ) || resource.logical_key != resource.relative_path)
+        {
+            return Err(ConfigurationError::InvalidSnapshot);
+        }
+        if resource.resource_type == EXEC_POLICY_RESOURCE
+            && (resource.relative_path != EXEC_POLICY_RELATIVE_PATH
+                || resource.logical_key != EXEC_POLICY_RELATIVE_PATH)
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }
@@ -4444,7 +4626,10 @@ fn sync_managed_after_restore(
                 (
                     if resource.resource_type == MODEL_CATALOG_RESOURCE {
                         json_semantic(&content)?
-                    } else if resource.resource_type == BUNDLED_SKILL_RESOURCE {
+                    } else if matches!(
+                        resource.resource_type.as_str(),
+                        BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+                    ) {
                         content.clone()
                     } else {
                         document_semantic(&content)?
@@ -5185,6 +5370,10 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         legacy_config["default_permissions"] = value(":read-only");
+        legacy_config["features"]
+            .as_table_mut()
+            .unwrap()
+            .remove("multi_agent");
         legacy_config["features"]["multi_agent_v2"] = value(true);
         legacy_config["developer_instructions"] =
             value("<<< CAS ORCHESTRATION v1 >>>\n旧版编排规则\n<<< END CAS ORCHESTRATION v1 >>>");
@@ -5212,6 +5401,14 @@ mod tests {
         baseline
             .as_object_mut()
             .unwrap()
+            .remove("multiAgentEnabled");
+        baseline
+            .as_object_mut()
+            .unwrap()
+            .remove("multiAgentCaptured");
+        baseline
+            .as_object_mut()
+            .unwrap()
             .remove("multiAgentV2Enabled");
         baseline
             .as_object_mut()
@@ -5231,6 +5428,7 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(active["default_permissions"].as_str(), Some(":workspace"));
+        assert_eq!(active["features"]["multi_agent"].as_bool(), Some(true));
         assert_eq!(active["features"]["multi_agent_v2"].as_bool(), Some(false));
 
         context
@@ -5244,6 +5442,13 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(restored["default_permissions"].as_str(), Some(":workspace"));
+        assert!(
+            restored["features"]
+                .as_table()
+                .unwrap()
+                .get("multi_agent")
+                .is_none()
+        );
         assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
     }
 
@@ -5307,7 +5512,7 @@ mod tests {
             fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap(),
             config_before
         );
-        assert_eq!(managed_resource_count(&context.database), 6);
+        assert_eq!(managed_resource_count(&context.database), 8);
     }
 
     #[test]
@@ -5374,8 +5579,9 @@ mod tests {
             config["mcp_servers"]["keep"]["command"].as_str(),
             Some("keep-me")
         );
-        assert!(!context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH).exists());
-        assert_eq!(managed_resource_count(&context.database), 6);
+        let global = fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
+        assert!(global.contains("CAS Primary delegation gate"));
+        assert_eq!(managed_resource_count(&context.database), 8);
     }
 
     #[test]
@@ -5809,7 +6015,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(managed_agents, 1);
-        assert!(!context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH).exists());
+        let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+        let global = fs::read_to_string(&global_path).unwrap();
+        assert!(global.contains("CAS Primary delegation gate"));
+        assert!(global.contains("不得因为用户没有逐次写出"));
+        assert!(global.contains("CAS Primary 编排协议（"));
+        assert!(global.contains("必须委派给 phase=EXECUTION"));
 
         context
             .service
@@ -5817,11 +6028,11 @@ mod tests {
                 active_agent_ids: Vec::new(),
             })
             .unwrap();
-        assert!(!context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH).exists());
+        assert!(!global_path.exists());
     }
 
     #[test]
-    fn active_apply_removes_legacy_global_orchestration_and_preserves_user_rules() {
+    fn active_apply_replaces_legacy_global_orchestration_with_executable_protocol() {
         let context = TestContext::new();
         let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
         let user_rules = "# 用户全局规则\n\n保留这段内容。\n";
@@ -5840,34 +6051,34 @@ mod tests {
         open_database(&context.database)
             .unwrap()
             .execute(
-                "INSERT INTO managed_resources (
-                    id, resource_type, logical_key, physical_location, ownership,
-                    semantic_hash, content_hash, fragment_hash, origin_entity_type,
-                    origin_entity_id, last_applied_at, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, 'CAS', ?5, ?6, ?5, 'RUNTIME',
-                           'primary-strict-stop', ?7, ?7, ?7)",
+                "UPDATE managed_resources
+                 SET semantic_hash = ?1, content_hash = ?2, fragment_hash = ?1,
+                     origin_entity_id = 'primary-strict-stop'
+                 WHERE resource_type = ?3 AND logical_key = ?4",
                 params![
-                    Uuid::new_v4().to_string(),
-                    GLOBAL_INSTRUCTIONS_RESOURCE,
-                    GLOBAL_INSTRUCTIONS_PATH,
-                    global_path.to_string_lossy().into_owned(),
                     hash_text(&semantic),
                     hash_bytes(legacy.as_bytes()),
-                    "2026-01-01T00:00:00Z"
+                    GLOBAL_INSTRUCTIONS_RESOURCE,
+                    GLOBAL_INSTRUCTIONS_PATH
                 ],
             )
             .unwrap();
 
         let preview = context.service.preview_apply().unwrap();
         assert!(preview.changes.iter().any(|change| {
-            change.operation == "DELETE" && change.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE
+            change.operation == "UPDATE" && change.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE
         }));
         context
             .service
             .apply(ConfigurationApplyRequest::default())
             .unwrap();
 
-        assert_eq!(fs::read_to_string(global_path).unwrap(), user_rules);
+        let active_global = fs::read_to_string(global_path).unwrap();
+        assert!(active_global.starts_with(user_rules));
+        assert!(active_global.contains("CAS Primary delegation gate"));
+        assert!(active_global.contains("CAS Primary 编排协议（"));
+        assert!(active_global.contains("必须委派给 phase=EXECUTION"));
+        assert!(!active_global.contains("旧版完整 Primary 编排协议"));
         let primary = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH))
             .unwrap()
             .parse::<DocumentMut>()
@@ -5887,7 +6098,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            0
+            1
         );
         assert_eq!(
             context.service.runtime_mode().unwrap().active_bindings[0].agent_id,
@@ -5901,7 +6112,7 @@ mod tests {
         fs::write(
             context.codex_home.join(CONFIG_RELATIVE_PATH),
             "default_permissions = ':workspace'\ndeveloper_instructions = '保留用户规则'\n\
-             [features]\nmulti_agent_v2 = true\n",
+             [features]\nmulti_agent = false\nmulti_agent_v2 = true\n",
         )
         .unwrap();
         fs::write(
@@ -5986,6 +6197,10 @@ mod tests {
         );
         assert_eq!(active_config["agents"]["enabled"].as_bool(), Some(true));
         assert_eq!(
+            active_config["features"]["multi_agent"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
             active_config["features"]["multi_agent_v2"].as_bool(),
             Some(false)
         );
@@ -5994,7 +6209,21 @@ mod tests {
         assert!(primary_instructions.contains("严禁 Primary 自行接管写入"));
         let active_global =
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
-        assert_eq!(active_global, "# 用户全局规则\n\n保留这段内容。\n");
+        assert!(active_global.starts_with("# 用户全局规则\n\n保留这段内容。\n"));
+        assert!(active_global.contains("CAS Primary delegation gate"));
+        assert!(active_global.contains("不得因为用户没有逐次写出"));
+        assert!(active_global.contains("CAS Primary 编排协议（"));
+        assert!(active_global.contains("必须委派给 phase=EXECUTION"));
+        assert!(active_global.contains("spawn 用 `agent_type=<name>`"));
+        assert!(active_global.contains("CAS1|<REUSE、SPAWN或WAIT>"));
+        let exec_policy_path = context.codex_home.join(EXEC_POLICY_RELATIVE_PATH);
+        assert_eq!(
+            fs::read_to_string(&exec_policy_path).unwrap(),
+            render_control_plane_exec_policy(
+                &context.database.parent().unwrap().join("cas-helper.exe"),
+                &context.database,
+            )
+        );
         assert!(primary_instructions.contains("规则只约束 Primary/root"));
         assert!(primary_instructions.contains("model=`deepseek-v4-flash`"));
         assert!(primary_instructions.contains("reasoning_effort=`high`"));
@@ -6013,16 +6242,23 @@ mod tests {
         assert!(primary_instructions.contains("CAS1|<REUSE、SPAWN或WAIT>"));
         assert!(primary_instructions.contains("CODEX_THREAD_ID"));
         assert!(primary_instructions.contains("Primary 不读 Thread、Token、Cache"));
-        assert!(primary_instructions.contains("cas-helper.exe\" schedule <agent-key> [task-key]"));
+        let database_argument = format!("\"{}\"", context.database.to_string_lossy());
+        assert!(primary_instructions.contains(&format!("D=`{database_argument}`")));
+        assert!(primary_instructions.contains("H schedule D <agent-key> W [task-key]"));
         assert!(
-            primary_instructions
-                .contains("cas-helper.exe\" bind <agent-key> <child-thread-id> [task-key]")
+            primary_instructions.contains("H bind D <agent-key> <child-thread-id> W [task-key]")
         );
+        assert!(primary_instructions.contains("禁用项目目录"));
+        assert!(primary_instructions.contains(&format!(
+            "workdir=\"{}\"",
+            context.database.parent().unwrap().to_string_lossy()
+        )));
         assert!(primary_instructions.contains("bind 成功"));
         assert!(primary_instructions.contains("task-key"));
         assert!(primary_instructions.contains("禁止猜任务键"));
         assert!(primary_instructions.contains(ORCHESTRATION_RUNTIME_CONTRACT));
         assert!(primary_instructions.contains("父任务必须使用 Auto 或 Workspace"));
+        assert!(primary_instructions.contains("sandbox_permissions=require_escalated"));
         assert!(!primary_instructions.contains("显式传入 model"));
 
         let default_response = context
@@ -6049,11 +6285,29 @@ mod tests {
             Some("保留用户规则")
         );
         assert!(restored.get("agents").is_none());
+        assert_eq!(restored["features"]["multi_agent"].as_bool(), Some(false));
         assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
         assert_eq!(
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap(),
             "# 用户全局规则\n\n保留这段内容。\n"
         );
+        assert!(!exec_policy_path.exists());
+    }
+
+    #[test]
+    fn control_plane_exec_policy_allows_only_owned_database_prefixes() {
+        let helper = Path::new(r"C:\Program Files\Codex Agent Switch\cas-helper.exe");
+        let database = Path::new(r"C:\Users\tester\AppData\Local\CAS\cas.db");
+        let policy = render_control_plane_exec_policy(helper, database);
+
+        assert!(policy.contains(
+            r#"pattern = ["C:\\Program Files\\Codex Agent Switch\\cas-helper.exe", "schedule", "C:\\Users\\tester\\AppData\\Local\\CAS\\cas.db"]"#
+        ));
+        assert!(policy.contains(
+            r#"pattern = ["C:\\Program Files\\Codex Agent Switch\\cas-helper.exe", "bind", "C:\\Users\\tester\\AppData\\Local\\CAS\\cas.db"]"#
+        ));
+        assert!(!policy.contains("\"token\""));
+        assert!(!policy.contains("decision = \"prompt\""));
     }
 
     #[test]
@@ -6147,6 +6401,49 @@ mod tests {
         assert_eq!(fs::read(&global_path).unwrap(), baseline_global);
         assert_eq!(fs::read(&user_agent_path).unwrap(), baseline_agent);
         assert_eq!(fs::read(&user_skill_path).unwrap(), baseline_skill);
+    }
+
+    #[test]
+    fn delegation_gate_uses_existing_global_override_and_restores_both_files_exactly() {
+        let context = TestContext::new();
+        let executor_id = executor_id(&context.database);
+        let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+        let override_path = context.codex_home.join(GLOBAL_OVERRIDE_INSTRUCTIONS_PATH);
+        let global_before = b"# Global user rules\r\n\r\nkeep global\r\n";
+        let override_before = b"# Override user rules\r\n\r\nkeep override  \r\n";
+        fs::write(&global_path, global_before).unwrap();
+        fs::write(&override_path, override_before).unwrap();
+
+        context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: vec![executor_id],
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(&global_path).unwrap(), global_before);
+        let active_override = fs::read_to_string(&override_path).unwrap();
+        assert!(active_override.contains("# Override user rules"));
+        assert!(active_override.contains("keep override"));
+        assert!(active_override.contains("CAS Primary delegation gate"));
+        assert!(active_override.contains("不得因为用户没有逐次写出"));
+        assert!(active_override.contains("CAS Primary 编排协议（"));
+        assert!(active_override.contains("必须委派给 phase=EXECUTION"));
+        assert!(
+            !fs::read_to_string(&global_path)
+                .unwrap()
+                .contains("CAS Primary delegation gate")
+        );
+
+        context
+            .service
+            .switch_runtime_mode(RuntimeModeSwitchRequest {
+                active_agent_ids: Vec::new(),
+            })
+            .unwrap();
+
+        assert_eq!(fs::read(&global_path).unwrap(), global_before);
+        assert_eq!(fs::read(&override_path).unwrap(), override_before);
     }
 
     #[test]
