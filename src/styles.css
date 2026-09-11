@@ -4701,3 +4701,124 @@ html.project-monitor-document #root {
     transition-duration: 0.01ms !important;
   }
 }
+
+.orchestration-tracking {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid hsl(var(--muted) / 0.4);
+  border-radius: 9px;
+}
+
+.orchestration-tracking-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.orchestration-tracking-header h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.orchestration-job-list,
+.orchestration-attempt-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.orchestration-job-row {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid hsl(var(--muted) / 0.32);
+  border-radius: 8px;
+}
+
+.orchestration-job-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.orchestration-job-state {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: hsl(var(--muted) / 0.32);
+}
+
+.orchestration-job-state.state-completed,
+.orchestration-job-state.state-approved {
+  color: hsl(var(--success));
+  background: hsl(var(--success) / 0.12);
+}
+
+.orchestration-job-state.state-failed,
+.orchestration-job-state.state-blocked,
+.orchestration-job-state.state-rejected,
+.orchestration-job-state.state-cancelled {
+  color: hsl(var(--danger));
+  background: hsl(var(--danger) / 0.1);
+}
+
+.orchestration-job-state.state-uncertain,
+.orchestration-job-state.state-review_pending,
+.orchestration-job-state.state-waiting {
+  color: hsl(var(--warning));
+  background: hsl(var(--warning) / 0.1);
+}
+
+.orchestration-job-error {
+  color: hsl(var(--danger));
+}
+
+.orchestration-attempt-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: hsl(var(--muted));
+}
+
+.orchestration-exec-kind.native {
+  color: hsl(var(--success));
+}
+
+.orchestration-exec-kind.managed {
+  color: hsl(var(--info, 210 90% 60%));
+}
+
+.orchestration-exec-kind.unknown {
+  color: hsl(var(--warning));
+}
+
+.orchestration-tracking-more {
+  margin: 0;
+  font-size: 11px;
+  color: hsl(var(--muted));
+}
+
+.orchestration-diagnostics {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+
+.orchestration-diagnostics-output pre {
+  max-width: 100%;
+  max-height: 320px;
+  overflow: auto;
+  padding: 10px;
+  border: 1px solid hsl(var(--muted) / 0.32);
+  border-radius: 8px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

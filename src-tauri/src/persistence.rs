@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 39;
+const LATEST_SCHEMA_VERSION: i64 = 40;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -194,6 +194,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "reviewer_reports",
         include_str!("../migrations/0039_reviewer_reports.sql"),
     ),
+    (
+        40,
+        "cached_input_provenance",
+        include_str!("../migrations/0040_cached_input_provenance.sql"),
+    ),
 ];
 
 pub(crate) fn open_database(path: &Path) -> Result<Connection, PersistenceError> {
@@ -335,7 +340,7 @@ mod tests {
                     |row| { row.get::<_, i64>(0) }
                 )
                 .unwrap(),
-            39
+            40
         );
         assert!(
             fresh
@@ -384,7 +389,7 @@ mod tests {
                     |row| { row.get::<_, i64>(0) }
                 )
                 .unwrap(),
-            39
+            40
         );
         assert_eq!(
             upgraded
@@ -418,7 +423,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            39
+            40
         );
         assert!(
             fresh
@@ -444,7 +449,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            39
+            40
         );
         assert!(
             upgraded

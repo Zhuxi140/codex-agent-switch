@@ -59,6 +59,7 @@ pub(crate) struct OrchestrationAttemptTracking {
     pub(crate) lease_state: Option<String>,
     pub(crate) receipt_stage: Option<String>,
     pub(crate) review_decision: Option<String>,
+    pub(crate) total_tokens: Option<i64>,
     pub(crate) updated_at: String,
 }
 
@@ -185,7 +186,9 @@ fn load_attempt_tracking(
                     (SELECT rv.decision FROM review_decisions rv
                      WHERE rv.attempt_id = a.attempt_id
                      ORDER BY rv.created_at DESC
-                     LIMIT 1)
+                     LIMIT 1),
+                    (SELECT i.total_tokens FROM agent_thread_instances i
+                     WHERE i.id = a.thread_instance_id)
              FROM job_attempts a
              WHERE a.job_id = ?1
              ORDER BY a.attempt_no ASC",
@@ -206,10 +209,147 @@ fn load_attempt_tracking(
                 lease_state: row.get(9)?,
                 receipt_stage: row.get(10)?,
                 review_decision: row.get(11)?,
+                total_tokens: row.get(12)?,
             })
         })
         .map_err(|_| super::persistence_error())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| super::persistence_error())?;
     Ok(attempts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestration_job::OrchestrationJobService;
+
+    fn insert_job(
+        connection: &rusqlite::Connection,
+        job_id: &str,
+        created_at: &str,
+        agent_id: &str,
+    ) {
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (
+                    ?1, 'key-executor', 'Executor', 'desc', 'instruction', 'CUSTOM', 1,
+                    'WORKSPACE_WRITE', 'MEDIUM', 'CAS', 1, ?2, ?2
+                 )",
+                rusqlite::params![agent_id, created_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO agent_schedule_decisions (
+                    id, created_at, source, agent_id, workspace_scope_key, decision,
+                    reason_code, cache_hint
+                 ) VALUES ('decision-1', ?2, 'ORCHESTRATION_EXECUTE_RECOMMENDATION', ?1,
+                    'c:/workspace', 'SPAWN', 'NO_IDLE_CANDIDATE', 'NONE')",
+                rusqlite::params![agent_id, created_at],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id,
+                    workspace_scope_key, task_scope_key, schedule_decision_id, state,
+                    expires_at, agent_type
+                 ) VALUES (
+                    ?3, ?2, ?2, ?1, 'parent-1', 'c:/workspace', 'task-1', 'decision-1',
+                    'RELEASED', '2099-01-01T00:00:00.000Z', 'executor'
+                 )",
+                rusqlite::params![agent_id, created_at, format!("lease-{job_id}")],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO orchestration_jobs (
+                    job_id, idempotency_key, task_packet, task_packet_hash, agent_id,
+                    parent_thread_id, workspace_scope_key, task_scope_key, state,
+                    created_at, updated_at, terminal_at
+                 ) VALUES (
+                    ?1, ?2, '{}', ?3, ?4, 'parent-1', 'c:/workspace', 'task-1',
+                    'COMPLETED', ?5, ?5, ?5
+                 )",
+                rusqlite::params![
+                    job_id,
+                    format!("key-{job_id}"),
+                    format!("{:064}", job_id.len()),
+                    agent_id,
+                    created_at,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO job_attempts (
+                    attempt_id, job_id, attempt_no, schedule_decision_id, lease_id,
+                    route_action, planned_execution_kind, state, created_at, updated_at,
+                    terminal_at
+                 ) VALUES (
+                    ?1, ?2, 1, 'decision-1', ?3, 'SPAWN', 'MANAGED_WORKER',
+                    'SUCCEEDED', ?4, ?4, ?4
+                 )",
+                rusqlite::params![
+                    format!("attempt-{job_id}"),
+                    job_id,
+                    format!("lease-{job_id}"),
+                    created_at
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn list_tracking_paginates_stably_and_keeps_attempt_history() {
+        let service = OrchestrationJobService::in_memory();
+        let connection = service.connection().unwrap();
+        insert_job(&connection, "job-a", "2026-09-11T10:00:00.000Z", "agent-1");
+        insert_job(&connection, "job-b", "2026-09-11T10:01:00.000Z", "agent-1");
+        insert_job(&connection, "job-c", "2026-09-11T10:01:00.000Z", "agent-1");
+        drop(connection);
+
+        let first = service
+            .list_tracking(OrchestrationJobListRequest {
+                workspace_scope_key: Some("c:/workspace".to_owned()),
+                agent_id: None,
+                page: 0,
+                page_size: 2,
+            })
+            .unwrap();
+        assert_eq!(first.total_count, 3);
+        assert_eq!(
+            first
+                .jobs
+                .iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-b", "job-c"]
+        );
+
+        let second = service
+            .list_tracking(OrchestrationJobListRequest {
+                workspace_scope_key: Some("c:/workspace".to_owned()),
+                agent_id: None,
+                page: 1,
+                page_size: 2,
+            })
+            .unwrap();
+        assert_eq!(
+            second
+                .jobs
+                .iter()
+                .map(|job| job.job_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["job-a"]
+        );
+
+        let attempts = &first.jobs[0].attempts;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].state, "SUCCEEDED");
+        assert_eq!(attempts[0].route_action, "SPAWN");
+    }
 }

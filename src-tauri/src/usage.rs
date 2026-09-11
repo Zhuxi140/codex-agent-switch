@@ -951,6 +951,7 @@ pub(crate) struct AgentThreadInstanceResponse {
     last_observed_at: Option<String>,
     task_scope_key: Option<String>,
     closed_at: Option<String>,
+    cached_input_provided: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -991,6 +992,7 @@ pub(crate) struct UsageRecordResponse {
     started_at: String,
     completed_at: Option<String>,
     updated_at: String,
+    cached_input_provided: Option<bool>,
 }
 
 impl From<UsageRecord> for UsageRecordResponse {
@@ -1019,6 +1021,7 @@ impl From<UsageRecord> for UsageRecordResponse {
             started_at: record.started_at,
             completed_at: record.completed_at,
             updated_at: record.updated_at,
+            cached_input_provided: record.cached_input_provided,
         }
     }
 }
@@ -1037,6 +1040,9 @@ pub(crate) struct UsageSnapshot {
     pub(crate) model_name_snapshot: Option<String>,
     pub(crate) input_tokens: i64,
     pub(crate) cached_input_tokens: i64,
+    /// F-02：Some(true/false) 表示 Provider 事件确实提供/未提供 Cached Input；
+    /// None 表示无法证明（历史记录或来源不含该字段）。
+    pub(crate) cached_input_provided: Option<bool>,
     pub(crate) cache_write_input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
@@ -1295,7 +1301,8 @@ impl SqliteUsageRepository {
                     model_id, model_name_snapshot, input_tokens, cached_input_tokens,
                     cache_write_input_tokens, output_tokens, reasoning_output_tokens,
                     total_tokens, model_context_window, usage_status, source,
-                    started_at, completed_at, updated_at, execution_kind
+                    started_at, completed_at, updated_at, execution_kind,
+                    cached_input_provided
              FROM token_usage_records
              WHERE (?1 IS NULL OR agent_id = ?1)
                AND (?2 IS NULL OR provider_id = ?2)
@@ -1336,7 +1343,8 @@ impl SqliteUsageRepository {
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason, execution_kind
+                    reuse_state, reuse_state_reason, execution_kind,
+                    cached_input_provided
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
                AND (
@@ -1416,7 +1424,8 @@ impl SqliteUsageRepository {
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason, execution_kind
+                    reuse_state, reuse_state_reason, execution_kind,
+                        cached_input_provided
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -1436,7 +1445,8 @@ impl SqliteUsageRepository {
                         total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                         created_at, last_used_at, closed_at, last_model_usage_at,
                         last_observed_at, task_scope_key, reuse_state, reuse_state_reason,
-                        execution_kind
+                        execution_kind,
+                        cached_input_provided
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -1457,7 +1467,7 @@ impl SqliteUsageRepository {
                         total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                         created_at, last_used_at, closed_at, last_model_usage_at,
                         last_observed_at, task_scope_key, reuse_state, reuse_state_reason,
-                        execution_kind,
+                        execution_kind, cached_input_provided,
                         CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                         CASE WHEN claimed_until IS NOT NULL
                                   AND julianday(claimed_until) > julianday('now')
@@ -1479,8 +1489,8 @@ impl SqliteUsageRepository {
                         current_context_tokens: instance.current_context_tokens,
                         context_window: instance.context_window,
                         runtime_fingerprint: instance.runtime_fingerprint,
-                        age_seconds: row.get(23)?,
-                        claimed: row.get(24)?,
+                        age_seconds: row.get(24)?,
+                        claimed: row.get(25)?,
                     })
                 },
             )
@@ -1535,7 +1545,7 @@ impl SqliteUsageRepository {
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason, execution_kind,
+                    reuse_state, reuse_state_reason, execution_kind, cached_input_provided,
                     CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                     CASE WHEN claimed_until IS NOT NULL
                               AND julianday(claimed_until) > julianday('now')
@@ -1571,8 +1581,8 @@ impl SqliteUsageRepository {
                     context_window: instance.context_window,
                     runtime_fingerprint: instance.runtime_fingerprint,
                     reuse_state: instance.reuse_state,
-                    age_seconds: row.get(23)?,
-                    claimed: row.get(24)?,
+                    age_seconds: row.get(24)?,
+                    claimed: row.get(25)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1946,12 +1956,13 @@ impl SqliteUsageRepository {
                 id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                 scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                 total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                last_model_usage_at, last_observed_at, task_scope_key, execution_kind
+                last_model_usage_at, last_observed_at, task_scope_key, execution_kind,
+                cached_input_provided
              ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 0, NULL, NULL, ?8,
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL,
-                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?9, 'MANAGED_WORKER'
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?9, 'MANAGED_WORKER', NULL
              )
              ON CONFLICT(codex_thread_id) DO UPDATE SET
                 parent_thread_id = COALESCE(
@@ -2405,14 +2416,15 @@ fn upsert_native_agent_instance(
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, reuse_state, reuse_state_reason,
-                    execution_kind
+                    execution_kind, cached_input_provided
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13,
             CASE WHEN ?7 = 'CLOSED' THEN ?13 ELSE NULL END,
             NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             CASE WHEN ?7 = 'CLOSED' THEN 'RETIRED' ELSE 'ACTIVE' END,
             CASE WHEN ?7 = 'CLOSED' THEN 'THREAD_CLOSED' ELSE NULL END,
-            'OBSERVED_EXTERNAL'
+            'OBSERVED_EXTERNAL',
+            NULL
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = excluded.agent_id,
@@ -2516,6 +2528,7 @@ fn map_agent_thread_instance(
         last_observed_at: row.get(18)?,
         task_scope_key: row.get(19)?,
         closed_at: row.get(16)?,
+        cached_input_provided: row.get::<_, Option<i64>>(23)?.map(|value| value != 0),
     })
 }
 
@@ -2545,6 +2558,8 @@ struct UsageRecord {
     started_at: String,
     completed_at: Option<String>,
     updated_at: String,
+    /// F-02：最近一次事件是否真的提供了 Cached Input；None 表示无法证明。
+    cached_input_provided: Option<bool>,
 }
 
 fn execution_kind_from_storage(value: String) -> rusqlite::Result<ExecutionKind> {
@@ -2595,6 +2610,7 @@ impl UsageRecord {
             started_at: snapshot.started_at,
             completed_at: snapshot.completed_at,
             updated_at: snapshot.updated_at,
+            cached_input_provided: snapshot.cached_input_provided,
         }
     }
 }
@@ -2610,7 +2626,8 @@ fn find_by_thread(
                     model_id, model_name_snapshot, input_tokens, cached_input_tokens,
                     cache_write_input_tokens, output_tokens, reasoning_output_tokens,
                     total_tokens, model_context_window, usage_status, source,
-                    started_at, completed_at, updated_at, execution_kind
+                    started_at, completed_at, updated_at, execution_kind,
+                    cached_input_provided
              FROM token_usage_records
              WHERE codex_thread_id = ?1",
             [thread_id],
@@ -2646,6 +2663,7 @@ fn map_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         completed_at: row.get(20)?,
         updated_at: row.get(21)?,
         execution_kind: execution_kind_from_storage(row.get(22)?)?,
+        cached_input_provided: row.get(23)?,
     })
 }
 
@@ -2660,10 +2678,10 @@ fn insert_record(
             model_id, model_name_snapshot, input_tokens, cached_input_tokens,
             cache_write_input_tokens, output_tokens, reasoning_output_tokens,
             total_tokens, model_context_window, usage_status, source,
-            started_at, completed_at, updated_at, execution_kind
+            started_at, completed_at, updated_at, execution_kind, cached_input_provided
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
          )",
         usage_record_params(record),
     )?;
@@ -2697,14 +2715,15 @@ fn update_record(
              started_at = ?20,
              completed_at = ?21,
              updated_at = ?22,
-             execution_kind = ?23
+             execution_kind = ?23,
+             cached_input_provided = ?24
          WHERE id = ?1",
         usage_record_params(record),
     )?;
     Ok(())
 }
 
-fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 23] {
+fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 24] {
     [
         &record.id,
         &record.codex_session_id,
@@ -2729,6 +2748,7 @@ fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 23] {
         &record.completed_at,
         &record.updated_at,
         execution_kind_sql(record.execution_kind),
+        &record.cached_input_provided,
     ]
 }
 
@@ -2762,12 +2782,16 @@ fn sync_agent_thread_instance(
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
             total_tokens, current_context_tokens, context_window, created_at, last_used_at, closed_at,
-            last_model_usage_at, last_observed_at, execution_kind
+            last_model_usage_at, last_observed_at, execution_kind, cached_input_provided
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL,
-            ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?16
+            ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?16, ?17
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
+            cached_input_provided = COALESCE(
+                excluded.cached_input_provided,
+                agent_thread_instances.cached_input_provided
+            ),
             agent_id = COALESCE(agent_thread_instances.agent_id, excluded.agent_id),
             agent_name_snapshot = COALESCE(
                 excluded.agent_name_snapshot,
@@ -2821,6 +2845,7 @@ fn sync_agent_thread_instance(
             record.updated_at,
             current_context_is_fresh,
             execution_kind_storage(record.execution_kind),
+            record.cached_input_provided,
         ],
     )?;
     Ok(())
@@ -2869,6 +2894,8 @@ fn merge_snapshot(mut record: UsageRecord, snapshot: UsageSnapshot) -> UsageReco
     if !keep_final_status {
         record.usage_status = snapshot.usage_status;
         record.completed_at = snapshot.completed_at;
+        // F-02：以最新事件为准刷新 Cached Input 提供状态；历史未知 (None) 不回填。
+        record.cached_input_provided = snapshot.cached_input_provided;
     }
     record.updated_at = snapshot.updated_at;
     record
@@ -3246,6 +3273,39 @@ mod tests {
             Some("2026-08-11T10:01:00Z")
         );
         assert!(instances[0].last_observed_at.is_some());
+    }
+
+    #[test]
+    fn missing_cached_input_is_marked_not_provided_and_never_zero_fact() {
+        // F-02：Provider 未返回 Cached Input 时，数值可以为 0，但 provenance
+        // 必须是「未提供」，展示层不得把缺失冒充为事实 0。
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+
+        let mut missing = snapshot(100, "FINAL");
+        missing.cached_input_tokens = 0;
+        missing.cached_input_provided = Some(false);
+        service.upsert_snapshot(missing).unwrap();
+
+        let items = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap()
+            .items;
+        assert_eq!(items[0].cached_input_tokens, 0);
+        assert_eq!(items[0].cached_input_provided, Some(false));
+
+        // 后续事件真正提供了 Cached Input 后，provenance 以最新事件为准。
+        let mut provided = snapshot(160, "FINAL");
+        provided.cached_input_tokens = 40;
+        provided.cached_input_provided = Some(true);
+        service.upsert_snapshot(provided).unwrap();
+
+        let items = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap()
+            .items;
+        assert_eq!(items[0].cached_input_tokens, 40);
+        assert_eq!(items[0].cached_input_provided, Some(true));
     }
 
     #[test]
@@ -4597,6 +4657,7 @@ mod tests {
             model_name_snapshot: Some("DeepSeek V4 Flash".to_owned()),
             input_tokens: (total_tokens - 20).max(0),
             cached_input_tokens: (total_tokens - 60).max(0),
+            cached_input_provided: Some(true),
             cache_write_input_tokens: 0,
             output_tokens: total_tokens.min(20),
             reasoning_output_tokens: total_tokens.min(5),

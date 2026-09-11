@@ -51,6 +51,9 @@ pub(crate) struct NormalizedTurn {
 pub(crate) struct NormalizedUsage {
     pub(crate) input_tokens: i64,
     pub(crate) cached_input_tokens: i64,
+    /// F-02：Provider 事件是否真的提供了 Cached Input 字段。缺失时数值为 0
+    /// 但此标志为 false，存储与展示不得把「未提供」冒充为「0」。
+    pub(crate) cached_input_provided: bool,
     pub(crate) cache_write_input_tokens: i64,
     pub(crate) output_tokens: i64,
     pub(crate) reasoning_output_tokens: i64,
@@ -301,6 +304,7 @@ fn parse_token_breakdown(
         NormalizedUsage {
             input_tokens,
             cached_input_tokens: cached.unwrap_or(0),
+            cached_input_provided: cached.is_some(),
             cache_write_input_tokens: cache_write.unwrap_or(0),
             output_tokens,
             reasoning_output_tokens: reasoning.unwrap_or(0),

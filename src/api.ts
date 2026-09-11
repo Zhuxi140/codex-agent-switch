@@ -347,6 +347,59 @@ export function getOrchestrationJob(
   });
 }
 
+export interface OrchestrationJobListRequest {
+  workspaceScopeKey: string | null;
+  agentId: string | null;
+  page: number;
+  pageSize: number;
+}
+
+export interface OrchestrationAttemptTracking {
+  attemptId: string;
+  attemptNo: number;
+  state: string;
+  routeAction: string;
+  plannedExecutionKind: string;
+  executionKind: string | null;
+  codexThreadId: string | null;
+  codexTurnId: string | null;
+  leaseState: string | null;
+  receiptStage: string | null;
+  reviewDecision: string | null;
+  totalTokens: number | null;
+  updatedAt: string;
+}
+
+export interface OrchestrationJobTracking {
+  jobId: string;
+  idempotencyKey: string;
+  state: string;
+  agentId: string;
+  parentThreadId: string;
+  workspaceScopeKey: string;
+  taskScopeKey: string;
+  lastErrorCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+  terminalAt: string | null;
+  attempts: OrchestrationAttemptTracking[];
+}
+
+export interface OrchestrationJobPageResponse {
+  jobs: OrchestrationJobTracking[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+}
+
+export function listOrchestrationJobs(
+  request: OrchestrationJobListRequest,
+): Promise<OrchestrationJobPageResponse> {
+  return invoke<OrchestrationJobPageResponse>("orchestration_job_list", {
+    request,
+  });
+}
+
 export function reviewOrchestrationJob(
   request: OrchestrationJobReviewRequest,
 ): Promise<OrchestrationJobReviewResponse> {
@@ -1001,6 +1054,7 @@ export interface UsageRecordResponse {
   completedAt: string | null;
   updatedAt: string;
   executionKind: ExecutionKind;
+  cachedInputProvided: boolean | null;
 }
 
 export type AgentThreadInstanceStatus =
@@ -1406,4 +1460,8 @@ export function startManagedUsageTurn(
   return invoke<ManagedTurnStartResponse>("usage_managed_turn_start", {
     request: { threadId, input },
   });
+}
+
+export function orchestrationDiagnosticsExport(): Promise<string> {
+  return invoke<string>("orchestration_diagnostics_export");
 }

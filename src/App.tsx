@@ -41,7 +41,9 @@ import {
   listProviders,
   listProjectExclusions,
   listSnapshots,
+  listOrchestrationJobs,
   listUsageRecords,
+  orchestrationDiagnosticsExport,
   openProjectMonitor,
   recommendAgentThreadInstance,
   redetectCodex,
@@ -74,6 +76,7 @@ import {
   type AgentThreadInstanceRecommendation,
   type AgentThreadInstanceStatus,
   type AgentThreadProjectSummaryResponse,
+  type OrchestrationJobPageResponse,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
   type CodexMcpServerResponse,
@@ -2770,6 +2773,7 @@ function AgentThreadProjectOverview({
             {loading ? "同步中…" : "同步原生状态"}
           </button>
         </div>
+        <OrchestrationDiagnosticsExportButton />
       </header>
 
       {error && <div className="inline-error" role="alert">{error}</div>}
@@ -2834,6 +2838,152 @@ function AgentThreadProjectOverview({
         </div>
       )}
     </section>
+  );
+}
+
+function OrchestrationDiagnosticsExportButton() {
+  const [text, setText] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const exportDiagnostics = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      setText(await orchestrationDiagnosticsExport());
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="orchestration-diagnostics">
+      <button
+        className="secondary-button"
+        disabled={busy}
+        onClick={() => void exportDiagnostics()}
+        type="button"
+      >
+        {busy ? "导出中…" : "导出诊断包"}
+      </button>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {text && (
+        <details className="orchestration-diagnostics-output">
+          <summary>诊断包已生成（脱敏 JSON，可复制）</summary>
+          <div className="orchestration-diagnostics-actions">
+            <CopyIconButton label="复制诊断包" value={text} />
+          </div>
+          <pre>{text}</pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function OrchestrationJobTrackingSection({
+  workspaceScopeKey,
+}: {
+  workspaceScopeKey: string | null;
+}) {
+  const [page, setPage] = useState<OrchestrationJobPageResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setPage(null);
+    setError(null);
+    try {
+      const loaded = await listOrchestrationJobs({
+        workspaceScopeKey: workspaceScopeKey ?? "",
+        agentId: null,
+        page: 0,
+        pageSize: 20,
+      });
+      setPage(loaded);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    }
+  }, [workspaceScopeKey]);
+
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => void load(true), 5000);
+    return () => window.clearInterval(timer);
+  }, [load]);
+
+  return (
+    <div className="orchestration-tracking" aria-label="编排任务追踪">
+      <div className="orchestration-tracking-header">
+        <h3>编排任务（Runtime First）</h3>
+        <button
+          className="secondary-button"
+          onClick={() => void load()}
+          type="button"
+        >
+          刷新
+        </button>
+      </div>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {page && page.jobs.length === 0 && (
+        <p className="empty-copy">该项目当前没有编排 Job 记录。</p>
+      )}
+      {page && page.jobs.length > 0 && (
+        <ul className="orchestration-job-list">
+          {page.jobs.map((job) => (
+            <li key={job.jobId} className="orchestration-job-row">
+              <div className="orchestration-job-main">
+                <span className={`orchestration-job-state state-${job.state.toLowerCase()}`}>
+                  {job.state}
+                </span>
+                <span className="orchestration-job-scope">
+                  task <code>{job.taskScopeKey}</code>
+                </span>
+                {job.lastErrorCode && (
+                  <span className="orchestration-job-error">{job.lastErrorCode}</span>
+                )}
+              </div>
+              <ul className="orchestration-attempt-list">
+                {job.attempts.map((attempt) => (
+                  <li key={attempt.attemptId} className="orchestration-attempt-row">
+                    <span className="orchestration-attempt-no">#{attempt.attemptNo}</span>
+                    <span>{attempt.routeAction}</span>
+                    <span
+                      className={attempt.executionKind === "NATIVE_CHILD"
+                        ? "orchestration-exec-kind native"
+                        : attempt.executionKind === "MANAGED_WORKER"
+                          ? "orchestration-exec-kind managed"
+                          : "orchestration-exec-kind unknown"}
+                    >
+                      {attempt.executionKind ?? "身份未证明"}
+                    </span>
+                    <span>{attempt.plannedExecutionKind}</span>
+                    {attempt.codexThreadId && (
+                      <Tooltip content={attempt.codexThreadId} label="Child Thread ID">
+                        <code className="orchestration-thread-id">
+                          {attempt.codexThreadId.slice(0, 12)}…
+                        </code>
+                      </Tooltip>
+                    )}
+                    {attempt.leaseState && <span>Lease {attempt.leaseState}</span>}
+                    <span>Receipt {attempt.receiptStage ?? "UNKNOWN"}</span>
+                    <span>
+                      Review {attempt.reviewDecision ?? "PENDING"}
+                    </span>
+                    <span>{formatTokenCount(attempt.totalTokens ?? 0)} Tokens</span>
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
+        </ul>
+      )}
+      {page && page.totalCount > page.jobs.length && (
+        <p className="orchestration-tracking-more">
+          仅显示最近 {page.jobs.length}/{page.totalCount} 个 Job。
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -3067,6 +3217,7 @@ function AgentThreadProjectDetail({
           />
         </div>
       </header>
+      <OrchestrationJobTrackingSection workspaceScopeKey={project.workspaceScopeKey} />
 
       {error && <div className="inline-error" role="alert">{error}</div>}
       {cleanupMessage && <div className="inline-success" role="status">{cleanupMessage}</div>}

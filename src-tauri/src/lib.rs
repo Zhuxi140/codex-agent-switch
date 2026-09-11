@@ -5,6 +5,7 @@ mod codex_hooks;
 mod codex_schema_probe;
 mod configuration;
 mod delivery_receipt;
+mod diagnostics;
 mod domain;
 mod model;
 mod orchestration_contract;
@@ -47,10 +48,10 @@ use model::{
 };
 use orchestration_job::{
     OrchestrationJobCreateRequest, OrchestrationJobCreateResponse, OrchestrationJobDetailResponse,
-    OrchestrationJobGetRequest, OrchestrationJobReviewRequest, OrchestrationJobReviewResponse,
-    OrchestrationJobService, OrchestrationReviewerCreateRequest,
-    OrchestrationReviewerCreateResponse, OrchestrationReviewerReport,
-    OrchestrationReviewerReportSubmitRequest,
+    OrchestrationJobGetRequest, OrchestrationJobListRequest, OrchestrationJobPageResponse,
+    OrchestrationJobReviewRequest, OrchestrationJobReviewResponse, OrchestrationJobService,
+    OrchestrationReviewerCreateRequest, OrchestrationReviewerCreateResponse,
+    OrchestrationReviewerReport, OrchestrationReviewerReportSubmitRequest,
 };
 use provider::{
     ApiError, DeleteResult, ProviderCreateRequest, ProviderDeleteRequest, ProviderDetailResponse,
@@ -833,11 +834,33 @@ fn orchestration_reviewer_create(
 }
 
 #[tauri::command]
+fn orchestration_job_list(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationJobListRequest,
+) -> Result<OrchestrationJobPageResponse, orchestration_contract::OrchestrationError> {
+    service.list_tracking(request)
+}
+
+#[tauri::command]
 fn orchestration_reviewer_report_submit(
     service: tauri::State<'_, OrchestrationJobService>,
     request: OrchestrationReviewerReportSubmitRequest,
 ) -> Result<OrchestrationReviewerReport, orchestration_contract::OrchestrationError> {
     service.submit_reviewer_report(request)
+}
+
+#[tauri::command]
+fn orchestration_diagnostics_export(
+    service: tauri::State<'_, diagnostics::DiagnosticsService>,
+) -> Result<String, ApiError> {
+    service.export().map_err(|_| {
+        ApiError::new(
+            "DIAGNOSTICS_EXPORT_FAILED",
+            "诊断包导出失败；Runtime 状态未被修改。",
+            true,
+            None,
+        )
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -856,6 +879,7 @@ pub fn run() {
             app.manage(ConfigurationService::open(&database_path, &data_home)?);
             app.manage(OrchestrationJobService::open(&database_path)?);
             app.manage(DeliveryReceiptRepository::open(&database_path)?);
+            app.manage(diagnostics::DiagnosticsService::open(&database_path)?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -927,7 +951,9 @@ pub fn run() {
             usage_managed_turn_start,
             orchestration_job_create,
             orchestration_job_get,
+            orchestration_job_list,
             orchestration_job_review,
+            orchestration_diagnostics_export,
             orchestration_reviewer_create,
             orchestration_reviewer_report_submit
         ])

@@ -2112,6 +2112,7 @@ fn usage_snapshot(
         model_name_snapshot: attribution.map(|value| value.model_name.clone()),
         input_tokens: usage.input_tokens,
         cached_input_tokens: usage.cached_input_tokens,
+        cached_input_provided: Some(usage.cached_input_provided),
         cache_write_input_tokens: usage.cache_write_input_tokens,
         output_tokens: usage.output_tokens,
         reasoning_output_tokens: usage.reasoning_output_tokens,
@@ -3168,6 +3169,7 @@ mod tests {
             .observe(NormalizedRuntimeEvent::Usage {
                 thread_id: "child".to_owned(),
                 usage: NormalizedUsage {
+                    cached_input_provided: true,
                     input_tokens: 100,
                     cached_input_tokens: 80,
                     cache_write_input_tokens: 0,
@@ -3216,6 +3218,7 @@ mod tests {
             .observe(NormalizedRuntimeEvent::Usage {
                 thread_id: "managed-thread".to_owned(),
                 usage: NormalizedUsage {
+                    cached_input_provided: true,
                     input_tokens: 10,
                     cached_input_tokens: 0,
                     cache_write_input_tokens: 0,

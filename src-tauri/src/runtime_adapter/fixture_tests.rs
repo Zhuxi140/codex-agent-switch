@@ -103,6 +103,27 @@ fn future_fields_are_ignored_without_losing_known_usage() {
 }
 
 #[test]
+fn cached_input_provenance_tracks_provider_field_presence() {
+    // F-02：事件缺少 cachedInputTokens 时数值为 0 但必须标记为「未提供」。
+    let missing = parse_event(&fixture("future-usage-event.json"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(missing, NormalizedRuntimeEvent::Usage { ref usage, .. } if usage.cached_input_tokens == 0 && !usage.cached_input_provided)
+    );
+
+    let present = events(MODERN_EVENTS)
+        .iter()
+        .filter_map(|value| parse_event(value).unwrap())
+        .find_map(|event| match event {
+            NormalizedRuntimeEvent::Usage { usage, .. } if usage.input_tokens == 100 => Some(usage),
+            _ => None,
+        })
+        .unwrap();
+    assert!(present.cached_input_tokens == 20 && present.cached_input_provided);
+}
+
+#[test]
 fn missing_critical_ids_fail_closed() {
     assert_eq!(
         parse_thread_response(&fixture("missing-thread-id.json")),

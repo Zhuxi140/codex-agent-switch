@@ -15,10 +15,7 @@ pub(crate) mod query;
 mod review;
 mod reviewer;
 mod schedule;
-pub(crate) use query::{
-    OrchestrationAttemptTracking, OrchestrationJobListRequest, OrchestrationJobPageResponse,
-    OrchestrationJobTracking,
-};
+pub(crate) use query::{OrchestrationJobListRequest, OrchestrationJobPageResponse};
 pub(crate) use review::{OrchestrationJobReviewRequest, OrchestrationJobReviewResponse};
 pub(crate) use reviewer::{
     OrchestrationReviewerCreateRequest, OrchestrationReviewerCreateResponse,
