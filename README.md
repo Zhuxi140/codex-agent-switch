@@ -74,22 +74,18 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
 
-### 当前主分支开发验证（2026-09-02）
+### 当前主分支开发验证（2026-09-11）
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 210 passed、0 failed、8 ignored |
+| Rust Workspace 测试 | cas-scheduler 72、cas-helper 28、主 lib 255，共 0 failed（7 个真实 E2E 除外） |
 | 前端生产构建 | 通过 |
-| Diff 检查 | 通过 |
-| Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 通过（`gpt-5.6-terra`） |
-| Codex Native RC-2：并发与失配调度矩阵 | 通过（`gpt-5.6-terra`） |
-| Codex Native Phase 12：空闲/运行中断流 → 同 Primary 恢复 | 通过（`gpt-5.6-terra`，原 Turn 未重放） |
-| Phase 12：启动失败 / 连续恢复失败上限 | 通过（`FAILED` 状态闭环、3 次硬上限） |
-| Phase 13A / 13B：配置同源状态与 Default 往返 | 隔离回归通过（两轮往返、重复 Default、用户文件逐字节保留） |
-| 子 Agent 自动委派协议与 Hook 信任状态 | 完整 AGENTS 协议投影、V1 Feature 和 Default 精确恢复回归通过；真实模型委派 E2E 待重新同步并重启后复验 |
-| Windows 项目监控浮窗：打开 → 隐藏 → 重新打开 → 状态恢复 | 真实桌面端验证通过，且保持单实例 |
+| V-01 多版本 Adapter 契约矩阵 | Modern + 较早别名 + Unsupported Fixture 共 13 格可重复报告通过 |
+| Runtime First R0～Phase F | 契约冻结、Adapter/Session Registry、TaskPacket/Job/幂等、原子调度、Receipt/Review/Release、Runtime Enforcement、AGENTS 去侵入、可观察性与脱敏诊断全部落地（见 docs/orchestration 实施记录） |
+| Codex Native RC-1：Primary → SPAWN → bind → IDLE → REUSE | 2026-09-11 重试被 ChatGPT 用量限额拦截（`TURN_FAILED`，重置于 13:57）；链路至 Turn 派发正常，证据已留存，限额重置后待重试 |
+| Codex Native RC-2 / Phase 12 真实矩阵 | 与 RC-1 同因待重试 |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限、紧凑编排提示词，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E。Phase 13A/13B 进一步让概览从一个后端响应读取配置状态、运行模式与活动事务，并补齐 Default 往返的精确保留回归。本次开发修复把可独立执行的完整 Primary 协议同步到全局 AGENTS，以兼容 Codex Desktop 覆盖配置级 `developer_instructions` 的场景；同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态。只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件，避免 PATH 旧副本代表桌面客户端。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、`bind` 身份固化、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E 脚本。Runtime First 改造（R0～Phase F）进一步落地：冻结的 TaskPacket/Job/Attempt 契约与幂等语义、按 Thread 的 Session Registry、原子调度事务（硬门槛 + 软评分 + Agent Type Lease）、四阶段 Delivery Receipt、Primary Review Gate 与 `HELD_FOR_REVIEW`、Revision Attempt、可选只读 Reviewer、Runtime Hook Admission 接线、AGENTS 最小兼容片段迁移、三态生效提示、Job 分层追踪查询与脱敏诊断包。同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态；只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。它仍是开发快照，不应当作新的 Release 安装包分发。
 
 当前 workspace 的 8 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 5 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
@@ -174,7 +170,7 @@ CAS 不复制或改写用户全局 MCP 的命令、环境变量、凭据与 OAut
 
 静态配置仍不替代单次任务授权：CAS 写入 Child 指令的 `TOOLS` 契约，只允许调用 TASK `TOOLS` 明列且完成验收必需的外部工具；`TOOLS: -` 表示禁用，外部写入还必须同时获得 `ALLOW` 明确许可。Discovery 与 Review 的外部工具保持只读，Verification 也不得制造未授权外部状态。CAS 选中的内置 Skill 通过 `skills.config` 投影，并按任务匹配和 Agent 显式绑定规则渐进加载；Primary 不把完整 Skill 内容复制进委派 prompt。
 
-Primary 专属协议会同步到两个位置：`config.toml` 的 `developer_instructions` 服务于 CLI 和保留该字段的客户端；当前真正生效的全局 `AGENTS.md` 或 `AGENTS.override.md` 则携带一份可独立执行的完整协议，覆盖 Codex Desktop 用宿主指令遮蔽配置字段的场景。两份投影来自同一个渲染结果，不允许漂移。整个 CAS 管理块都明确限定为 Primary/root 专用；Child 必须忽略它，并继续只执行 `agents/cas-*.toml` 中更高优先级的职责边界。CAS 会保留用户原有内容，切回 Default 时只移除带标记的 CAS 管理块并逐字节恢复基线。
+Primary 专属协议以最小兼容片段同步到两个位置：`config.toml` 的 `developer_instructions` 与全局 `AGENTS.md`/`AGENTS.override.md` 中带标记的 CAS 管理块，来自同一渲染结果、不允许漂移。片段只保留调用契约（`schedule` 决策语法、`bind`、spawn prompt 骨架）、失败策略、`CAS:OFF`/`CAS:ON` 对话逃生口与 Primary/Child 边界；排除判定、Agent 可用性、复用、并发、租约与恢复全部由 Runtime Hook 与调度数据库证明，提示词不再承担强制职责。整个 CAS 管理块限定为 Primary/root 专用；Child 必须忽略它。CAS 保留用户原有内容，切回 Default 时只移除带标记的 CAS 管理块并逐字节恢复基线；旧版完整协议会在下一次 Apply 时整块迁移为最小片段。
 
 失败策略可选：
 
@@ -225,9 +221,8 @@ Primary 专属协议会同步到两个位置：`config.toml` 的 `developer_inst
 
 ## Roadmap（下一阶段：v0.5 RC）
 
-- **真实编排闭环（RC-1 已完成）**：Codex Native 已固定验证 Primary → SPAWN → bind → IDLE → REUSE → follow-up，并核对父子 Thread、Token 与决策日志。
-- **并发与失配矩阵（RC-2 已完成）**：同任务并发返回唯一 SPAWN 与 WAIT；Task Scope、Runtime Fingerprint、Workspace 或 Context 变化时稳定拒绝旧 Thread，并给出 SPAWN 建议。
-- **恢复能力（Runtime Bridge 当前版本矩阵已完成）**：空闲/运行中断流、启动失败与恢复上限已闭环；Default 往返已完成隔离文件系统回归，继续覆盖真实干净目录、项目排除、配置冲突、凭据清理重试、旧数据库升级和本地多 Codex 版本样本。
+- **Runtime First 改造（R0～Phase F 已完成）**：TaskPacket/Job/Attempt 契约、Session Registry、原子调度、Receipt/Review/Release、Runtime Enforcement 与 AGENTS 去侵入、可观察性与脱敏诊断已全部落地；实施记录见 docs/orchestration。
+- **真实编排闭环（历史 RC-1 已通过；2026-09-11 复验被限额拦截）**：链路至 Turn 派发正常，模型调用被 ChatGPT 账户用量限额拒绝（当日 13:57 重置）；待限额重置后重试 RC-1/RC-2/Phase 12。
 - **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
 - **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
 

@@ -513,3 +513,7 @@ impl fmt::Display for ProtocolParseError {
 #[cfg(test)]
 #[path = "runtime_adapter/fixture_tests.rs"]
 mod fixture_tests;
+
+#[cfg(test)]
+#[path = "runtime_adapter/contract_matrix_tests.rs"]
+mod contract_matrix_tests;
