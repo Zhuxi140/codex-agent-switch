@@ -1,0 +1,8 @@
+{
+  "thread": {
+    "id": "thread-modern-001",
+    "sessionId": "session-modern-001",
+    "futureField": {"preservedByProtocol": true}
+  },
+  "futureEnvelopeField": "ignored"
+}

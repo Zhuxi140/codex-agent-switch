@@ -26,6 +26,7 @@ const instance: AgentThreadInstanceResponse = {
   agentNameSnapshot: "Codex Native / Executor",
   codexThreadId: "019ffb28-0000-7000-8000-123456789abc",
   parentThreadId: "019ffb15-0000-7000-8000-123456789abc",
+  executionKind: "OBSERVED_EXTERNAL",
   workspaceScopeKey: project.workspaceScopeKey,
   status: "RUNNING",
   reuseState: "ACTIVE",

@@ -1,0 +1,1 @@
+{"type":"object","required":["threadId","input"],"properties":{"threadId":{},"input":{}}}

@@ -1,3 +1,7 @@
+pub mod hard_gates;
+pub mod runtime_policy;
+pub mod scoring;
+
 /// REUSE 短租约时长：覆盖「预检返回 REUSE」到「follow-up 使 Thread 进入 RUNNING」的窗口。
 // ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
 pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;

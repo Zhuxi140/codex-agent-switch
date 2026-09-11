@@ -332,3 +332,7 @@ mod tests {
         let _ = fs::remove_dir_all(missing);
     }
 }
+
+#[cfg(test)]
+#[path = "codex_schema_probe/fixture_tests.rs"]
+mod fixture_tests;

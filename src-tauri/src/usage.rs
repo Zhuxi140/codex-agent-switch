@@ -18,12 +18,14 @@ use cas_scheduler::{
 use cas_scheduler::{
     cache_hint, context_pressure_limit, effective_cache_retention, effective_reuse_strategy,
 };
+use rusqlite::types::Type;
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::orchestration_contract::ExecutionKind;
 use crate::persistence::{PersistenceError, open_database};
 use crate::provider::ApiError;
 
@@ -222,6 +224,13 @@ impl UsageService {
             return repository
                 .set_agent_instance_reuse_state(&thread_id, "ACTIVE", None)
                 .map_err(ApiError::from);
+        }
+        if instance.execution_kind != ExecutionKind::ManagedWorker {
+            return Err(UsageServiceError::ReuseRestoreBlocked(
+                "EXECUTION_KIND_UNSUPPORTED",
+                "只有 CAS 托管的 MANAGED_WORKER Thread 可以进入复用池。",
+            )
+            .into());
         }
         if instance.status != "IDLE" {
             return Err(UsageServiceError::ReuseRestoreBlocked(
@@ -477,12 +486,14 @@ impl UsageService {
         &self,
         profile: &AgentRuntimeProfile,
         thread_id: &str,
+        parent_thread_id: &str,
         scope_key: &str,
         task_scope_key: Option<&str>,
     ) -> Result<(), UsageServiceError> {
         self.repository()?.register_agent_execution_thread(
             profile,
             thread_id,
+            parent_thread_id,
             scope_key,
             task_scope_key,
             "IDLE",
@@ -922,6 +933,7 @@ pub(crate) struct AgentThreadInstanceResponse {
     agent_name_snapshot: Option<String>,
     codex_thread_id: String,
     parent_thread_id: Option<String>,
+    execution_kind: ExecutionKind,
     workspace_scope_key: Option<String>,
     status: String,
     reuse_state: String,
@@ -960,6 +972,7 @@ pub(crate) struct UsageRecordResponse {
     codex_session_id: String,
     codex_thread_id: String,
     parent_thread_id: Option<String>,
+    execution_kind: ExecutionKind,
     agent_id: Option<String>,
     agent_name_snapshot: Option<String>,
     provider_id: Option<String>,
@@ -987,6 +1000,7 @@ impl From<UsageRecord> for UsageRecordResponse {
             codex_session_id: record.codex_session_id,
             codex_thread_id: record.codex_thread_id,
             parent_thread_id: record.parent_thread_id,
+            execution_kind: record.execution_kind,
             agent_id: record.agent_id,
             agent_name_snapshot: record.agent_name_snapshot,
             provider_id: record.provider_id,
@@ -1014,6 +1028,7 @@ pub(crate) struct UsageSnapshot {
     pub(crate) codex_session_id: String,
     pub(crate) codex_thread_id: String,
     pub(crate) parent_thread_id: Option<String>,
+    pub(crate) execution_kind: ExecutionKind,
     pub(crate) agent_id: Option<String>,
     pub(crate) agent_name_snapshot: Option<String>,
     pub(crate) provider_id: Option<String>,
@@ -1139,6 +1154,7 @@ impl SqliteUsageRepository {
                         existing.parent_thread_id.as_deref(),
                         snapshot.parent_thread_id.as_deref(),
                     )
+                    || existing.execution_kind != snapshot.execution_kind
                 {
                     return Err(UsageServiceError::ThreadIdentityConflict);
                 }
@@ -1279,7 +1295,7 @@ impl SqliteUsageRepository {
                     model_id, model_name_snapshot, input_tokens, cached_input_tokens,
                     cache_write_input_tokens, output_tokens, reasoning_output_tokens,
                     total_tokens, model_context_window, usage_status, source,
-                    started_at, completed_at, updated_at
+                    started_at, completed_at, updated_at, execution_kind
              FROM token_usage_records
              WHERE (?1 IS NULL OR agent_id = ?1)
                AND (?2 IS NULL OR provider_id = ?2)
@@ -1320,7 +1336,7 @@ impl SqliteUsageRepository {
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason
+                    reuse_state, reuse_state_reason, execution_kind
              FROM agent_thread_instances
              WHERE (?1 IS NULL OR agent_id = ?1)
                AND (
@@ -1400,7 +1416,7 @@ impl SqliteUsageRepository {
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason
+                    reuse_state, reuse_state_reason, execution_kind
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -1419,7 +1435,8 @@ impl SqliteUsageRepository {
                         scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                         total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                         created_at, last_used_at, closed_at, last_model_usage_at,
-                        last_observed_at, task_scope_key, reuse_state, reuse_state_reason
+                        last_observed_at, task_scope_key, reuse_state, reuse_state_reason,
+                        execution_kind
                  FROM agent_thread_instances
                  WHERE codex_thread_id = ?1",
                 [thread_id],
@@ -1440,6 +1457,7 @@ impl SqliteUsageRepository {
                         total_tokens, current_context_tokens, context_window, runtime_fingerprint,
                         created_at, last_used_at, closed_at, last_model_usage_at,
                         last_observed_at, task_scope_key, reuse_state, reuse_state_reason,
+                        execution_kind,
                         CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                         CASE WHEN claimed_until IS NOT NULL
                                   AND julianday(claimed_until) > julianday('now')
@@ -1461,8 +1479,8 @@ impl SqliteUsageRepository {
                         current_context_tokens: instance.current_context_tokens,
                         context_window: instance.context_window,
                         runtime_fingerprint: instance.runtime_fingerprint,
-                        age_seconds: row.get(22)?,
-                        claimed: row.get(23)?,
+                        age_seconds: row.get(23)?,
+                        claimed: row.get(24)?,
                     })
                 },
             )
@@ -1517,16 +1535,17 @@ impl SqliteUsageRepository {
                     scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
                     last_model_usage_at, last_observed_at, task_scope_key,
-                    reuse_state, reuse_state_reason,
+                    reuse_state, reuse_state_reason, execution_kind,
                     CAST(MAX(0, (julianday('now') - julianday(last_model_usage_at)) * 86400) AS INTEGER),
                     CASE WHEN claimed_until IS NOT NULL
                               AND julianday(claimed_until) > julianday('now')
                          THEN 1 ELSE 0 END
-             FROM agent_thread_instances
-             WHERE agent_id = ?1
-               AND scope_key = ?2
-               AND (?3 IS NULL OR parent_thread_id = ?3)
-               {task_condition}
+                 FROM agent_thread_instances
+                 WHERE agent_id = ?1
+                   AND scope_key = ?2
+                   AND (?3 IS NULL OR parent_thread_id = ?3)
+                   AND execution_kind = 'MANAGED_WORKER'
+                   {task_condition}
              ORDER BY last_used_at DESC, codex_thread_id ASC",
         ))?;
         let mut bound_parameters = vec![
@@ -1552,8 +1571,8 @@ impl SqliteUsageRepository {
                     context_window: instance.context_window,
                     runtime_fingerprint: instance.runtime_fingerprint,
                     reuse_state: instance.reuse_state,
-                    age_seconds: row.get(22)?,
-                    claimed: row.get(23)?,
+                    age_seconds: row.get(23)?,
+                    claimed: row.get(24)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()
@@ -1869,6 +1888,7 @@ impl SqliteUsageRepository {
         &self,
         profile: &AgentRuntimeProfile,
         thread_id: &str,
+        parent_thread_id: &str,
         scope_key: &str,
         task_scope_key: Option<&str>,
         status: &str,
@@ -1876,7 +1896,8 @@ impl SqliteUsageRepository {
         let existing_identity = self
             .connection
             .query_row(
-                "SELECT agent_id, scope_key, task_scope_key, runtime_fingerprint
+                "SELECT agent_id, parent_thread_id, scope_key, task_scope_key,
+                        runtime_fingerprint, execution_kind
                  FROM agent_thread_instances WHERE codex_thread_id = ?1",
                 [thread_id],
                 |row| {
@@ -1885,15 +1906,27 @@ impl SqliteUsageRepository {
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
                     ))
                 },
             )
             .optional()?;
         if existing_identity.is_some_and(
-            |(existing_agent_id, existing_scope_key, existing_task_scope_key, fingerprint)| {
+            |(
+                existing_agent_id,
+                existing_parent_thread_id,
+                existing_scope_key,
+                existing_task_scope_key,
+                fingerprint,
+                execution_kind,
+            )| {
                 existing_agent_id
                     .as_deref()
                     .is_some_and(|existing| existing != profile.agent_id)
+                    || existing_parent_thread_id
+                        .as_deref()
+                        .is_some_and(|existing| existing != parent_thread_id)
                     || existing_scope_key
                         .as_deref()
                         .is_some_and(|existing| existing != scope_key)
@@ -1903,6 +1936,7 @@ impl SqliteUsageRepository {
                     || fingerprint
                         .as_deref()
                         .is_some_and(|existing| existing != profile.runtime_fingerprint)
+                    || execution_kind != execution_kind_storage(ExecutionKind::ManagedWorker)
             },
         ) {
             return Err(UsageServiceError::ThreadIdentityConflict);
@@ -1912,18 +1946,23 @@ impl SqliteUsageRepository {
                 id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
                 scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                 total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                last_model_usage_at, last_observed_at, task_scope_key
+                last_model_usage_at, last_observed_at, task_scope_key, execution_kind
              ) VALUES (
-                ?1, ?2, ?3, ?4, NULL, ?5, ?6, 0, 0, 0, 0, NULL, NULL, ?7,
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, 0, NULL, NULL, ?8,
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), NULL,
-                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?8
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?9, 'MANAGED_WORKER'
              )
              ON CONFLICT(codex_thread_id) DO UPDATE SET
+                parent_thread_id = COALESCE(
+                    agent_thread_instances.parent_thread_id,
+                    excluded.parent_thread_id
+                ),
                 scope_key = excluded.scope_key,
                 status = excluded.status,
                 runtime_fingerprint = COALESCE(agent_thread_instances.runtime_fingerprint, excluded.runtime_fingerprint),
                 task_scope_key = COALESCE(agent_thread_instances.task_scope_key, excluded.task_scope_key),
+                execution_kind = excluded.execution_kind,
                 last_used_at = excluded.last_used_at,
                 last_observed_at = excluded.last_observed_at",
             params![
@@ -1931,6 +1970,7 @@ impl SqliteUsageRepository {
                 profile.agent_id,
                 profile.agent_name,
                 thread_id,
+                parent_thread_id,
                 scope_key,
                 status,
                 profile.runtime_fingerprint,
@@ -2007,6 +2047,7 @@ impl SqliteUsageRepository {
              WHERE id = ?1
                AND status = 'IDLE'
                AND reuse_state = 'ACTIVE'
+               AND execution_kind = 'MANAGED_WORKER'
                AND runtime_fingerprint = ?2
                AND (
                    claimed_until IS NULL
@@ -2363,13 +2404,15 @@ fn upsert_native_agent_instance(
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
                     total_tokens, current_context_tokens, context_window, runtime_fingerprint, created_at, last_used_at, closed_at,
-                    last_model_usage_at, last_observed_at, reuse_state, reuse_state_reason
+                    last_model_usage_at, last_observed_at, reuse_state, reuse_state_reason,
+                    execution_kind
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, 0, ?8, ?9, ?10, ?11, ?12, ?13,
             CASE WHEN ?7 = 'CLOSED' THEN ?13 ELSE NULL END,
             NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
             CASE WHEN ?7 = 'CLOSED' THEN 'RETIRED' ELSE 'ACTIVE' END,
-            CASE WHEN ?7 = 'CLOSED' THEN 'THREAD_CLOSED' ELSE NULL END
+            CASE WHEN ?7 = 'CLOSED' THEN 'THREAD_CLOSED' ELSE NULL END,
+            'OBSERVED_EXTERNAL'
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = excluded.agent_id,
@@ -2398,7 +2441,9 @@ fn upsert_native_agent_instance(
             last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at),
             last_observed_at = excluded.last_observed_at,
             closed_at = excluded.closed_at
-         WHERE agent_thread_instances.agent_id IS NOT excluded.agent_id
+         WHERE agent_thread_instances.execution_kind = excluded.execution_kind
+           AND (
+            agent_thread_instances.agent_id IS NOT excluded.agent_id
             OR agent_thread_instances.agent_name_snapshot IS NOT excluded.agent_name_snapshot
             OR agent_thread_instances.parent_thread_id IS NOT excluded.parent_thread_id
             OR (
@@ -2412,7 +2457,8 @@ fn upsert_native_agent_instance(
             OR excluded.created_at < agent_thread_instances.created_at
             OR excluded.last_used_at > agent_thread_instances.last_used_at
             OR agent_thread_instances.closed_at IS NOT excluded.closed_at
-            OR agent_thread_instances.last_observed_at IS NOT excluded.last_observed_at",
+            OR agent_thread_instances.last_observed_at IS NOT excluded.last_observed_at
+           )",
         params![
             format!("native-{}", record.thread_id),
             agent_id,
@@ -2452,6 +2498,7 @@ fn map_agent_thread_instance(
         agent_name_snapshot: row.get(2)?,
         codex_thread_id: row.get(3)?,
         parent_thread_id: row.get(4)?,
+        execution_kind: execution_kind_from_storage(row.get(22)?)?,
         workspace_scope_key: row.get(5)?,
         status: row.get(6)?,
         reuse_state: row.get(20)?,
@@ -2478,6 +2525,7 @@ struct UsageRecord {
     codex_session_id: String,
     codex_thread_id: String,
     parent_thread_id: Option<String>,
+    execution_kind: ExecutionKind,
     agent_id: Option<String>,
     agent_name_snapshot: Option<String>,
     provider_id: Option<String>,
@@ -2499,6 +2547,27 @@ struct UsageRecord {
     updated_at: String,
 }
 
+fn execution_kind_from_storage(value: String) -> rusqlite::Result<ExecutionKind> {
+    serde_json::from_value(serde_json::Value::String(value))
+        .map_err(|error| rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error)))
+}
+
+fn execution_kind_storage(value: ExecutionKind) -> &'static str {
+    match value {
+        ExecutionKind::NativeChild => "NATIVE_CHILD",
+        ExecutionKind::ManagedWorker => "MANAGED_WORKER",
+        ExecutionKind::ObservedExternal => "OBSERVED_EXTERNAL",
+    }
+}
+
+fn execution_kind_sql(value: ExecutionKind) -> &'static dyn rusqlite::ToSql {
+    match value {
+        ExecutionKind::NativeChild => &"NATIVE_CHILD",
+        ExecutionKind::ManagedWorker => &"MANAGED_WORKER",
+        ExecutionKind::ObservedExternal => &"OBSERVED_EXTERNAL",
+    }
+}
+
 impl UsageRecord {
     fn from_snapshot(snapshot: UsageSnapshot) -> Self {
         Self {
@@ -2506,6 +2575,7 @@ impl UsageRecord {
             codex_session_id: snapshot.codex_session_id,
             codex_thread_id: snapshot.codex_thread_id,
             parent_thread_id: snapshot.parent_thread_id,
+            execution_kind: snapshot.execution_kind,
             agent_id: snapshot.agent_id,
             agent_name_snapshot: snapshot.agent_name_snapshot,
             provider_id: snapshot.provider_id,
@@ -2540,7 +2610,7 @@ fn find_by_thread(
                     model_id, model_name_snapshot, input_tokens, cached_input_tokens,
                     cache_write_input_tokens, output_tokens, reasoning_output_tokens,
                     total_tokens, model_context_window, usage_status, source,
-                    started_at, completed_at, updated_at
+                    started_at, completed_at, updated_at, execution_kind
              FROM token_usage_records
              WHERE codex_thread_id = ?1",
             [thread_id],
@@ -2575,6 +2645,7 @@ fn map_usage_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         started_at: row.get(19)?,
         completed_at: row.get(20)?,
         updated_at: row.get(21)?,
+        execution_kind: execution_kind_from_storage(row.get(22)?)?,
     })
 }
 
@@ -2589,10 +2660,10 @@ fn insert_record(
             model_id, model_name_snapshot, input_tokens, cached_input_tokens,
             cache_write_input_tokens, output_tokens, reasoning_output_tokens,
             total_tokens, model_context_window, usage_status, source,
-            started_at, completed_at, updated_at
+            started_at, completed_at, updated_at, execution_kind
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22
+            ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
          )",
         usage_record_params(record),
     )?;
@@ -2625,14 +2696,15 @@ fn update_record(
              source = ?19,
              started_at = ?20,
              completed_at = ?21,
-             updated_at = ?22
+             updated_at = ?22,
+             execution_kind = ?23
          WHERE id = ?1",
         usage_record_params(record),
     )?;
     Ok(())
 }
 
-fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 22] {
+fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 23] {
     [
         &record.id,
         &record.codex_session_id,
@@ -2656,6 +2728,7 @@ fn usage_record_params(record: &UsageRecord) -> [&dyn rusqlite::ToSql; 22] {
         &record.started_at,
         &record.completed_at,
         &record.updated_at,
+        execution_kind_sql(record.execution_kind),
     ]
 }
 
@@ -2674,15 +2747,25 @@ fn sync_agent_thread_instance(
         "PARTIAL" => "RECOVERY_REQUIRED",
         _ => "UNKNOWN",
     };
+    let existing_kind = transaction
+        .query_row(
+            "SELECT execution_kind FROM agent_thread_instances WHERE codex_thread_id = ?1",
+            [&record.codex_thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if existing_kind.is_some_and(|value| value != execution_kind_storage(record.execution_kind)) {
+        return Err(UsageRepositoryError::ExecutionKindConflict);
+    }
     transaction.execute(
         "INSERT INTO agent_thread_instances (
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
             total_tokens, current_context_tokens, context_window, created_at, last_used_at, closed_at,
-            last_model_usage_at, last_observed_at
+            last_model_usage_at, last_observed_at, execution_kind
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL,
-            ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            ?14, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?16
          )
          ON CONFLICT(codex_thread_id) DO UPDATE SET
             agent_id = COALESCE(agent_thread_instances.agent_id, excluded.agent_id),
@@ -2737,6 +2820,7 @@ fn sync_agent_thread_instance(
             record.started_at,
             record.updated_at,
             current_context_is_fresh,
+            execution_kind_storage(record.execution_kind),
         ],
     )?;
     Ok(())
@@ -2851,7 +2935,8 @@ impl From<UsageServiceError> for ApiError {
                 details = Some(BTreeMap::from([("field", field.to_owned())]));
                 ("VALIDATION_ERROR", "Token Usage 查询字段无效。", false)
             }
-            UsageServiceError::ThreadIdentityConflict => (
+            UsageServiceError::ThreadIdentityConflict
+            | UsageServiceError::Repository(UsageRepositoryError::ExecutionKindConflict) => (
                 "USAGE_THREAD_IDENTITY_CONFLICT",
                 "Token Usage 线程归属发生冲突。",
                 false,
@@ -2952,6 +3037,7 @@ impl From<rusqlite::Error> for UsageServiceError {
 #[derive(Debug)]
 pub(crate) enum UsageRepositoryError {
     AgentInstanceNotFound,
+    ExecutionKindConflict,
     Persistence(PersistenceError),
     Sqlite(rusqlite::Error),
 }
@@ -2960,6 +3046,7 @@ impl fmt::Display for UsageRepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AgentInstanceNotFound => formatter.write_str("agent thread instance not found"),
+            Self::ExecutionKindConflict => formatter.write_str("thread execution kind conflict"),
             Self::Persistence(error) => write!(formatter, "persistence failed: {error}"),
             Self::Sqlite(_) => formatter.write_str("sqlite operation failed"),
         }
@@ -3069,6 +3156,7 @@ mod tests {
         );
         assert_eq!(instances[0].agent_id.as_deref(), Some("agent-1"));
         assert_eq!(instances[0].status, "IDLE");
+        assert_eq!(instances[0].execution_kind, ExecutionKind::ObservedExternal);
         assert_eq!(instances[0].total_tokens, 12345);
         assert_eq!(instances[0].context_window, Some(128_000));
         assert_eq!(
@@ -3087,6 +3175,26 @@ mod tests {
                 .items
                 .len(),
             1
+        );
+        let repository = service.repository().unwrap();
+        assert_eq!(
+            repository
+                .connection
+                .query_row("SELECT COUNT(*) FROM job_attempts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_delegation_leases",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -3181,6 +3289,87 @@ mod tests {
         assert_eq!(running[0].status, "RUNNING");
         assert_eq!(running[0].total_tokens, 200);
         assert_eq!(running[0].codex_thread_id, "thread-child-1");
+    }
+
+    #[test]
+    fn execution_kind_conflict_does_not_upgrade_a_managed_usage_record() {
+        let service = UsageService::in_memory();
+        service.upsert_snapshot(snapshot(100, "LIVE")).unwrap();
+
+        let mut conflicting = snapshot(120, "FINAL");
+        conflicting.execution_kind = ExecutionKind::NativeChild;
+        assert!(matches!(
+            service.upsert_snapshot(conflicting),
+            Err(UsageServiceError::ThreadIdentityConflict)
+        ));
+
+        let record = service.list(UsageListRequest::default()).unwrap().remove(0);
+        assert_eq!(record.execution_kind, ExecutionKind::ManagedWorker);
+        assert_eq!(record.total_tokens, 100);
+    }
+
+    #[test]
+    fn observed_external_thread_cannot_be_reused_or_claimed() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+        service.upsert_snapshot(snapshot(100, "FINAL")).unwrap();
+        service
+            .set_agent_instance_workspace_scope(AgentThreadInstanceWorkspaceScopeRequest {
+                thread_id: "thread-child-1".to_owned(),
+                workspace_scope_key: Some("c:/workspace/project".to_owned()),
+            })
+            .unwrap();
+
+        let fingerprint = {
+            let repository = service.repository().unwrap();
+            let fingerprint = repository
+                .scheduling_profile("agent-1")
+                .unwrap()
+                .runtime_fingerprint
+                .unwrap();
+            repository
+                .connection
+                .execute(
+                    "UPDATE agent_thread_instances
+                     SET runtime_fingerprint = ?1,
+                         execution_kind = 'OBSERVED_EXTERNAL',
+                         status = 'IDLE',
+                         reuse_state = 'ACTIVE',
+                         claimed_until = NULL
+                     WHERE codex_thread_id = 'thread-child-1'",
+                    [&fingerprint],
+                )
+                .unwrap();
+            fingerprint
+        };
+
+        let recommendation = service
+            .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: Some("thread-root-1".to_owned()),
+                task_scope_key: None,
+            })
+            .unwrap();
+        assert_eq!(recommendation.decision, "SPAWN");
+        assert_eq!(recommendation.candidate_thread_id, None);
+
+        let mut repository = service.repository().unwrap();
+        assert!(matches!(
+            repository.claim_agent_thread_instance("thread-child-1", &fingerprint),
+            Err(UsageServiceError::DecisionChanged)
+        ));
+        assert_eq!(
+            repository
+                .connection
+                .query_row(
+                    "SELECT claimed_until FROM agent_thread_instances WHERE codex_thread_id = 'thread-child-1'",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -3886,6 +4075,7 @@ mod tests {
             .register_agent_execution_thread(
                 &plan.profile,
                 "thread-runtime",
+                "parent-1",
                 &plan.workspace_scope_key,
                 plan.task_scope_key.as_deref(),
             )
@@ -3906,6 +4096,7 @@ mod tests {
             service.register_agent_execution_thread(
                 &plan.profile,
                 "thread-runtime",
+                "parent-1",
                 &plan.workspace_scope_key,
                 Some("payments"),
             ),
@@ -4397,6 +4588,7 @@ mod tests {
             codex_session_id: "session-1".to_owned(),
             codex_thread_id: "thread-child-1".to_owned(),
             parent_thread_id: Some("thread-root-1".to_owned()),
+            execution_kind: ExecutionKind::ManagedWorker,
             agent_id: Some("agent-1".to_owned()),
             agent_name_snapshot: Some("Executor".to_owned()),
             provider_id: Some("provider-deepseek".to_owned()),

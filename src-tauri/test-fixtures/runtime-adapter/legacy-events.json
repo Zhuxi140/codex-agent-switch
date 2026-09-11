@@ -1,0 +1,7 @@
+[
+  {"method":"thread/started","params":{"thread_id":"thread-legacy-001","session_id":"session-legacy-001","parent_thread_id":"thread-parent-legacy"}},
+  {"method":"item/completed","params":{"item":{"type":"collabToolCall","sender_thread_id":"thread-parent-legacy","receiver_thread_ids":["thread-legacy-001"],"model_id":"gpt-legacy"}}},
+  {"method":"item/started","params":{"item":{"type":"subAgentActivity","agent_thread_id":"thread-legacy-001","agent_path":"/agents/cas-legacy.toml"}}},
+  {"method":"codex/event/token_count","params":{"conversationId":"thread-legacy-001","msg":{"info":{"total_token_usage":{"input_tokens":80,"cached_input_tokens":8,"cache_write_input_tokens":2,"output_tokens":20,"reasoning_output_tokens":4,"total_tokens":100},"last_token_usage":{"total_tokens":100},"model_context_window":64000}}}},
+  {"method":"turn/completed","params":{"thread_id":"thread-legacy-001","turn":{"turn_id":"turn-legacy-001","status":"failed"},"error":"legacy failure"}}
+]

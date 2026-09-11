@@ -99,6 +99,274 @@ export interface AppBootstrapResponse {
   recoveryRequired: boolean;
 }
 
+export type PermissionPolicy =
+  | "READ_ONLY"
+  | "WORKSPACE_WRITE"
+  | "DANGER_FULL_ACCESS"
+  | "INHERIT";
+export type ExecutionKindPolicy =
+  | "NATIVE_CHILD_REQUIRED"
+  | "NATIVE_CHILD_OR_MANAGED_WORKER"
+  | "MANAGED_WORKER_REQUIRED";
+export type OutputContract = "STANDARD_V1";
+export type ReviewPolicy =
+  | "PRIMARY_REQUIRED"
+  | "PRIMARY_WITH_READ_ONLY_REVIEWER";
+export type ExecutionKind =
+  | "NATIVE_CHILD"
+  | "MANAGED_WORKER"
+  | "OBSERVED_EXTERNAL";
+export type DispatchExecutionKind = "NATIVE_CHILD" | "MANAGED_WORKER";
+export type RouteAction = "REUSE" | "SPAWN";
+export type JobState =
+  | "CREATED"
+  | "ROUTED"
+  | "CLAIMED"
+  | "DISPATCHED"
+  | "RUNNING"
+  | "RESULT_RECEIVED"
+  | "REVIEW_PENDING"
+  | "REVISION_REQUIRED"
+  | "APPROVED"
+  | "COMPLETED"
+  | "WAITING"
+  | "UNCERTAIN"
+  | "BLOCKED"
+  | "FAILED"
+  | "CANCELLED"
+  | "REJECTED";
+export type AttemptState =
+  | "PLANNED"
+  | "DISPATCHING"
+  | "ACCEPTED"
+  | "RUNNING"
+  | "SUCCEEDED"
+  | "UNCERTAIN"
+  | "FAILED"
+  | "CANCELLED";
+
+export interface TaskPacket {
+  schema_version: number;
+  job_id: string;
+  idempotency_key: string;
+  agent_id: string;
+  parent_thread_id: string;
+  workspace_scope_key: string;
+  task_scope_key: string;
+  objective: string;
+  allowed_scope: string[];
+  constraints: string[];
+  success_criteria: string[];
+  allowed_tools: string[];
+  permission_policy: PermissionPolicy;
+  execution_kind_policy: ExecutionKindPolicy;
+  context_references: string[];
+  output_contract: OutputContract;
+  review_policy: ReviewPolicy;
+}
+
+export interface OrchestrationJob {
+  job_id: string;
+  idempotency_key: string;
+  task_packet: TaskPacket;
+  task_packet_hash: string;
+  agent_id: string;
+  parent_thread_id: string;
+  workspace_scope_key: string;
+  task_scope_key: string;
+  state: JobState;
+  last_error_code: OrchestrationErrorCode | null;
+  created_at: string;
+  updated_at: string;
+  terminal_at: string | null;
+}
+
+export interface JobAttempt {
+  attempt_id: string;
+  job_id: string;
+  attempt_no: number;
+  previous_attempt_id: string | null;
+  schedule_decision_id: string;
+  lease_id: string;
+  route_action: RouteAction;
+  planned_execution_kind: DispatchExecutionKind;
+  execution_kind: ExecutionKind | null;
+  thread_instance_id: string | null;
+  codex_turn_id: string | null;
+  state: AttemptState;
+  recovery_count: number;
+  last_error_code: OrchestrationErrorCode | null;
+  created_at: string;
+  updated_at: string;
+  dispatch_recorded_at: string | null;
+  accepted_at: string | null;
+  terminal_at: string | null;
+}
+
+export type IdempotencyOutcome =
+  | "CREATED"
+  | "EXISTING_NOT_DISPATCHED"
+  | "EXISTING_KNOWN"
+  | "EXISTING_UNCERTAIN"
+  | "KEY_CONFLICT";
+export type OrchestrationErrorCode =
+  | "TASK_PACKET_FIELD_REQUIRED"
+  | "TASK_PACKET_FIELD_INVALID"
+  | "TASK_PACKET_SCOPE_MISMATCH"
+  | "TASK_PACKET_CANONICALIZATION_FAILED"
+  | "IDEMPOTENCY_KEY_CONFLICT"
+  | "AGENT_NOT_EXECUTABLE"
+  | "SCOPE_EXCLUDED"
+  | "EXECUTION_KIND_UNSUPPORTED"
+  | "RUNTIME_UNAVAILABLE"
+  | "SCHEMA_UNVERIFIED"
+  | "PERMISSION_DENIED"
+  | "CONCURRENCY_LIMIT_REACHED"
+  | "STALE_EXPECTED_DECISION"
+  | "STALE_EXPECTED_CANDIDATE"
+  | "ACTIVE_TURN_EXISTS"
+  | "DISPATCH_REJECTED"
+  | "DISPATCH_OUTCOME_UNKNOWN"
+  | "THREAD_ID_MISSING"
+  | "TURN_ID_MISSING"
+  | "THREAD_ID_MISMATCH"
+  | "TURN_ID_MISMATCH"
+  | "NATIVE_PARENT_CHILD_EVIDENCE_MISSING"
+  | "EXECUTION_KIND_MISMATCH"
+  | "RECOVERY_REQUIRED"
+  | "RECOVERY_LIMIT_REACHED"
+  | "RESULT_NOT_OBSERVED"
+  | "REVIEW_REQUIRED"
+  | "REVIEW_DECISION_CONFLICT"
+  | "ATTEMPT_NOT_CURRENT"
+  | "INVALID_STATE_TRANSITION"
+  | "CANCELLATION_UNCONFIRMED"
+  | "PERSISTENCE_ERROR"
+  | "INTERNAL_INVARIANT_VIOLATION";
+
+export interface OrchestrationError {
+  code: OrchestrationErrorCode;
+  message: string;
+  field_path: string | null;
+  job_id: string | null;
+  attempt_id: string | null;
+}
+
+export interface OrchestrationJobCreateRequest {
+  taskPacket: TaskPacket;
+}
+
+export interface OrchestrationJobCreateResponse {
+  outcome: IdempotencyOutcome;
+  job: OrchestrationJob;
+  currentAttempt: JobAttempt | null;
+}
+
+export interface OrchestrationJobGetRequest {
+  jobId: string;
+}
+
+export interface OrchestrationJobDetailResponse {
+  job: OrchestrationJob;
+  attempts: JobAttempt[];
+}
+
+export type ReviewOutcome = "APPROVE" | "REVISION_REQUIRED" | "REJECT";
+
+export interface ReviewDecision {
+  review_id: string;
+  job_id: string;
+  attempt_id: string;
+  decision: ReviewOutcome;
+  reviewer_thread_id: string;
+  reason: string;
+  evidence_refs: string[];
+  created_at: string;
+}
+
+export interface OrchestrationJobReviewRequest {
+  jobId: string;
+  attemptId: string;
+  decision: ReviewOutcome;
+  reviewerThreadId: string;
+  reason: string;
+  evidenceRefs: string[];
+}
+
+export interface OrchestrationJobReviewResponse {
+  review: ReviewDecision;
+  job: OrchestrationJob;
+}
+
+export interface OrchestrationReviewerCreateRequest {
+  primaryJobId: string;
+  primaryAttemptId: string;
+  reviewerJobId: string;
+  reviewerAgentId: string;
+  idempotencyKey: string;
+  allowedScope: string[];
+}
+
+export interface OrchestrationReviewerCreateResponse {
+  reviewerJob: OrchestrationJobCreateResponse;
+}
+
+export interface OrchestrationReviewerReportSubmitRequest {
+  reviewerJobId: string;
+  reviewerThreadId: string;
+  summary: string;
+  findings: string[];
+  evidenceRefs: string[];
+}
+
+export interface OrchestrationReviewerReport {
+  reportId: string;
+  reviewerJobId: string;
+  primaryJobId: string;
+  primaryAttemptId: string;
+  reviewerThreadId: string;
+  summary: string;
+  findings: string[];
+  evidenceRefs: string[];
+  createdAt: string;
+}
+
+export function createOrchestrationJob(
+  request: OrchestrationJobCreateRequest,
+): Promise<OrchestrationJobCreateResponse> {
+  return invoke<OrchestrationJobCreateResponse>("orchestration_job_create", {
+    request,
+  });
+}
+
+export function getOrchestrationJob(
+  request: OrchestrationJobGetRequest,
+): Promise<OrchestrationJobDetailResponse | null> {
+  return invoke<OrchestrationJobDetailResponse | null>("orchestration_job_get", {
+    request,
+  });
+}
+
+export function reviewOrchestrationJob(
+  request: OrchestrationJobReviewRequest,
+): Promise<OrchestrationJobReviewResponse> {
+  return invoke<OrchestrationJobReviewResponse>("orchestration_job_review", {
+    request,
+  });
+}
+
+export function createOrchestrationReviewer(
+  request: OrchestrationReviewerCreateRequest,
+): Promise<OrchestrationReviewerCreateResponse> {
+  return invoke<OrchestrationReviewerCreateResponse>("orchestration_reviewer_create", { request });
+}
+
+export function submitOrchestrationReviewerReport(
+  request: OrchestrationReviewerReportSubmitRequest,
+): Promise<OrchestrationReviewerReport> {
+  return invoke<OrchestrationReviewerReport>("orchestration_reviewer_report_submit", { request });
+}
+
 export function getAppBootstrap(): Promise<AppBootstrapResponse> {
   return invoke<AppBootstrapResponse>("app_get_bootstrap");
 }
@@ -724,6 +992,7 @@ export interface UsageRecordResponse {
   startedAt: string;
   completedAt: string | null;
   updatedAt: string;
+  executionKind: ExecutionKind;
 }
 
 export type AgentThreadInstanceStatus =
@@ -758,6 +1027,7 @@ export interface AgentThreadInstanceResponse {
   lastObservedAt: string | null;
   taskScopeKey: string | null;
   closedAt: string | null;
+  executionKind: ExecutionKind;
 }
 
 export interface NativeSubagentSyncResponse {
@@ -840,8 +1110,10 @@ export interface AgentThreadInstanceRecommendation {
 
 export interface AgentThreadExecutionResponse {
   action: "REUSED" | "SPAWNED";
-  decision: "REUSE" | "SPAWN";
-  reasonCode: AgentThreadInstanceRecommendation["reasonCode"];
+  decision: RouteAction;
+  reasonCode: string;
+  jobId: string;
+  attemptId: string;
   agentId: string;
   agentName: string;
   workspaceScopeKey: string;
@@ -1006,13 +1278,11 @@ export function recommendAgentThreadInstance(
 }
 
 export function executeAgentThread(request: {
-  agentId: string;
-  workspaceScopeKey: string;
+  taskPacket: TaskPacket;
   cwd: string;
   input: string;
-  expectedDecision: "REUSE" | "SPAWN";
+  expectedDecision: RouteAction;
   expectedCandidateThreadId: string | null;
-  taskScopeKey?: string | null;
 }): Promise<AgentThreadExecutionResponse> {
   return invoke<AgentThreadExecutionResponse>("agent_thread_instance_execute", { request });
 }
@@ -1072,6 +1342,7 @@ export interface RuntimeBridgeStatusResponse {
   autoRecoveryExhausted: boolean;
   lastRecoveryAt: string | null;
   managedSession: ManagedSessionResponse | null;
+  managedSessions: ManagedSessionResponse[];
 }
 
 export function startUsageMonitor(): Promise<RuntimeBridgeStatusResponse> {

@@ -1,0 +1,1 @@
+{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-modern-001","tokenUsage":{"total":{"inputTokens":1,"outputTokens":2,"totalTokens":3,"futureCounter":99},"futureUsageField":"ignored"},"futureEnvelopeField":true}}

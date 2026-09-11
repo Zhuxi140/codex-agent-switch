@@ -1,0 +1,1 @@
+{"type":"object","required":["cwd","approvalPolicy"],"properties":{"cwd":{},"approvalPolicy":{}}}

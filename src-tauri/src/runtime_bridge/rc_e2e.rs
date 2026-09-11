@@ -273,7 +273,7 @@ fn collect_thread_evidence(value: &Value, messages: &mut Vec<String>, commands: 
 
 fn primary_summary(bridge: &RuntimeBridgeService, thread_id: &str) -> String {
     let Ok(thread) = bridge.request(
-        "thread/read",
+        AppServerMethod::ThreadRead.as_str(),
         json!({"threadId": thread_id, "includeTurns": true}),
     ) else {
         return "primaryMessage=unavailable".to_owned();
@@ -294,15 +294,7 @@ fn primary_summary(bridge: &RuntimeBridgeService, thread_id: &str) -> String {
 }
 
 fn thread_turn_evidence(thread: &Value, turn_id: &str) -> Option<(usize, usize)> {
-    let thread = find_object(thread, &["thread"]).unwrap_or(thread);
-    let turns = thread.get("turns").and_then(Value::as_array)?;
-    let occurrences = turns
-        .iter()
-        .filter(|candidate| {
-            find_string(candidate, &["id", "turnId", "turn_id"]).as_deref() == Some(turn_id)
-        })
-        .count();
-    Some((turns.len(), occurrences))
+    crate::runtime_adapter::thread_turn_evidence(thread, turn_id)
 }
 
 fn verify_output(

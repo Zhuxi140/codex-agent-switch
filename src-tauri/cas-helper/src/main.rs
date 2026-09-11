@@ -1409,31 +1409,40 @@ fn record_subagent_stop(database_path: &Path, payload: &serde_json::Value) -> Ex
             ..RuntimeIdentity::default()
         }
     };
-    let released = connection
-        .execute(
-            "UPDATE runtime_delegation_leases
+    let job_backed = lease
+        .as_ref()
+        .is_some_and(|lease| lease_has_job_attempt(&connection, &lease.id).unwrap_or(true));
+    let released = (!job_backed)
+        .then(|| {
+            connection.execute(
+                "UPDATE runtime_delegation_leases
              SET state = 'RELEASED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                  release_reason = 'SUBAGENT_STOP'
              WHERE codex_agent_id = ?1 AND state = 'ACTIVE'",
-            [codex_agent_id],
-        )
+                [codex_agent_id],
+            )
+        })
+        .transpose()
+        .unwrap_or(None)
         .unwrap_or(0);
-    let _ = connection.execute(
-        "UPDATE runtime_hook_turns
+    if !job_backed {
+        let _ = connection.execute(
+            "UPDATE runtime_hook_turns
          SET lease_state = 'RELEASED', stopped_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE codex_agent_id = ?1 AND stopped_at IS NULL",
-        [codex_agent_id],
-    );
-    let _ = connection.execute(
-        "UPDATE agent_thread_instances
+        WHERE codex_agent_id = ?1 AND stopped_at IS NULL",
+            [codex_agent_id],
+        );
+        let _ = connection.execute(
+            "UPDATE agent_thread_instances
          SET status = 'IDLE', claimed_until = NULL,
              last_observed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE codex_thread_id = ?1",
-        [codex_agent_id],
-    );
-    if let Some(lease) = lease.as_ref() {
+            [codex_agent_id],
+        );
+    }
+    if !job_backed && let Some(lease) = lease.as_ref() {
         let _ = connection.execute(
             "DELETE FROM agent_spawn_reservations
              WHERE agent_id = ?1 AND parent_thread_id = ?2
@@ -1447,7 +1456,13 @@ fn record_subagent_stop(database_path: &Path, payload: &serde_json::Value) -> Ex
             ],
         );
     }
-    let (decision, reason_code, message) = if released > 0 {
+    let (decision, reason_code, message) = if job_backed {
+        (
+            "ALLOW",
+            "DELEGATION_LEASE_REVIEW_PENDING",
+            "子 Agent 已停止；Job-backed Lease 保持 ACTIVE，等待可信结果证据与 Primary Review。",
+        )
+    } else if released > 0 {
         if let Some(lease) = identity.lease.as_mut() {
             lease.state = "RELEASED".to_owned();
         }
@@ -1476,6 +1491,16 @@ fn record_subagent_stop(database_path: &Path, payload: &serde_json::Value) -> Ex
     );
     println!("{{}}");
     ExitCode::SUCCESS
+}
+
+fn lease_has_job_attempt(connection: &Connection, lease_id: &str) -> Result<bool, rusqlite::Error> {
+    connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM job_attempts WHERE lease_id = ?1)",
+            [lease_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
 }
 
 fn open_runtime_database(path: &Path) -> Result<Connection, ()> {
@@ -1599,79 +1624,31 @@ fn runtime_lease_from_row(row: &rusqlite::Row<'_>) -> Result<RuntimeLease, rusql
 }
 
 fn expire_runtime_leases(connection: &Connection) -> Result<(), rusqlite::Error> {
-    let timeout_modifier = format!("-{SPAWN_RESERVATION_TTL_SECONDS} seconds");
-    let _ = connection.execute(
-        "INSERT INTO runtime_enforcement_events (
-            id, created_at, session_id, turn_id, agent_id, agent_type,
-            orchestration_phase, tool_name, decision, reason_code, cwd, message,
-            codex_agent_id, lease_id, workspace_scope_key, task_scope_key,
-            lease_state, lease_expires_at
-         )
-         SELECT lower(hex(randomblob(16))), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                lease.parent_thread_id, 'admission-timeout-' || lease.id,
-                lease.agent_id, agent.agent_key, agent.orchestration_phase,
-                'delegation_admission', 'WARN', 'DELEGATION_ADMISSION_TIMEOUT',
-                lease.workspace_scope_key,
-                '委派工具未在认领窗口内完成确认；CAS 已撤销租约。',
-                lease.codex_agent_id, lease.id, lease.workspace_scope_key,
-                lease.task_scope_key, 'REVOKED', lease.expires_at
-         FROM runtime_delegation_leases lease
-         LEFT JOIN agents agent ON agent.id = lease.agent_id
-         WHERE lease.state IN ('PENDING', 'ACTIVE')
-           AND lease.admission_tool_use_id IS NOT NULL
-           AND lease.admission_confirmed_at IS NULL
-           AND lease.admitted_at IS NOT NULL
-           AND julianday(lease.admitted_at) <= julianday('now', ?1)",
-        [&timeout_modifier],
-    );
+    // C-05：TTL 本身不能证明请求未发送。只有尚未经过委派 Hook，且关联 Attempt
+    // 仍明确停在派发边界之前（或旧 Lease 根本没有 Attempt）时，才可释放占用。
+    // ACTIVE、已有 admission_tool_use_id 或越过 PLANNED 的 Lease 保持 live，等待恢复证据。
     connection.execute(
-        "UPDATE runtime_delegation_leases
-         SET state = 'REVOKED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             release_reason = 'ADMISSION_TIMEOUT'
-         WHERE state IN ('PENDING', 'ACTIVE')
-           AND admission_tool_use_id IS NOT NULL
-           AND admission_confirmed_at IS NULL
-           AND admitted_at IS NOT NULL
-           AND julianday(admitted_at) <= julianday('now', ?1)",
-        [&timeout_modifier],
-    )?;
-    connection.execute(
-        "UPDATE agent_thread_instances SET claimed_until = NULL
-         WHERE codex_thread_id IN (
-            SELECT codex_agent_id FROM runtime_delegation_leases
-            WHERE state = 'REVOKED' AND release_reason = 'ADMISSION_TIMEOUT'
-         )",
-        [],
-    )?;
-    connection.execute(
-        "DELETE FROM agent_spawn_reservations
-         WHERE EXISTS (
-            SELECT 1 FROM runtime_delegation_leases lease
-            WHERE lease.state = 'REVOKED' AND lease.release_reason = 'ADMISSION_TIMEOUT'
-              AND lease.agent_id = agent_spawn_reservations.agent_id
-              AND lease.parent_thread_id = agent_spawn_reservations.parent_thread_id
-              AND lease.workspace_scope_key = agent_spawn_reservations.workspace_scope_key
-              AND lease.task_scope_key IS agent_spawn_reservations.task_scope_key
-         )",
-        [],
-    )?;
-    connection.execute(
-        "UPDATE runtime_hook_turns SET lease_state = 'REVOKED',
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-         WHERE lease_id IN (
-            SELECT id FROM runtime_delegation_leases
-            WHERE state = 'REVOKED' AND release_reason = 'ADMISSION_TIMEOUT'
-         )",
-        [],
-    )?;
-    connection.execute(
-        "UPDATE runtime_delegation_leases
+        "UPDATE runtime_delegation_leases AS lease
          SET state = 'EXPIRED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              release_reason = 'TTL_EXPIRED'
-         WHERE state IN ('PENDING', 'ACTIVE')
-           AND julianday(expires_at) <= julianday('now')",
+         WHERE lease.state = 'PENDING'
+           AND julianday(lease.expires_at) <= julianday('now')
+           AND lease.admission_tool_use_id IS NULL
+           AND (
+                EXISTS (
+                    SELECT 1 FROM job_attempts attempt
+                    WHERE attempt.lease_id = lease.id
+                      AND attempt.state = 'PLANNED'
+                      AND attempt.dispatch_recorded_at IS NULL
+                )
+                OR (
+                    lease.codex_agent_id IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM job_attempts attempt WHERE attempt.lease_id = lease.id
+                    )
+                )
+           )",
         [],
     )?;
     Ok(())
@@ -2128,6 +2105,7 @@ fn reconcile_native_idle_leases(
                 .codex_agent_id
                 .as_deref()
                 .is_some_and(|thread_id| idle_threads.contains(thread_id))
+            && !lease_has_job_attempt(connection, &lease.id).unwrap_or(true)
     }) {
         let changed = connection.execute(
             "UPDATE runtime_delegation_leases
@@ -2182,17 +2160,17 @@ fn load_recommendation(
     let Some(active) = load_active_agent_profile(connection, agent_key)? else {
         return Ok(None);
     };
+    let agent_type = active
+        .role_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(agent_key)
+        .to_owned();
     // F-11：候选读取与 REUSE 租约写入必须在同一 Immediate 事务内，
     // 否则两个并发 helper 预检可以同时选中同一个 IDLE Thread（双重 REUSE）。
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute(
-        "UPDATE runtime_delegation_leases
-         SET state = 'EXPIRED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), release_reason = 'TTL_EXPIRED'
-         WHERE state IN ('PENDING', 'ACTIVE')
-           AND julianday(expires_at) <= julianday('now')",
-        [],
-    )?;
+    expire_runtime_leases(&transaction)?;
     // 显式 Task Scope：同键才可复用；无键任务不得复用绑定了任务键的 Thread（fail-closed）。
     let (task_condition, task_parameter) = match task_scope_key {
         Some(key) => ("AND task_scope_key = ?4", Some(key.to_owned())),
@@ -2257,11 +2235,10 @@ fn load_recommendation(
     let matching_lease_exists = transaction.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM runtime_delegation_leases
-            WHERE agent_id = ?1 AND parent_thread_id = ?2 AND workspace_scope_key = ?3
-              AND task_scope_key IS ?4 AND state IN ('PENDING', 'ACTIVE')
-              AND julianday(expires_at) > julianday('now')
+            WHERE workspace_scope_key = ?1 AND parent_thread_id = ?2
+              AND agent_type = ?3 AND state IN ('PENDING', 'ACTIVE')
          )",
-        params![active.agent_id, parent_thread_id, scope_key, task_scope_key],
+        params![scope_key, parent_thread_id, agent_type],
         |row| row.get::<_, i64>(0),
     )? != 0;
     let mut candidates = candidates
@@ -2291,7 +2268,7 @@ fn load_recommendation(
     if matching_lease_exists {
         recommendation.decision = "WAIT";
         recommendation.reason_code = "DELEGATION_LEASE_ACTIVE";
-        recommendation.message = "同一任务已有有效委派租约，请等待当前子 Agent 完成。";
+        recommendation.message = "同一 Agent Type 已有委派租约，请等待当前子 Agent 完成。";
         recommendation.candidate_instance_id = None;
         recommendation.candidate_thread_id = None;
     }
@@ -2302,7 +2279,6 @@ fn load_recommendation(
             "SELECT EXISTS(
                 SELECT 1 FROM runtime_delegation_leases
                 WHERE codex_agent_id = ?1 AND state = 'ACTIVE'
-                  AND julianday(expires_at) > julianday('now')
              )",
             [thread_id],
             |row| row.get::<_, i64>(0),
@@ -2433,13 +2409,14 @@ fn load_recommendation(
         transaction.execute(
             "INSERT INTO runtime_delegation_leases (
                 id, created_at, updated_at, agent_id, parent_thread_id, codex_agent_id,
-                workspace_scope_key, task_scope_key, schedule_decision_id, state, expires_at
+                workspace_scope_key, task_scope_key, schedule_decision_id, state, expires_at,
+                agent_type
              ) VALUES (
                 lower(hex(randomblob(16))),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?8)
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?8), ?9
              )",
             params![
                 active.agent_id,
@@ -2450,6 +2427,7 @@ fn load_recommendation(
                 schedule_decision_id,
                 state,
                 format!("+{ttl_seconds} seconds"),
+                agent_type,
             ],
         )?;
     }
@@ -2865,14 +2843,21 @@ fn bind_native_thread(
         return Err(ScheduleError::BindRejected);
     };
     let lease = (*lease).clone();
+    let job_backed = lease_has_job_attempt(&transaction, &lease.id)?;
+    if job_backed && lease.state != "PENDING" {
+        return Err(ScheduleError::BindRejected);
+    }
     let compatibility_admission = lease.admission_tool_use_id.is_none();
     let native_admission_id = if lease.state == "PENDING" {
         format!("native-bind:{child_thread_id}")
     } else {
         format!("native-reuse:{child_thread_id}")
     };
-    let changed = transaction.execute(
-        "UPDATE runtime_delegation_leases
+    let changed = if job_backed {
+        1
+    } else {
+        transaction.execute(
+            "UPDATE runtime_delegation_leases
          SET codex_agent_id = ?2, state = 'ACTIVE',
              admission_tool_use_id = COALESCE(admission_tool_use_id, ?4),
              admitted_at = COALESCE(
@@ -2886,33 +2871,36 @@ fn bind_native_thread(
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?3)
          WHERE id = ?1 AND state IN ('PENDING', 'ACTIVE')",
-        params![
-            lease.id,
-            child_thread_id,
-            format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds"),
-            native_admission_id,
-        ],
-    )?;
+            params![
+                lease.id,
+                child_thread_id,
+                format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds"),
+                native_admission_id,
+            ],
+        )?
+    };
     if changed != 1 {
         return Err(ScheduleError::BindRejected);
     }
-    transaction.execute(
-        "UPDATE runtime_hook_turns
+    if !job_backed {
+        transaction.execute(
+            "UPDATE runtime_hook_turns
          SET lease_id = ?2, workspace_scope_key = ?3, task_scope_key = ?4,
              lease_state = 'ACTIVE',
              lease_expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?5),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
          WHERE codex_agent_id = ?1 AND agent_id = ?6",
-        params![
-            child_thread_id,
-            lease.id,
-            scope_key,
-            task_scope_key,
-            format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds"),
-            active.agent_id
-        ],
-    )?;
-    if let Some(task_scope_key) = task_scope_key {
+            params![
+                child_thread_id,
+                lease.id,
+                scope_key,
+                task_scope_key,
+                format!("+{RUNTIME_DELEGATION_LEASE_TTL_SECONDS} seconds"),
+                active.agent_id
+            ],
+        )?;
+    }
+    if !job_backed && let Some(task_scope_key) = task_scope_key {
         transaction.execute(
             "DELETE FROM agent_spawn_reservations
              WHERE agent_id = ?1 AND parent_thread_id = ?2
@@ -2921,7 +2909,7 @@ fn bind_native_thread(
         )?;
     }
     transaction.commit()?;
-    if compatibility_admission {
+    if compatibility_admission && !job_backed {
         let lease =
             load_runtime_lease(connection, &lease.id)?.ok_or(ScheduleError::BindRejected)?;
         let identity = runtime_identity_for_lease(connection, &lease)?;
@@ -3463,7 +3451,13 @@ mod tests {
                     release_reason TEXT,
                     admission_tool_use_id TEXT,
                     admitted_at TEXT,
-                    admission_confirmed_at TEXT
+                    admission_confirmed_at TEXT,
+                    agent_type TEXT NOT NULL DEFAULT 'executor'
+                 );
+                 CREATE TABLE job_attempts (
+                    lease_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    dispatch_recorded_at TEXT
                  );
                  CREATE TABLE runtime_hook_turns (
                     turn_id TEXT PRIMARY KEY,
@@ -3510,7 +3504,7 @@ mod tests {
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'agent-executor', 'session-1', NULL,
                     'c:/workspace', 'task-1', 'decision-1', 'PENDING',
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds'), NULL, NULL,
-                    NULL, NULL, NULL
+                    NULL, NULL, NULL, 'executor'
                  );
                  INSERT INTO agent_thread_instances VALUES ('child-1', 'RUNNING', NULL, NULL);",
             )
@@ -3665,7 +3659,7 @@ mod tests {
                     'lease-4', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds'),
                     strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds'),
                     'agent-executor', 'session-1', 'c:/workspace', 'task-4', 'decision-4',
-                    'PENDING', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds'),
+                    'PENDING', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-120 seconds'),
                     'tool-timeout', strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds')
                  )",
                 [],
@@ -3772,7 +3766,6 @@ mod tests {
                 "DENY:DELEGATION_LEASE_ALREADY_CONSUMED",
                 "ALLOW:DELEGATION_ALLOWED",
                 "WARN:DELEGATION_TOOL_FAILED",
-                "WARN:DELEGATION_ADMISSION_TIMEOUT",
                 "ALLOW:EXECUTION_LEASE_WRITE_ALLOWED",
                 "DENY:PRIMARY_STRICT_STOP_WRITE_DENIED",
                 "DENY:EXECUTION_LEASE_MISSING",
@@ -3818,13 +3811,12 @@ mod tests {
         assert_eq!(
             connection
                 .query_row(
-                    "SELECT state || ':' || release_reason
-                     FROM runtime_delegation_leases WHERE id = 'lease-4'",
+                    "SELECT state FROM runtime_delegation_leases WHERE id = 'lease-4'",
                     [],
                     |row| row.get::<_, String>(0),
                 )
                 .unwrap(),
-            "REVOKED:ADMISSION_TIMEOUT"
+            "PENDING"
         );
         assert_eq!(
             connection
@@ -4822,7 +4814,7 @@ mod tests {
     }
 
     #[test]
-    fn reuse_claim_blocks_concurrent_schedule_until_lease_expires() {
+    fn unknown_active_lease_blocks_until_dispatch_is_proven_absent() {
         let mut connection = scheduling_connection();
         let home = native_state_home();
         let fingerprint = runtime_fingerprint(
@@ -4903,7 +4895,7 @@ mod tests {
         assert_eq!(second.decision, "WAIT");
         assert_eq!(second.reason_code, "DELEGATION_LEASE_ACTIVE");
 
-        // 租约过期后 Thread 重新可复用。
+        // C-05：ACTIVE 租约即使 TTL 已过，也不能据此推断委派没有发出。
         connection
             .execute(
                 "UPDATE agent_thread_instances
@@ -4930,7 +4922,30 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(third.decision, "REUSE");
+        assert_eq!(third.decision, "WAIT");
+        assert_eq!(third.reason_code, "DELEGATION_LEASE_ACTIVE");
+
+        // 只有补齐“仍为 PENDING、未绑定 Thread、未经过委派 Hook”的证据后，
+        // 过期清理才能安全释放槽位。
+        connection
+            .execute(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'PENDING', codex_agent_id = NULL, admission_tool_use_id = NULL
+                 WHERE state = 'ACTIVE'",
+                [],
+            )
+            .unwrap();
+        let fourth = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fourth.decision, "REUSE");
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -4983,6 +4998,14 @@ mod tests {
         .unwrap();
         assert_eq!(same_task.decision, "REUSE");
         assert_eq!(same_task.candidate_thread_id.as_deref(), Some("thread-b"));
+        connection
+            .execute_batch(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'RELEASED', release_reason = 'TEST_COMPLETE'
+                 WHERE state IN ('PENDING', 'ACTIVE');
+                 UPDATE agent_thread_instances SET claimed_until = NULL;",
+            )
+            .unwrap();
 
         // 无键任务不得复用绑定了任务键的 Thread（fail-closed）。
         let no_key = load_recommendation(
@@ -4997,6 +5020,14 @@ mod tests {
         .unwrap();
         assert_eq!(no_key.decision, "REUSE");
         assert_eq!(no_key.candidate_thread_id.as_deref(), Some("thread-a"));
+        connection
+            .execute_batch(
+                "UPDATE runtime_delegation_leases
+                 SET state = 'RELEASED', release_reason = 'TEST_COMPLETE'
+                 WHERE state IN ('PENDING', 'ACTIVE');
+                 UPDATE agent_thread_instances SET claimed_until = NULL;",
+            )
+            .unwrap();
 
         // 异键任务不匹配任何候选。
         let other_task = load_recommendation(
@@ -5389,7 +5420,13 @@ mod tests {
                     release_reason TEXT,
                     admission_tool_use_id TEXT,
                     admitted_at TEXT,
-                    admission_confirmed_at TEXT
+                    admission_confirmed_at TEXT,
+                    agent_type TEXT NOT NULL DEFAULT 'executor'
+                 );
+                 CREATE TABLE job_attempts (
+                    lease_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    dispatch_recorded_at TEXT
                  );
                  CREATE TABLE runtime_hook_turns (
                     turn_id TEXT PRIMARY KEY,

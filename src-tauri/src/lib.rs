@@ -4,10 +4,15 @@ mod codex_environment;
 mod codex_hooks;
 mod codex_schema_probe;
 mod configuration;
+mod delivery_receipt;
 mod domain;
 mod model;
+mod orchestration_contract;
+mod orchestration_job;
+mod orchestration_receipt;
 mod persistence;
 mod provider;
+mod runtime_adapter;
 mod runtime_bridge;
 mod settings;
 mod usage;
@@ -34,10 +39,18 @@ use configuration::{
     SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse,
     SnapshotRestoreRequest, SnapshotRestoreResponse,
 };
+use delivery_receipt::DeliveryReceiptRepository;
 use model::{
     ModelAddRequest, ModelConnectionTestResponse, ModelDeleteRequest, ModelDetailResponse,
     ModelGetRequest, ModelListRequest, ModelService, ModelSetEnabledRequest, ModelSummary,
     ModelTestConnectionRequest, ModelUpdateRequest,
+};
+use orchestration_job::{
+    OrchestrationJobCreateRequest, OrchestrationJobCreateResponse, OrchestrationJobDetailResponse,
+    OrchestrationJobGetRequest, OrchestrationJobReviewRequest, OrchestrationJobReviewResponse,
+    OrchestrationJobService, OrchestrationReviewerCreateRequest,
+    OrchestrationReviewerCreateResponse, OrchestrationReviewerReport,
+    OrchestrationReviewerReportSubmitRequest,
 };
 use provider::{
     ApiError, DeleteResult, ProviderCreateRequest, ProviderDeleteRequest, ProviderDetailResponse,
@@ -45,14 +58,15 @@ use provider::{
     ProviderUpdateRequest,
 };
 use runtime_bridge::{
-    AgentThreadExecutionResponse, ManagedSessionRecoveryRequest, ManagedSessionResponse,
-    ManagedSessionResumeRequest, ManagedSessionStartRequest, ManagedTurnStartRequest,
-    ManagedTurnStartResponse, RuntimeBridgeService, RuntimeBridgeStatusResponse,
+    AgentThreadExecutionRequest, AgentThreadExecutionResponse, ManagedSessionRecoveryRequest,
+    ManagedSessionResponse, ManagedSessionResumeRequest, ManagedSessionStartRequest,
+    ManagedTurnStartRequest, ManagedTurnStartResponse, RuntimeBridgeService,
+    RuntimeBridgeStatusResponse,
 };
 use settings::{SettingsResponse, SettingsUpdateRequest};
 use usage::{
     AgentScheduleDecisionListRequest, AgentThreadCleanupRequest, AgentThreadCleanupResponse,
-    AgentThreadExecutionRequest, AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
+    AgentThreadInstanceListRequest, AgentThreadInstanceListResponse,
     AgentThreadInstanceRecommendRequest, AgentThreadInstanceRecommendation,
     AgentThreadInstanceResponse, AgentThreadInstanceReuseStateRequest,
     AgentThreadInstanceWorkspaceScopeRequest, AgentThreadProjectListResponse,
@@ -698,9 +712,10 @@ fn runtime_enforcement_event_list(
 #[tauri::command]
 fn agent_thread_instance_execute(
     bridge: tauri::State<'_, RuntimeBridgeService>,
+    orchestration: tauri::State<'_, OrchestrationJobService>,
     request: AgentThreadExecutionRequest,
 ) -> Result<AgentThreadExecutionResponse, ApiError> {
-    bridge.execute_agent_thread(request)
+    bridge.execute_agent_thread(&orchestration, request)
 }
 
 #[tauri::command]
@@ -785,6 +800,46 @@ fn usage_managed_turn_start(
     bridge.managed_turn_start(request)
 }
 
+#[tauri::command]
+fn orchestration_job_create(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationJobCreateRequest,
+) -> Result<OrchestrationJobCreateResponse, orchestration_contract::OrchestrationError> {
+    service.create_or_get(request)
+}
+
+#[tauri::command]
+fn orchestration_job_get(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationJobGetRequest,
+) -> Result<Option<OrchestrationJobDetailResponse>, orchestration_contract::OrchestrationError> {
+    service.get(request)
+}
+
+#[tauri::command]
+fn orchestration_job_review(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationJobReviewRequest,
+) -> Result<OrchestrationJobReviewResponse, orchestration_contract::OrchestrationError> {
+    service.review(request)
+}
+
+#[tauri::command]
+fn orchestration_reviewer_create(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationReviewerCreateRequest,
+) -> Result<OrchestrationReviewerCreateResponse, orchestration_contract::OrchestrationError> {
+    service.create_reviewer(request)
+}
+
+#[tauri::command]
+fn orchestration_reviewer_report_submit(
+    service: tauri::State<'_, OrchestrationJobService>,
+    request: OrchestrationReviewerReportSubmitRequest,
+) -> Result<OrchestrationReviewerReport, orchestration_contract::OrchestrationError> {
+    service.submit_reviewer_report(request)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -799,6 +854,8 @@ pub fn run() {
             app.manage(NativeObserverService::default());
             app.manage(RuntimeBridgeService::open(&database_path, &data_home)?);
             app.manage(ConfigurationService::open(&database_path, &data_home)?);
+            app.manage(OrchestrationJobService::open(&database_path)?);
+            app.manage(DeliveryReceiptRepository::open(&database_path)?);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -867,7 +924,12 @@ pub fn run() {
             usage_managed_session_start,
             usage_managed_session_resume,
             usage_managed_session_resolve_recovery,
-            usage_managed_turn_start
+            usage_managed_turn_start,
+            orchestration_job_create,
+            orchestration_job_get,
+            orchestration_job_review,
+            orchestration_reviewer_create,
+            orchestration_reviewer_report_submit
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Agent Switch");

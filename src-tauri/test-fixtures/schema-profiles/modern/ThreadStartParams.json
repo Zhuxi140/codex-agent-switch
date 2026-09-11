@@ -1,0 +1,1 @@
+{"type":"object","required":["cwd"],"properties":{"cwd":{},"model":{},"modelProvider":{},"developerInstructions":{},"sandbox":{},"futureOptionalField":{}}}

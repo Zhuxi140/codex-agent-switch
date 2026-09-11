@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 32;
+const LATEST_SCHEMA_VERSION: i64 = 39;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -159,6 +159,41 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "runtime_delegation_confirmation",
         include_str!("../migrations/0032_runtime_delegation_confirmation.sql"),
     ),
+    (
+        33,
+        "orchestration_jobs_and_attempts",
+        include_str!("../migrations/0033_orchestration_jobs_and_attempts.sql"),
+    ),
+    (
+        34,
+        "execution_kind_observations",
+        include_str!("../migrations/0034_execution_kind_observations.sql"),
+    ),
+    (
+        35,
+        "atomic_scheduling_ownership",
+        include_str!("../migrations/0035_atomic_scheduling_ownership.sql"),
+    ),
+    (
+        36,
+        "delivery_receipts",
+        include_str!("../migrations/0036_delivery_receipts.sql"),
+    ),
+    (
+        37,
+        "runtime_receipt_events",
+        include_str!("../migrations/0037_runtime_receipt_events.sql"),
+    ),
+    (
+        38,
+        "review_decisions",
+        include_str!("../migrations/0038_review_decisions.sql"),
+    ),
+    (
+        39,
+        "reviewer_reports",
+        include_str!("../migrations/0039_reviewer_reports.sql"),
+    ),
 ];
 
 pub(crate) fn open_database(path: &Path) -> Result<Connection, PersistenceError> {
@@ -253,7 +288,7 @@ impl From<rusqlite::Error> for PersistenceError {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::OptionalExtension;
+    use rusqlite::{OptionalExtension, params};
 
     use super::*;
 
@@ -286,6 +321,502 @@ mod tests {
             apply_migrations(&mut connection, MIGRATIONS),
             Err(PersistenceError::SchemaTooNew)
         ));
+    }
+
+    #[test]
+    fn execution_kind_migration_supports_fresh_and_0033_upgrade() {
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut fresh, MIGRATIONS).unwrap();
+        assert_eq!(
+            fresh
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            39
+        );
+        assert!(
+            fresh
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'job_attempts'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fresh
+                .query_row(
+                    "SELECT execution_kind FROM token_usage_records LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .unwrap(),
+            None
+        );
+
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut upgraded, &MIGRATIONS[..33]).unwrap();
+        upgraded
+            .execute(
+                "INSERT INTO token_usage_records (
+                    id, codex_session_id, codex_thread_id, input_tokens, cached_input_tokens,
+                    cache_write_input_tokens, output_tokens, reasoning_output_tokens, total_tokens,
+                    usage_status, source, started_at, updated_at
+                 ) VALUES (
+                    'usage-before-0034', 'session-1', 'thread-1', 0, 0, 0, 0, 0, 0,
+                    'UNKNOWN', 'CODEX_APP_SERVER', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        apply_migrations(&mut upgraded, MIGRATIONS).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            39
+        );
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT execution_kind FROM token_usage_records WHERE id = 'usage-before-0034'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "OBSERVED_EXTERNAL"
+        );
+        assert!(
+            upgraded
+                .execute(
+                    "UPDATE token_usage_records SET execution_kind = 'UNKNOWN' WHERE id = 'usage-before-0034'",
+                    [],
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn runtime_receipt_event_migration_supports_fresh_and_0036_upgrade() {
+        let mut fresh = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut fresh, MIGRATIONS).unwrap();
+        assert_eq!(
+            fresh
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            39
+        );
+        assert!(
+            fresh
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'runtime_receipt_events'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut upgraded, &MIGRATIONS[..35]).unwrap();
+        apply_migrations(&mut upgraded, MIGRATIONS).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            39
+        );
+        assert!(
+            upgraded
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'idx_runtime_receipt_events_pending'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn review_migration_preserves_threads_and_adds_held_for_review() {
+        let mut upgraded = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut upgraded, &MIGRATIONS[..37]).unwrap();
+        upgraded
+            .execute(
+                "INSERT INTO agent_thread_instances (
+                    id, codex_thread_id, status, created_at, last_used_at, reuse_state
+                 ) VALUES (
+                    'instance-before-0038', 'thread-before-0038', 'IDLE',
+                    '2026-09-10T00:00:00Z', '2026-09-10T00:00:00Z', 'ACTIVE'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        apply_migrations(&mut upgraded, MIGRATIONS).unwrap();
+        assert_eq!(
+            upgraded
+                .query_row(
+                    "SELECT reuse_state FROM agent_thread_instances
+                     WHERE id = 'instance-before-0038'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ACTIVE"
+        );
+        upgraded
+            .execute(
+                "UPDATE agent_thread_instances SET reuse_state = 'HELD_FOR_REVIEW'
+                 WHERE id = 'instance-before-0038'",
+                [],
+            )
+            .unwrap();
+        assert!(
+            upgraded
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'review_decisions'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            upgraded
+                .prepare("PRAGMA foreign_key_check")
+                .unwrap()
+                .query_map([], |_| Ok(()))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn atomic_scheduling_ownership_backfills_agent_type_and_enforces_one_live_slot() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..34]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, role_key,
+                    created_at, updated_at
+                 ) VALUES
+                    ('agent-executor', 'executor-key', 'Executor', 'test', 'test', 'CUSTOM', 1,
+                     'WORKSPACE_WRITE', 'HIGH', 'CAS', 1, 'executor',
+                     '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'),
+                    ('agent-tester', 'tester-key', 'Tester', 'test', 'test', 'CUSTOM', 1,
+                     'WORKSPACE_WRITE', 'MEDIUM', 'CAS', 1, NULL,
+                     '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z');
+                 INSERT INTO agent_schedule_decisions (
+                    id, created_at, source, workspace_scope_key, decision, reason_code, cache_hint
+                 ) VALUES
+                    ('decision-executor', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE'),
+                    ('decision-tester', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE'),
+                    ('decision-next', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE');
+                 INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id, workspace_scope_key,
+                    schedule_decision_id, state, expires_at
+                 ) VALUES
+                    ('lease-executor', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z',
+                     'agent-executor', 'parent-1', 'workspace-1', 'decision-executor', 'PENDING',
+                     '2026-09-10T00:00:00Z'),
+                    ('lease-tester', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z',
+                     'agent-tester', 'parent-1', 'workspace-1', 'decision-tester', 'ACTIVE',
+                     '2026-09-10T00:00:00Z');",
+            )
+            .unwrap();
+
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        let types = connection
+            .prepare("SELECT agent_type FROM runtime_delegation_leases ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(types, vec!["executor", "tester-key"]);
+
+        let same_type = connection.execute(
+            "INSERT INTO runtime_delegation_leases (
+                id, created_at, updated_at, agent_id, parent_thread_id, workspace_scope_key,
+                schedule_decision_id, state, expires_at, agent_type
+             ) VALUES (
+                'lease-conflict', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z',
+                'agent-executor', 'parent-1', 'workspace-1', 'decision-next', 'ACTIVE',
+                '2026-09-10T00:00:00Z', 'executor'
+             )",
+            [],
+        );
+        assert!(same_type.is_err());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_delegation_leases
+                     WHERE workspace_scope_key = 'workspace-1' AND parent_thread_id = 'parent-1'
+                       AND state IN ('PENDING', 'ACTIVE')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_live_agent_type_rolls_back_0035_migration() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..34]).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, role_key,
+                    created_at, updated_at
+                 ) VALUES (
+                    'agent-1', 'executor-key', 'Executor', 'test', 'test', 'CUSTOM', 1,
+                    'WORKSPACE_WRITE', 'HIGH', 'CAS', 1, 'executor',
+                    '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+                 );
+                 INSERT INTO agent_schedule_decisions (
+                    id, created_at, source, workspace_scope_key, decision, reason_code, cache_hint
+                 ) VALUES
+                    ('decision-1', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE'),
+                    ('decision-2', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE');
+                 INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id, workspace_scope_key,
+                    schedule_decision_id, state, expires_at
+                 ) VALUES
+                    ('lease-1', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z', 'agent-1',
+                     'parent-1', 'workspace-1', 'decision-1', 'PENDING', '2026-09-10T00:00:00Z'),
+                    ('lease-2', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z', 'agent-1',
+                     'parent-1', 'workspace-1', 'decision-2', 'ACTIVE', '2026-09-10T00:00:00Z');",
+            )
+            .unwrap();
+
+        assert!(apply_migrations(&mut connection, MIGRATIONS).is_err());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            34
+        );
+        let columns = connection
+            .prepare("PRAGMA table_info(runtime_delegation_leases)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(!columns.iter().any(|column| column == "agent_type"));
+    }
+
+    #[test]
+    fn failed_0033_migration_does_not_advance_schema_version() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..32]).unwrap();
+
+        assert!(
+            apply_migrations(
+                &mut connection,
+                &[(
+                    33,
+                    "orchestration_jobs_and_attempts",
+                    "CREATE TABLE orchestration_jobs_partial (id TEXT); INVALID SQL;"
+                )]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            32
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'orchestration_jobs_partial'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn orchestration_job_idempotency_key_is_unique_within_its_frozen_scope() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        connection
+            .execute(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (
+                    'agent-1', 'agent-1', 'Agent 1', 'test', 'test', 'CUSTOM', 1,
+                    'WORKSPACE_WRITE', 'INHERIT', 'CAS', 1,
+                    '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+                 )",
+                [],
+            )
+            .unwrap();
+
+        let insert = "INSERT INTO orchestration_jobs (
+                job_id, idempotency_key, task_packet, task_packet_hash, agent_id,
+                parent_thread_id, workspace_scope_key, task_scope_key, state,
+                created_at, updated_at
+            ) VALUES (
+                ?1, 'key-1', '{\"schema_version\":1}', lower(hex(zeroblob(32))), 'agent-1',
+                'parent-1', 'workspace-1', 'scope-1', 'CREATED',
+                '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+            )";
+        connection.execute(insert, ["job-1"]).unwrap();
+        assert!(connection.execute(insert, ["job-2"]).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM orchestration_jobs", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn job_attempt_constraints_reject_external_execution_and_multiple_active_attempts() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type, enabled,
+                    sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                 ) VALUES (
+                    'agent-1', 'agent-1', 'Agent 1', 'test', 'test', 'CUSTOM', 1,
+                    'WORKSPACE_WRITE', 'INHERIT', 'CAS', 1,
+                    '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+                 );
+                 INSERT INTO orchestration_jobs (
+                    job_id, idempotency_key, task_packet, task_packet_hash, agent_id,
+                    parent_thread_id, workspace_scope_key, task_scope_key, state,
+                    created_at, updated_at
+                 ) VALUES (
+                    'job-1', 'key-1', '{\"schema_version\":1}', lower(hex(zeroblob(32))), 'agent-1',
+                    'parent-1', 'workspace-1', 'scope-1', 'CREATED',
+                    '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+                 );
+                 INSERT INTO agent_schedule_decisions (
+                    id, created_at, source, workspace_scope_key, decision, reason_code, cache_hint
+                 ) VALUES
+                    ('decision-1', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE'),
+                    ('decision-2', '2026-09-09T00:00:00Z', 'TEST', 'workspace-1', 'SPAWN', 'TEST', 'NONE');
+                 INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id, workspace_scope_key,
+                    schedule_decision_id, state, expires_at, agent_type
+                 ) VALUES
+                    ('lease-1', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z', 'agent-1', 'parent-1',
+                     'workspace-1', 'decision-1', 'PENDING', '2026-09-10T00:00:00Z', 'executor'),
+                    ('lease-2', '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z', 'agent-1', 'parent-1',
+                     'workspace-1', 'decision-2', 'PENDING', '2026-09-10T00:00:00Z', 'tester');",
+            )
+            .unwrap();
+
+        let insert_attempt = "INSERT INTO job_attempts (
+                attempt_id, job_id, attempt_no, previous_attempt_id, schedule_decision_id, lease_id,
+                route_action, planned_execution_kind, execution_kind, state, created_at, updated_at
+            ) VALUES (
+                ?1, 'job-1', ?2, ?3, ?4, ?5, 'SPAWN', 'NATIVE_CHILD', ?6, 'PLANNED',
+                '2026-09-09T00:00:00Z', '2026-09-09T00:00:00Z'
+            )";
+        assert!(
+            connection
+                .execute(
+                    insert_attempt,
+                    params![
+                        "attempt-external",
+                        1,
+                        Option::<&str>::None,
+                        "decision-1",
+                        "lease-1",
+                        "OBSERVED_EXTERNAL",
+                    ],
+                )
+                .is_err()
+        );
+        connection
+            .execute(
+                insert_attempt,
+                params![
+                    "attempt-1",
+                    1,
+                    Option::<&str>::None,
+                    "decision-1",
+                    "lease-1",
+                    Option::<&str>::None,
+                ],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    insert_attempt,
+                    params![
+                        "attempt-2",
+                        2,
+                        "attempt-1",
+                        "decision-2",
+                        "lease-2",
+                        Option::<&str>::None,
+                    ],
+                )
+                .is_err()
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM job_attempts", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
