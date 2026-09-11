@@ -34,10 +34,7 @@ fn cell(profile: &str, scenario: &str, outcome: &str) -> String {
 
 #[test]
 fn adapter_contract_matrix_covers_supported_and_unsupported_profiles() {
-    let mut report = vec![
-        cell("profile", "scenario", "outcome"),
-        cell("-", "-", "-"),
-    ];
+    let mut report = vec![cell("profile", "scenario", "outcome"), cell("-", "-", "-")];
 
     for (profile, raw) in [("modern", MODERN_EVENTS), ("legacy", LEGACY_EVENTS)] {
         let events = events(raw);
@@ -69,15 +66,29 @@ fn adapter_contract_matrix_covers_supported_and_unsupported_profiles() {
 
         // 场景 3：Turn 响应在缺 Turn ID 时必须 Fail Closed。
         assert!(parse_turn_response(&fixture("missing-turn-id.json")).is_err());
-        report.push(cell(profile, "turn response missing id fail-closed", "PASS"));
+        report.push(cell(
+            profile,
+            "turn response missing id fail-closed",
+            "PASS",
+        ));
 
         // 场景 4：已知方法的畸形事件 Fail Closed；未知事件保持向前兼容。
         assert!(parse_event(&fixture("unsupported-known-malformed.json")).is_err());
-        assert!(parse_event(&fixture("unknown-event.json")).unwrap().is_none());
-        report.push(cell(profile, "malformed fail-closed / unknown ignored", "PASS"));
+        assert!(
+            parse_event(&fixture("unknown-event.json"))
+                .unwrap()
+                .is_none()
+        );
+        report.push(cell(
+            profile,
+            "malformed fail-closed / unknown ignored",
+            "PASS",
+        ));
 
         // 场景 5：未来附加字段不得破坏规范化（版本前瞻兼容）。
-        let future = parse_event(&fixture("future-usage-event.json")).unwrap().unwrap();
+        let future = parse_event(&fixture("future-usage-event.json"))
+            .unwrap()
+            .unwrap();
         assert!(matches!(future, NormalizedRuntimeEvent::Usage { .. }));
         report.push(cell(profile, "future fields tolerated", "PASS"));
     }
@@ -88,7 +99,11 @@ fn adapter_contract_matrix_covers_supported_and_unsupported_profiles() {
         unsupported,
         Err(ProtocolParseError::MissingField("thread.id"))
     ));
-    report.push(cell("unsupported", "thread response missing id", "FAIL-CLOSED"));
+    report.push(cell(
+        "unsupported",
+        "thread response missing id",
+        "FAIL-CLOSED",
+    ));
 
     // 输出可重复报告：相同 Fixture 每次运行产生相同矩阵。
     let report_text = report.join("\n");
