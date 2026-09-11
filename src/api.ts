@@ -401,6 +401,13 @@ export function runDiagnostics(includeNetworkChecks = false): Promise<Diagnostic
   });
 }
 
+export type SettingsEffectivenessLevel = "IMMEDIATE" | "NEXT_TURN" | "RESTART_REQUIRED";
+
+export interface SettingsEffectiveness {
+  level: SettingsEffectivenessLevel;
+  detail: string;
+}
+
 export interface ConfigurationStatusResponse {
   status: ConfigurationStatus;
   desiredStateHash: string | null;
@@ -408,6 +415,7 @@ export interface ConfigurationStatusResponse {
   driftCount: number;
   conflictCount: number;
   restartRecommended: boolean;
+  effectiveness: SettingsEffectiveness | null;
   runtimeMode: RuntimeModeResponse | null;
   activeOperationId: string | null;
   issues: DiagnosticIssue[];

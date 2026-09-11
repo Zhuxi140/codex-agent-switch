@@ -965,6 +965,18 @@ function OverviewPage({
             </span>
           </div>
         )}
+        {configuration?.effectiveness && !restartPending && (
+          <div className={`effectiveness-hint effectiveness-${configuration.effectiveness.level.toLowerCase()}`}>
+            <strong>
+              {configuration.effectiveness.level === "IMMEDIATE"
+                ? "设置即时生效"
+                : configuration.effectiveness.level === "NEXT_TURN"
+                  ? "设置对下一 Turn 生效"
+                  : "需重启或新建 Task"}
+            </strong>
+            <span>{configuration.effectiveness.detail}</span>
+          </div>
+        )}
         {runtimeUsesSubagents
           && runtimeHookStatus
           && runtimeHookStatus.status !== "ACTIVE"

@@ -6,13 +6,13 @@ use cas_scheduler::hard_gates::{
     ExecutionKind as SchedulerExecutionKind, HardGateContext, HardGateReasonCode, RequiredIdentity,
     RequiredScope, ThreadState,
 };
-use cas_scheduler::scoring::{
-    CacheEvidenceSource, ReuseSelection, ReuseStrategy, ScoringCandidate, ScoringPolicy,
-    select_reuse,
-};
 use cas_scheduler::runtime_policy::{
     AdmissionDecision, OrchestrationFailurePolicy, RuntimePolicyInput, RuntimePolicyMode,
     RuntimePolicyReasonCode, evaluate_runtime_policy,
+};
+use cas_scheduler::scoring::{
+    CacheEvidenceSource, ReuseSelection, ReuseStrategy, ScoringCandidate, ScoringPolicy,
+    select_reuse,
 };
 use cas_scheduler::{
     Profile as LegacySchedulingProfile, REUSE_CLAIM_TTL_SECONDS, SPAWN_RESERVATION_TTL_SECONDS,
@@ -1956,16 +1956,12 @@ fn project_is_excluded(
     }))
 }
 
-fn runtime_policy_mode(
-    connection: &Connection,
-) -> Result<RuntimePolicyMode, OrchestrationError> {
+fn runtime_policy_mode(connection: &Connection) -> Result<RuntimePolicyMode, OrchestrationError> {
     connection
         .query_row(
-            "SELECT EXISTS(
-                    SELECT 1
-                    FROM active_agent_bindings binding
-                    JOIN agents agent ON agent.id = binding.agent_id AND agent.enabled = 1
-                 ) OR EXISTS(
+            // 模式是配置事实：绑定存在即编排模式。Agent 启停由硬门槛以
+            // AGENT_NOT_ENABLED/AGENT_NOT_EXECUTABLE 上报，不得掩盖为 DEFAULT_MODE。
+            "SELECT EXISTS(SELECT 1 FROM active_agent_bindings) OR EXISTS(
                     SELECT 1 FROM configuration_state
                     WHERE active_agent_id IS NOT NULL
                  )",
@@ -2060,6 +2056,89 @@ fn current_timestamp(connection: &Connection) -> Result<String, OrchestrationErr
             row.get(0)
         })
         .map_err(|_| persistence_error())
+}
+
+/// E-04：运行模式切换后释放「可证明未派发」的 Reservation/Lease/Attempt/Job。
+/// 已有 `dispatch_recorded_at`、Hook Admission 或非 PLANNED Attempt 的占用不满足
+/// 未发送事实，保持原状等待恢复或 TTL，不假装取消（设计 §16.4）。
+pub(crate) fn release_undispatched_occupancy_for_mode_switch(
+    connection: &mut Connection,
+) -> Result<(), OrchestrationError> {
+    let now = current_timestamp(connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| persistence_error())?;
+    let revoked = transaction
+        .execute(
+            "UPDATE runtime_delegation_leases AS lease
+             SET state = 'REVOKED', released_at = ?1, updated_at = ?1,
+                 release_reason = 'MODE_SWITCH_REVOKED'
+             WHERE lease.state = 'PENDING'
+               AND lease.admission_tool_use_id IS NULL
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM job_attempts attempt
+                       WHERE attempt.lease_id = lease.id
+                         AND attempt.state = 'PLANNED'
+                         AND attempt.dispatch_recorded_at IS NULL
+                   )
+                   OR NOT EXISTS (
+                       SELECT 1 FROM job_attempts attempt WHERE attempt.lease_id = lease.id
+                   )
+               )",
+            [&now.clone()],
+        )
+        .map_err(|_| persistence_error())?;
+    if revoked > 0 {
+        transaction
+            .execute(
+                "UPDATE job_attempts
+                 SET state = 'CANCELLED', updated_at = ?1, terminal_at = ?1
+                 WHERE state = 'PLANNED'
+                   AND dispatch_recorded_at IS NULL
+                   AND lease_id IN (
+                       SELECT id FROM runtime_delegation_leases
+                       WHERE state = 'REVOKED' AND release_reason = 'MODE_SWITCH_REVOKED'
+                   )",
+                [&now],
+            )
+            .map_err(|_| persistence_error())?;
+        transaction
+            .execute(
+                "UPDATE orchestration_jobs
+                 SET state = 'CANCELLED', terminal_at = ?1, updated_at = ?1
+                 WHERE state = 'CLAIMED'
+                   AND EXISTS (
+                       SELECT 1 FROM job_attempts attempt
+                       WHERE attempt.job_id = orchestration_jobs.job_id
+                         AND attempt.state = 'CANCELLED'
+                   )",
+                [&now],
+            )
+            .map_err(|_| persistence_error())?;
+        transaction
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET claimed_until = NULL, claim_lease_id = NULL
+                 WHERE claim_lease_id IN (
+                     SELECT id FROM runtime_delegation_leases
+                     WHERE state = 'REVOKED' AND release_reason = 'MODE_SWITCH_REVOKED'
+                 )",
+                [],
+            )
+            .map_err(|_| persistence_error())?;
+        transaction
+            .execute(
+                "DELETE FROM agent_spawn_reservations
+                 WHERE lease_id IN (
+                     SELECT id FROM runtime_delegation_leases
+                     WHERE state = 'REVOKED' AND release_reason = 'MODE_SWITCH_REVOKED'
+                 )",
+                [],
+            )
+            .map_err(|_| persistence_error())?;
+    }
+    transaction.commit().map_err(|_| persistence_error())
 }
 
 fn schedule_error(
@@ -3386,5 +3465,136 @@ mod tests {
             }
             assert_no_delegation_occupancy(&service);
         }
+    }
+
+    #[test]
+    fn mode_switch_releases_undispatched_occupancy_and_cancels_job() {
+        let service = OrchestrationJobService::in_memory();
+        seed_agent(&service, "agent-1", "executor");
+        let permit = ready(
+            service
+                .schedule_atomic(request(
+                    packet("job-1", "mode-switch-spawn", "agent-1", "task-1"),
+                    RouteAction::Spawn,
+                ))
+                .unwrap(),
+        );
+        assert_eq!(permit.job.state, JobState::Claimed);
+        assert_eq!(table_count(&service, "agent_spawn_reservations"), 1);
+
+        let mut connection = service.connection().unwrap();
+        release_undispatched_occupancy_for_mode_switch(&mut connection).unwrap();
+        let (lease_state, release_reason, attempt_state, job_state): (
+            String,
+            String,
+            String,
+            String,
+        ) = connection
+            .query_row(
+                "SELECT
+                    (SELECT state || '|' || release_reason FROM runtime_delegation_leases),
+                    (SELECT state FROM job_attempts),
+                    (SELECT state FROM orchestration_jobs)",
+                [],
+                |row| {
+                    let lease: String = row.get(0)?;
+                    let attempt: String = row.get(1)?;
+                    let job: String = row.get(2)?;
+                    let (lease_state, release_reason) = lease
+                        .split_once('|')
+                        .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+                    Ok((
+                        lease_state.to_owned(),
+                        release_reason.to_owned(),
+                        attempt,
+                        job,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(lease_state, "REVOKED");
+        assert_eq!(release_reason, "MODE_SWITCH_REVOKED");
+        assert_eq!(attempt_state, "CANCELLED");
+        assert_eq!(job_state, "CANCELLED");
+        assert_eq!(table_count(&service, "agent_spawn_reservations"), 0);
+    }
+
+    #[test]
+    fn mode_switch_keeps_dispatched_occupancy_untouched() {
+        let service = OrchestrationJobService::in_memory();
+        seed_agent(&service, "agent-1", "executor");
+        let permit = ready(
+            service
+                .schedule_atomic(request(
+                    packet("job-1", "mode-switch-dispatched", "agent-1", "task-1"),
+                    RouteAction::Spawn,
+                ))
+                .unwrap(),
+        );
+        let dispatched = service.authorize_dispatch(&permit).unwrap();
+        assert_eq!(dispatched.dispatch_recorded_at.is_some(), true);
+
+        let mut connection = service.connection().unwrap();
+        release_undispatched_occupancy_for_mode_switch(&mut connection).unwrap();
+        drop(connection);
+
+        let connection = service.connection().unwrap();
+        let (lease_state, attempt_state, job_state): (String, String, String) = connection
+            .query_row(
+                "SELECT (SELECT state FROM runtime_delegation_leases),
+                        (SELECT state FROM job_attempts),
+                        (SELECT state FROM orchestration_jobs)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(lease_state, "PENDING");
+        assert_eq!(attempt_state, "DISPATCHING");
+        assert_eq!(job_state, "DISPATCHED");
+        assert_eq!(table_count(&service, "agent_spawn_reservations"), 1);
+    }
+
+    #[test]
+    fn mode_switch_releases_reuse_claim_and_keeps_thread_history() {
+        let service = OrchestrationJobService::in_memory();
+        seed_agent(&service, "agent-1", "executor");
+        seed_candidate(&service, "agent-1", "thread-1");
+        let mut schedule_request = request(
+            packet("job-1", "mode-switch-reuse", "agent-1", "task-1"),
+            RouteAction::Reuse,
+        );
+        schedule_request.expected_candidate_thread_id = Some("thread-1".to_owned());
+        let _permit = ready(service.schedule_atomic(schedule_request).unwrap());
+        let claimed: i64 = service
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM agent_thread_instances WHERE claim_lease_id IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claimed, 1);
+
+        let mut connection = service.connection().unwrap();
+        release_undispatched_occupancy_for_mode_switch(&mut connection).unwrap();
+        drop(connection);
+
+        let connection = service.connection().unwrap();
+        let (claim_count, thread_total): (i64, i64) = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM agent_thread_instances WHERE claim_lease_id IS NOT NULL),
+                        (SELECT COUNT(*) FROM agent_thread_instances)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(claim_count, 0);
+        assert_eq!(thread_total, 1, "Thread 历史与 Usage 必须保留");
+        assert_eq!(table_count(&service, "agent_schedule_decisions"), 2);
     }
 }

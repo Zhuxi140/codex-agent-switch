@@ -1898,6 +1898,31 @@ code,
   color: hsl(var(--danger) / 0.72);
 }
 
+.effectiveness-hint {
+  display: grid;
+  gap: 3px;
+  padding: 11px 13px;
+  border: 1px solid hsl(var(--muted) / 0.4);
+  border-radius: 9px;
+  font-size: 12px;
+  background: hsl(var(--muted) / 0.16);
+}
+
+.effectiveness-hint strong {
+  font-size: 12px;
+}
+
+.effectiveness-hint span {
+  line-height: 1.5;
+  color: hsl(var(--muted));
+}
+
+.effectiveness-hint.effectiveness-restart_required {
+  border-color: hsl(var(--warning) / 0.34);
+  color: hsl(var(--warning));
+  background: hsl(var(--warning) / 0.08);
+}
+
 .inline-success {
   padding: 10px 12px;
   border: 1px solid hsl(var(--success) / 0.28);

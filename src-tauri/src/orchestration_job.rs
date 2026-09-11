@@ -11,9 +11,14 @@ use crate::orchestration_contract::{
 };
 use crate::persistence::{PersistenceError, open_database};
 
+pub(crate) mod query;
 mod review;
 mod reviewer;
 mod schedule;
+pub(crate) use query::{
+    OrchestrationAttemptTracking, OrchestrationJobListRequest, OrchestrationJobPageResponse,
+    OrchestrationJobTracking,
+};
 pub(crate) use review::{OrchestrationJobReviewRequest, OrchestrationJobReviewResponse};
 pub(crate) use reviewer::{
     OrchestrationReviewerCreateRequest, OrchestrationReviewerCreateResponse,
@@ -21,7 +26,7 @@ pub(crate) use reviewer::{
 };
 pub(crate) use schedule::{
     AtomicScheduleOutcome, AtomicScheduleRequest, DispatchAdmission, DispatchAgentProfile,
-    DispatchPermit, ScheduleStop,
+    DispatchPermit, ScheduleStop, release_undispatched_occupancy_for_mode_switch,
 };
 
 pub(crate) struct OrchestrationJobService {
