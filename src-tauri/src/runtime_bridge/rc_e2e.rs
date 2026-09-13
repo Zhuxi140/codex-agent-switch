@@ -632,6 +632,63 @@ fn invoke_concurrent_schedule(
         .collect()
 }
 
+fn release_rc2_preflight_probe(
+    database_path: &Path,
+    agent_id: &str,
+    parent_thread_id: &str,
+    workspace_scope_key: &str,
+    task_scope_key: &str,
+) -> Result<(), Rc1Failure> {
+    let mut connection = stage(Connection::open(database_path), "RC2_PROBE_CLEANUP_FAILED")?;
+    let transaction = stage(connection.transaction(), "RC2_PROBE_CLEANUP_FAILED")?;
+    let released = stage(
+        transaction.execute(
+            "UPDATE runtime_delegation_leases
+             SET state = 'RELEASED',
+                 released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 release_reason = 'RC2_PREFLIGHT_PROBE_COMPLETE'
+             WHERE agent_id = ?1 AND parent_thread_id = ?2
+               AND workspace_scope_key = ?3 AND task_scope_key = ?4
+               AND state = 'PENDING' AND codex_agent_id IS NULL
+               AND admission_tool_use_id IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM job_attempts attempt
+                   WHERE attempt.lease_id = runtime_delegation_leases.id
+               )",
+            params![
+                agent_id,
+                parent_thread_id,
+                workspace_scope_key,
+                task_scope_key
+            ],
+        ),
+        "RC2_PROBE_CLEANUP_FAILED",
+    )?;
+    let reservations = stage(
+        transaction.execute(
+            "DELETE FROM agent_spawn_reservations
+             WHERE agent_id = ?1 AND parent_thread_id = ?2
+               AND workspace_scope_key = ?3 AND task_scope_key = ?4",
+            params![
+                agent_id,
+                parent_thread_id,
+                workspace_scope_key,
+                task_scope_key
+            ],
+        ),
+        "RC2_PROBE_CLEANUP_FAILED",
+    )?;
+    if released != 1 || reservations != 1 {
+        return Err(Rc1Failure::new(
+            "RC2_PROBE_CLEANUP_FAILED",
+            format!("预检清理数量异常：releasedLeases={released}, reservations={reservations}"),
+        ));
+    }
+    stage(transaction.commit(), "RC2_PROBE_CLEANUP_FAILED")?;
+    Ok(())
+}
+
 fn codex_state_database(codex_home: &Path) -> Result<PathBuf, Rc1Failure> {
     let entries = stage(
         fs::read_dir(codex_home),
@@ -785,6 +842,13 @@ fn run_rc2_matrix(
             format!("期望 SPAWN=1/WAIT=1，实际 SPAWN={spawn_count}/WAIT={wait_count}"),
         ));
     }
+    release_rc2_preflight_probe(
+        database_path,
+        &agent.id,
+        parent_thread_id,
+        &base.workspace_scope_key,
+        CONCURRENT_TASK_SCOPE_KEY,
+    )?;
 
     let alternate_workspace = root.join("workspace-other");
     stage(
@@ -804,6 +868,13 @@ fn run_rc2_matrix(
         "SPAWN",
         Some("NO_WORKSPACE_SCOPE_MATCH"),
         "RC2_WORKSPACE_ISOLATION_FAILED",
+    )?;
+    release_rc2_preflight_probe(
+        database_path,
+        &agent.id,
+        parent_thread_id,
+        &workspace_invocation.workspace_scope_key,
+        TASK_SCOPE_KEY,
     )?;
 
     let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
@@ -838,6 +909,16 @@ fn run_rc2_matrix(
         ),
         "RC2_FINGERPRINT_RESTORE_FAILED",
     )?;
+    stage(
+        restore_connection.execute(
+            "UPDATE agent_thread_instances
+             SET reuse_state = 'ACTIVE', reuse_state_reason = NULL
+             WHERE codex_thread_id = ?1 AND reuse_state = 'RETIRED'
+               AND reuse_state_reason = 'RUNTIME_FINGERPRINT_MISMATCH'",
+            [&instance.thread_id],
+        ),
+        "RC2_FINGERPRINT_RESTORE_FAILED",
+    )?;
     drop(restore_connection);
     let fingerprint_decision = fingerprint_result?;
     require_decision(
@@ -845,6 +926,13 @@ fn run_rc2_matrix(
         "SPAWN",
         Some("RUNTIME_FINGERPRINT_MISMATCH"),
         "RC2_FINGERPRINT_ISOLATION_FAILED",
+    )?;
+    release_rc2_preflight_probe(
+        database_path,
+        &agent.id,
+        parent_thread_id,
+        &base.workspace_scope_key,
+        TASK_SCOPE_KEY,
     )?;
 
     let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
@@ -912,7 +1000,7 @@ fn run_rc2_matrix(
 
 fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     let root = required_path("CAS_E2E_ROOT")?;
-    let _cleanup = TempRoot(root.clone());
+    let cleanup = TempRoot(root.clone());
     let source_database = required_path("CAS_E2E_SOURCE_DATABASE_PATH")?;
     let source_codex_home = required_path("CAS_E2E_SOURCE_CODEX_HOME")?;
     let helper_source = required_path("CAS_E2E_HELPER_PATH")?;
@@ -947,7 +1035,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     stage(
         fs::write(
             codex_home.join("config.toml"),
-            b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n",
+            b"approval_policy = \"on-failure\"\nsandbox_mode = \"workspace-write\"\n",
         ),
         "NON_INTERACTIVE_CONFIG_FAILED",
     )?;
@@ -1010,7 +1098,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
         let session = stage(
             bridge.managed_session_start_inner(ManagedSessionStartRequest {
                 cwd: workspace.to_string_lossy().into_owned(),
-                approval_policy: Some("on-request".to_owned()),
+                approval_policy: Some("on-failure".to_owned()),
                 sandbox: Some("workspace-write".to_owned()),
             }),
             "PRIMARY_START_FAILED",
@@ -1024,7 +1112,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
                     "在当前工作目录完成稳定任务 `{TASK_SCOPE_KEY}` 的第一步：创建 cas-rc1-first.txt，内容只写 CAS_RC1_FIRST，不得修改其他文件。按当前 CAS 编排规则执行。"
                 ),
                 effort: None,
-                approval_policy: Some("on-request".to_owned()),
+                approval_policy: Some("on-failure".to_owned()),
                 sandbox_policy: Some(json!({
                     "type": "workspaceWrite",
                     "writableRoots": [
@@ -1068,7 +1156,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
                     "继续同一个稳定任务 `{TASK_SCOPE_KEY}`：创建 cas-rc1-second.txt，内容只写 CAS_RC1_SECOND，不得修改其他文件。按当前 CAS 编排规则重新预检并执行。"
                 ),
                 effort: None,
-                approval_policy: Some("on-request".to_owned()),
+                approval_policy: Some("on-failure".to_owned()),
                 sandbox_policy: Some(json!({
                     "type": "workspaceWrite",
                     "writableRoots": [
@@ -1318,6 +1406,13 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
         Ok(result)
     })();
     let _ = bridge.stop_inner();
+    if outcome.is_ok() {
+        drop(cleanup);
+    } else {
+        // 失败保留隔离现场（codex-home 的 rules/config/rollout 是定位
+        // 授权类失败的关键证据），由 write_e2e_result 折叠进诊断。
+        std::mem::forget(cleanup);
+    }
     outcome
 }
 
@@ -1789,11 +1884,17 @@ fn write_e2e_result(outcome: Result<Value, Rc1Failure>, result_label: &str) {
         required_path("CAS_E2E_RESULT_PATH").expect("CAS_E2E_RESULT_PATH is required");
     let payload = match &outcome {
         Ok(value) => value.clone(),
-        Err(error) => json!({
-            "status": "FAIL",
-            "failureCode": error.code,
-            "message": error.message
-        }),
+        Err(error) => {
+            let mut payload = json!({
+                "status": "FAIL",
+                "failureCode": error.code,
+                "message": error.message
+            });
+            if let Some(diagnostics) = collect_preserved_diagnostics() {
+                payload["diagnostics"] = diagnostics;
+            }
+            payload
+        }
     };
     if let Some(parent) = result_path.parent() {
         fs::create_dir_all(parent).expect("create result directory");
@@ -1807,6 +1908,86 @@ fn write_e2e_result(outcome: Result<Value, Rc1Failure>, result_label: &str) {
     if let Err(error) = outcome {
         panic!("{}: {}", error.code, error.message);
     }
+}
+
+/// 失败时把保留的隔离现场关键文件折叠进证据 JSON：
+/// config.toml、CAS rules 文件与 Codex rollout 尾部（含真实命令与拒绝详情）。
+fn collect_preserved_diagnostics() -> Option<Value> {
+    let root = required_path("CAS_E2E_ROOT").ok()?;
+    let codex_home = root.join("codex-home");
+    if !codex_home.is_dir() {
+        return None;
+    }
+    let read_tail = |path: &Path, max_bytes: usize| -> Option<String> {
+        let bytes = fs::read(path).ok()?;
+        let start = bytes.len().saturating_sub(max_bytes);
+        String::from_utf8(bytes[start..].to_vec()).ok()
+    };
+    let mut diagnostics = json!({
+        "e2eRootPreserved": root.display().to_string(),
+        "note": "现场未清理；config/rules/rollout 摘要如下，完整目录请检查 e2eRootPreserved。"
+    });
+    if let Some(config) = read_tail(&codex_home.join("config.toml"), 8_000) {
+        diagnostics["configToml"] = json!(config);
+    }
+    let rules_dir = codex_home.join("rules");
+    if let Ok(entries) = fs::read_dir(&rules_dir) {
+        let mut rules = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|value| value == "rules")
+                && let Some(content) = read_tail(&path, 8_000)
+            {
+                rules.push(json!({
+                    "file": path.display().to_string(),
+                    "content": content
+                }));
+            }
+        }
+        diagnostics["rulesFiles"] = Value::Array(rules);
+    }
+    let sessions_dir = codex_home.join("sessions");
+    let mut rollouts = Vec::new();
+    if let Ok(entries) = fs::read_dir(&sessions_dir) {
+        for entry in entries.flatten().take(20) {
+            collect_rollout_tails(&entry.path(), 6_000, &mut rollouts);
+        }
+    }
+    if !rollouts.is_empty() {
+        diagnostics["rolloutTails"] = Value::Array(rollouts);
+    }
+    Some(diagnostics)
+}
+
+fn collect_rollout_tails(dir: &Path, max_bytes: usize, rollouts: &mut Vec<Value>) {
+    if rollouts.len() >= 6 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rollout_tails(&path, max_bytes, rollouts);
+        } else if path.extension().is_some_and(|value| value == "jsonl")
+            && let Some(tail) = read_rollout_tail(&path, max_bytes)
+        {
+            rollouts.push(json!({
+                "file": path.display().to_string(),
+                "tail": tail
+            }));
+        }
+        if rollouts.len() >= 6 {
+            return;
+        }
+    }
+}
+
+fn read_rollout_tail(path: &Path, max_bytes: usize) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let start = bytes.len().saturating_sub(max_bytes);
+    String::from_utf8(bytes[start..].to_vec()).ok()
 }
 
 #[test]

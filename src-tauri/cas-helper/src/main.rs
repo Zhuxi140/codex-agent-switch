@@ -2078,7 +2078,6 @@ fn reconcile_native_idle_leases(
     active: &ActiveAgentProfile,
     parent_thread_id: &str,
     scope_key: &str,
-    task_scope_key: Option<&str>,
     native_candidates: &[Candidate],
 ) -> Result<(), ScheduleError> {
     let idle_threads = native_candidates
@@ -2097,14 +2096,12 @@ fn reconcile_native_idle_leases(
         [active.agent_id.as_str(), parent_thread_id, scope_key],
     )?;
     for lease in leases.into_iter().filter(|lease| {
-        lease.task_scope_key.as_deref() == task_scope_key
-            && lease.admission_tool_use_id.as_deref().is_some_and(|value| {
-                value.starts_with("native-bind:") || value.starts_with("native-reuse:")
-            })
-            && lease
-                .codex_agent_id
-                .as_deref()
-                .is_some_and(|thread_id| idle_threads.contains(thread_id))
+        lease.admission_tool_use_id.as_deref().is_some_and(|value| {
+            value.starts_with("native-bind:") || value.starts_with("native-reuse:")
+        }) && lease
+            .codex_agent_id
+            .as_deref()
+            .is_some_and(|thread_id| idle_threads.contains(thread_id))
             && !lease_has_job_attempt(connection, &lease.id).unwrap_or(true)
     }) {
         let changed = connection.execute(
@@ -2229,9 +2226,30 @@ fn load_recommendation(
         &active,
         parent_thread_id,
         scope_key,
-        task_scope_key,
         &native_candidates,
     )?;
+    let mut task_scoped_native_candidates = Vec::new();
+    for candidate in native_candidates {
+        if native_record_matches_task_scope(&transaction, &candidate.thread_id, task_scope_key)? {
+            task_scoped_native_candidates.push(candidate);
+        }
+    }
+    let native_candidates = task_scoped_native_candidates;
+    let matching_spawn_reservation_exists = match task_scope_key {
+        Some(task_scope_key) => {
+            transaction.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM agent_spawn_reservations
+                    WHERE agent_id = ?1 AND parent_thread_id = ?2
+                      AND workspace_scope_key = ?3 AND task_scope_key = ?4
+                      AND julianday(reserved_until) > julianday('now')
+                 )",
+                params![active.agent_id, parent_thread_id, scope_key, task_scope_key],
+                |row| row.get::<_, i64>(0),
+            )? != 0
+        }
+        None => false,
+    };
     let matching_lease_exists = transaction.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM runtime_delegation_leases
@@ -2265,7 +2283,13 @@ fn load_recommendation(
     });
     let runtime_fingerprint = active.profile.runtime_fingerprint.clone();
     let mut recommendation = recommend(scope_key.to_owned(), candidates, active.profile);
-    if matching_lease_exists {
+    if matching_spawn_reservation_exists {
+        recommendation.decision = "WAIT";
+        recommendation.reason_code = "SPAWN_RESERVED";
+        recommendation.message = "同一任务已有子 Agent 创建流程正在进行，请稍后重试预检。";
+        recommendation.candidate_instance_id = None;
+        recommendation.candidate_thread_id = None;
+    } else if matching_lease_exists {
         recommendation.decision = "WAIT";
         recommendation.reason_code = "DELEGATION_LEASE_ACTIVE";
         recommendation.message = "同一 Agent Type 已有委派租约，请等待当前子 Agent 完成。";
@@ -2649,6 +2673,24 @@ fn load_native_candidates(
         });
     }
     Ok(candidates)
+}
+
+fn native_record_matches_task_scope(
+    connection: &Connection,
+    thread_id: &str,
+    task_scope_key: Option<&str>,
+) -> Result<bool, ScheduleError> {
+    let bound_task_scope_key = connection
+        .query_row(
+            "SELECT task_scope_key FROM agent_thread_instances WHERE codex_thread_id = ?1",
+            [thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(match bound_task_scope_key {
+        Some(bound_task_scope_key) => bound_task_scope_key.as_deref() == task_scope_key,
+        None => task_scope_key.is_none(),
+    })
 }
 
 fn bind_native_thread(
@@ -4953,6 +4995,7 @@ mod tests {
     fn task_scope_key_gates_reuse_and_bind_persists_it() {
         let mut connection = scheduling_connection();
         let home = native_state_home();
+        insert_native_child(&home, "thread-b", "thread-root", 10, "open");
         let fingerprint = runtime_fingerprint(
             &connection,
             "agent-1",
@@ -5055,7 +5098,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(duplicate_spawn.decision, "WAIT");
-        assert_eq!(duplicate_spawn.reason_code, "DELEGATION_LEASE_ACTIVE");
+        assert_eq!(duplicate_spawn.reason_code, "SPAWN_RESERVED");
 
         // bind 固化任务键并释放对应 SPAWN 预留；后续异键 bind 被拒绝。
         admit_test_spawn(
@@ -5105,6 +5148,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reservation_count, 0);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn cross_task_schedule_releases_idle_native_lease_before_reserving_spawn() {
+        let mut connection = scheduling_connection();
+        let home = native_state_home();
+        insert_native_child(&home, "thread-native", "thread-root", 10, "open");
+
+        let first_task = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            Some("first-task"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first_task.decision, "SPAWN");
+        bind_native_thread(
+            &mut connection,
+            &home,
+            "executor",
+            "thread-native",
+            "c:/workspace/project",
+            "thread-root",
+            Some("first-task"),
+        )
+        .unwrap();
+
+        let second_task = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            Some("second-task"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second_task.decision, "SPAWN");
+        assert_eq!(second_task.reason_code, "NO_WORKSPACE_SCOPE_MATCH");
+        let released_lease_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_delegation_leases
+                 WHERE task_scope_key = 'first-task' AND state = 'RELEASED'
+                   AND release_reason = 'NATIVE_THREAD_IDLE'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(released_lease_count, 1);
+
+        let duplicate = load_recommendation(
+            &mut connection,
+            &home,
+            "executor",
+            "c:/workspace/project",
+            "thread-root",
+            Some("second-task"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(duplicate.decision, "WAIT");
+        assert_eq!(duplicate.reason_code, "SPAWN_RESERVED");
         std::fs::remove_dir_all(home).unwrap();
     }
 

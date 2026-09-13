@@ -1359,21 +1359,38 @@ fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
     if actions.len() != 1 {
         return false;
     }
-    let expected_prefix = format!("& \"{}\" ", helper_path.to_string_lossy());
+    let expected_helper = normalize_workspace_scope_key(&helper_path.to_string_lossy());
+    let expected_database = helper_path.with_file_name("cas.db");
+    let expected_database = normalize_workspace_scope_key(&expected_database.to_string_lossy());
     actions.iter().all(|action| {
         let Some(command) = action.get("command").and_then(Value::as_str) else {
             return false;
         };
-        let Some(arguments) = command.strip_prefix(&expected_prefix) else {
+        let Some(command) = command.strip_prefix("& ") else {
             return false;
         };
-        let arguments = arguments.split_ascii_whitespace().collect::<Vec<_>>();
-        let valid_argument = |value: &&str| {
+        let Some(arguments) = parse_cas_control_plane_arguments(command) else {
+            return false;
+        };
+        let Some((helper, arguments)) = arguments.split_first() else {
+            return false;
+        };
+        if expected_helper.as_deref() != normalize_workspace_scope_key(helper).as_deref() {
+            return false;
+        }
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let valid_argument = |value: &str| {
             !value.is_empty()
                 && value.len() <= 64
                 && value
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        };
+        let valid_database = |value: &str| {
+            expected_database.as_deref() == normalize_workspace_scope_key(value).as_deref()
+        };
+        let valid_workspace = |value: &str| {
+            Path::new(value).is_absolute() && normalize_workspace_scope_key(value).is_some()
         };
         match arguments.as_slice() {
             ["schedule", agent_key] => valid_argument(agent_key),
@@ -1386,9 +1403,85 @@ fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
             ["bind", agent_key, thread_id, task_key] => {
                 valid_argument(agent_key) && valid_argument(thread_id) && valid_argument(task_key)
             }
+            ["schedule", database, agent_key, workspace] => {
+                valid_database(database) && valid_argument(agent_key) && valid_workspace(workspace)
+            }
+            ["schedule", database, agent_key, workspace, task_key] => {
+                valid_database(database)
+                    && valid_argument(agent_key)
+                    && valid_workspace(workspace)
+                    && valid_argument(task_key)
+            }
+            ["bind", database, agent_key, thread_id, workspace] => {
+                valid_database(database)
+                    && valid_argument(agent_key)
+                    && valid_argument(thread_id)
+                    && valid_workspace(workspace)
+            }
+            ["bind", database, agent_key, thread_id, workspace, task_key] => {
+                valid_database(database)
+                    && valid_argument(agent_key)
+                    && valid_argument(thread_id)
+                    && valid_workspace(workspace)
+                    && valid_argument(task_key)
+            }
             _ => false,
         }
     })
+}
+
+fn parse_cas_control_plane_arguments(input: &str) -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    let mut offset = 0;
+    while offset < input.len() {
+        while offset < input.len() {
+            let current = input[offset..].chars().next()?;
+            if !current.is_ascii_whitespace() {
+                break;
+            }
+            offset += current.len_utf8();
+        }
+        if offset == input.len() {
+            break;
+        }
+        let opening = input[offset..].chars().next()?;
+        if matches!(opening, '"' | '\'') {
+            let value_start = offset + 1;
+            let closing = input[value_start..].find(opening)? + value_start;
+            let value = &input[value_start..closing];
+            if value.is_empty()
+                || value.chars().any(|character| {
+                    character.is_control() || (opening == '"' && matches!(character, '`' | '$'))
+                })
+            {
+                return None;
+            }
+            offset = closing + 1;
+            if offset < input.len() && !input[offset..].chars().next()?.is_ascii_whitespace() {
+                return None;
+            }
+            arguments.push(value.to_owned());
+        } else {
+            let start = offset;
+            while offset < input.len() {
+                let current = input[offset..].chars().next()?;
+                if current.is_ascii_whitespace() {
+                    break;
+                }
+                if current.is_control()
+                    || matches!(
+                        current,
+                        '`' | '$' | '"' | '\'' | ';' | '&' | '|' | '<' | '>' | '#' | ','
+                    )
+                {
+                    return None;
+                }
+                offset += current.len_utf8();
+            }
+            arguments.push(input[start..offset].to_owned());
+        }
+    }
+    (!arguments.is_empty()).then_some(arguments)
 }
 
 fn resolve_pending_response(
@@ -2740,6 +2833,24 @@ mod tests {
             &request("& \"C:\\CAS Data\\cas-helper.exe\" bind executor 019ffb28-1234 stable-task"),
             helper,
         ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor \"C:\\Work Space\" stable-task"
+            ),
+            helper,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& \"C:\\CAS Data\\cas-helper.exe\" bind \"C:\\CAS Data\\cas.db\" executor 019ffb28-1234 \"C:\\Work Space\" stable-task"
+            ),
+            helper,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& 'C:\\CAS Data\\cas-helper.exe' schedule 'C:\\CAS Data\\cas.db' executor 'C:\\Work Space' stable-task"
+            ),
+            helper,
+        ));
         assert!(!is_cas_control_plane_request(
             &request("& \"C:\\CAS Data\\cas-helper.exe\" token credential-id"),
             helper,
@@ -2750,6 +2861,18 @@ mod tests {
         ));
         assert!(!is_cas_control_plane_request(
             &request("& \"C:\\Other\\cas-helper.exe\" schedule executor stable-task"),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request(
+                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\Other\\cas.db\" executor \"C:\\Work Space\" stable-task"
+            ),
+            helper,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request(
+                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor relative-workspace stable-task"
+            ),
             helper,
         ));
         assert!(!is_cas_control_plane_request(
