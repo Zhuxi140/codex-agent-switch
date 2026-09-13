@@ -914,19 +914,32 @@ fn run_rc2_matrix(
             "UPDATE agent_thread_instances
              SET reuse_state = 'ACTIVE', reuse_state_reason = NULL
              WHERE codex_thread_id = ?1 AND reuse_state = 'RETIRED'
-               AND reuse_state_reason = 'RUNTIME_FINGERPRINT_MISMATCH'",
+               AND reuse_state_reason IN (
+                   'RUNTIME_FINGERPRINT_MISMATCH', 'AGENT_RUNTIME_CHANGED'
+               )",
             [&instance.thread_id],
         ),
         "RC2_FINGERPRINT_RESTORE_FAILED",
     )?;
     drop(restore_connection);
     let fingerprint_decision = fingerprint_result?;
-    require_decision(
-        &fingerprint_decision,
-        "SPAWN",
-        Some("RUNTIME_FINGERPRINT_MISMATCH"),
-        "RC2_FINGERPRINT_ISOLATION_FAILED",
-    )?;
+    // agents.instruction 更新会触发 retire_threads_after_agent_runtime_change 立即退役，
+    // 因此调度器可能给 RUNTIME_FINGERPRINT_MISMATCH（推荐时判定），也可能给兜底的
+    // CANDIDATE_RETIRED（触发器先行）。两者都证明指纹变化后未复用旧 Thread。
+    if fingerprint_decision.decision != "SPAWN"
+        || !matches!(
+            fingerprint_decision.reason_code.as_str(),
+            "RUNTIME_FINGERPRINT_MISMATCH" | "CANDIDATE_RETIRED"
+        )
+    {
+        return Err(Rc1Failure::new(
+            "RC2_FINGERPRINT_ISOLATION_FAILED",
+            format!(
+                "期望 SPAWN/RUNTIME_FINGERPRINT_MISMATCH 或 SPAWN/CANDIDATE_RETIRED，实际为 {}/{}",
+                fingerprint_decision.decision, fingerprint_decision.reason_code
+            ),
+        ));
+    }
     release_rc2_preflight_probe(
         database_path,
         &agent.id,
@@ -1035,7 +1048,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     stage(
         fs::write(
             codex_home.join("config.toml"),
-            b"approval_policy = \"on-failure\"\nsandbox_mode = \"workspace-write\"\n",
+            b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n",
         ),
         "NON_INTERACTIVE_CONFIG_FAILED",
     )?;
@@ -1098,7 +1111,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
         let session = stage(
             bridge.managed_session_start_inner(ManagedSessionStartRequest {
                 cwd: workspace.to_string_lossy().into_owned(),
-                approval_policy: Some("on-failure".to_owned()),
+                approval_policy: Some("on-request".to_owned()),
                 sandbox: Some("workspace-write".to_owned()),
             }),
             "PRIMARY_START_FAILED",
@@ -1112,7 +1125,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
                     "在当前工作目录完成稳定任务 `{TASK_SCOPE_KEY}` 的第一步：创建 cas-rc1-first.txt，内容只写 CAS_RC1_FIRST，不得修改其他文件。按当前 CAS 编排规则执行。"
                 ),
                 effort: None,
-                approval_policy: Some("on-failure".to_owned()),
+                approval_policy: Some("on-request".to_owned()),
                 sandbox_policy: Some(json!({
                     "type": "workspaceWrite",
                     "writableRoots": [
@@ -1156,7 +1169,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
                     "继续同一个稳定任务 `{TASK_SCOPE_KEY}`：创建 cas-rc1-second.txt，内容只写 CAS_RC1_SECOND，不得修改其他文件。按当前 CAS 编排规则重新预检并执行。"
                 ),
                 effort: None,
-                approval_policy: Some("on-failure".to_owned()),
+                approval_policy: Some("on-request".to_owned()),
                 sandbox_policy: Some(json!({
                     "type": "workspaceWrite",
                     "writableRoots": [

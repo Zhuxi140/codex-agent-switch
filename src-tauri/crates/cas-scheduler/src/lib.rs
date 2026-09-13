@@ -5,7 +5,9 @@ pub mod scoring;
 /// REUSE 短租约时长：覆盖「预检返回 REUSE」到「follow-up 使 Thread 进入 RUNNING」的窗口。
 // ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
 pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;
-pub const SPAWN_RESERVATION_TTL_SECONDS: i64 = 120;
+/// SPAWN 预留与初始租约时长：需覆盖 Primary 从 schedule 到 bind 完成认领的全过程，
+/// 包括 bind 等待原生 Thread 记录持久化的窗口（上游在 Child turn 结束前后才落库）。
+pub const SPAWN_RESERVATION_TTL_SECONDS: i64 = 600;
 const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的 Child Agent，不是 Primary。只完成 TASK 包中的一个可独立验收的工作单元，并把 GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP 视为边界。不得扩展到相邻问题、额外重构、文档、提交、发布、依赖安装，或未明确授权的公开 API、数据模型与产品行为变更。缺少安全推进所需信息、需要未冻结决策、越过允许范围或磁盘事实冲突会改变方向时，立即停止并把控制权交还 Primary；不得猜测或重新执行 Primary 编排流程，也不得递归创建同职责子 Agent。首行必须返回 `RESULT: DONE`、`RESULT: NEEDS_DECISION`、`RESULT: PARTIAL` 或 `RESULT: BLOCKED`，且不得声称未实际验证的结果。";
 const DELEGATED_TOOL_INSTRUCTIONS: &str = "工具契约：本地工具仍受阶段及 ALLOW/DENY 约束。外部 MCP、插件或连接器只可调用 TOOLS 明列且完成 ACCEPT 必需的项；`TOOLS: -` 表示禁用。任何外部写入、消息发送、发布、登录、授权或安装还必须由 ALLOW 明确许可，否则返回 `RESULT: NEEDS_DECISION`。Skill 只按任务匹配和已绑定规则加载，不得扫描或调用无关 Skill。";
 const EXECUTION_PHASE_INSTRUCTIONS: &str = "阶段契约：EXECUTION。优先使用本地已有工具，只在 ALLOW 内做满足 ACCEPT 的最小实现及针对性验证；不负责需求规划、独立审查、发布或相邻清理。随后只报告适用的 `CHANGED`、`VERIFIED`、`REMAINING`、`EVIDENCE`、`NEXT`。";

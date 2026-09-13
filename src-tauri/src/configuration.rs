@@ -2565,6 +2565,22 @@ fn load_desired_resources(
                         session_catalog_path: None,
                     });
                 }
+                // Codex 只从 $CODEX_HOME/skills/<key>/SKILL.md 发现技能；agent 定义内
+                // 的 skills.config 不被 Runtime 消费，必须同时投影到规范位置。
+                let codex_skill_relative_path = format!("skills/{}/SKILL.md", skill.key);
+                resources.push(DesiredResource {
+                    resource_type: BUNDLED_SKILL_RESOURCE.to_owned(),
+                    logical_key: codex_skill_relative_path.clone(),
+                    target_path: safe_join(codex_home, &codex_skill_relative_path)?,
+                    relative_path: codex_skill_relative_path,
+                    semantic: skill.skill.to_owned(),
+                    content: Some(skill.skill.to_owned()),
+                    summary: format!("配置内置 Skill {} 到 Codex 技能目录", skill.key),
+                    origin_entity_type: "SKILL".to_owned(),
+                    origin_entity_id: skill.key.to_owned(),
+                    provider: None,
+                    session_catalog_path: None,
+                });
             }
         }
         if !skills_valid {
@@ -3413,7 +3429,8 @@ fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
             && resource.relative_path.starts_with("cas/model-catalogs/")
             && resource.relative_path.ends_with(".json"))
         || (resource.resource_type == BUNDLED_SKILL_RESOURCE
-            && resource.relative_path.starts_with("cas/bundled-skills/"))
+            && (resource.relative_path.starts_with("cas/bundled-skills/")
+                || resource.relative_path.starts_with("skills/")))
         || (resource.resource_type == EXEC_POLICY_RESOURCE
             && resource.relative_path == EXEC_POLICY_RELATIVE_PATH)
 }
@@ -4317,6 +4334,9 @@ fn managed_relative_path(resource: &ManagedResource) -> Option<String> {
         }
         AGENT_RESOURCE => Some(format!("agents/cas-{}.toml", resource.logical_key)),
         MODEL_CATALOG_RESOURCE => Some(format!("cas/model-catalogs/{}.json", resource.logical_key)),
+        BUNDLED_SKILL_RESOURCE if resource.logical_key.starts_with("skills/") => {
+            Some(resource.logical_key.clone())
+        }
         BUNDLED_SKILL_RESOURCE => Some(format!("cas/bundled-skills/{}", resource.logical_key)),
         EXEC_POLICY_RESOURCE if resource.logical_key == EXEC_POLICY_RELATIVE_PATH => {
             Some(EXEC_POLICY_RELATIVE_PATH.to_owned())
@@ -4454,7 +4474,10 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
                         && resource.relative_path
                             == format!("cas/bundled-skills/{}/{file_name}", skill.key)
                 })
-            }))
+            }) && !(resource.logical_key == resource.relative_path
+                && BUNDLED_SKILLS.iter().any(|skill| {
+                    resource.relative_path == format!("skills/{}/SKILL.md", skill.key)
+                })))
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }

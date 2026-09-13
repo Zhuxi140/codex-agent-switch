@@ -4,7 +4,8 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use cas_native_lifecycle::{
     ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
@@ -2714,18 +2715,7 @@ fn bind_native_thread(
     if !native_state_schema_supported(&state_connection) {
         return Err(ScheduleError::NativeStateIncompatible);
     }
-    let record = load_native_candidate_records(&state_connection)?
-        .into_iter()
-        .find(|record| record.thread_id == child_thread_id)
-        .ok_or(ScheduleError::BindRejected)?;
-    if record
-        .model_slug
-        .as_deref()
-        .is_none_or(|model| model.trim().is_empty())
-        || record.model_provider.trim().is_empty()
-    {
-        return Err(ScheduleError::BindRejected);
-    }
+    let record = wait_for_native_candidate_record(&state_connection, child_thread_id)?;
     if record.parent_thread_id != parent_thread_id
         || record.scope_key != scope_key
         || !(record.agent_role.as_deref() == active.role_key.as_deref()
@@ -3040,6 +3030,58 @@ fn table_columns(
     statement
         .query_map([], |row| row.get(1))?
         .collect::<Result<_, _>>()
+}
+
+/// 上游 Codex 在 Child Thread 的 turn 结束前后才把 threads/thread_spawn_edges 行写入
+/// 原生状态库，而 bind 紧跟 spawn 执行；在窗口内轮询等待记录与模型身份就绪。
+fn wait_for_native_candidate_record(
+    state_connection: &Connection,
+    child_thread_id: &str,
+) -> Result<NativeCandidateRecord, ScheduleError> {
+    poll_native_candidate_record(state_connection, child_thread_id, bind_wait_seconds())
+}
+
+fn poll_native_candidate_record(
+    state_connection: &Connection,
+    child_thread_id: &str,
+    wait_seconds: u64,
+) -> Result<NativeCandidateRecord, ScheduleError> {
+    let deadline = Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        let found = load_native_candidate_records(state_connection)?
+            .into_iter()
+            .find(|record| record.thread_id == child_thread_id);
+        if let Some(record) = found {
+            let model_ready = record
+                .model_slug
+                .as_deref()
+                .is_some_and(|model| !model.trim().is_empty())
+                && !record.model_provider.trim().is_empty();
+            if model_ready {
+                return Ok(record);
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(ScheduleError::BindRejected);
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn bind_wait_seconds() -> u64 {
+    #[cfg(test)]
+    {
+        // 测试构建缩短轮询窗口，避免身份非法用例空等完整窗口。
+        1
+    }
+    #[cfg(not(test))]
+    {
+        env::var("CAS_BIND_WAIT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(180)
+    }
 }
 
 fn load_native_candidate_records(
@@ -4549,6 +4591,23 @@ mod tests {
                 .unwrap(),
             0
         );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn bind_polls_until_late_native_record_is_ready() {
+        let home = native_state_home();
+        let state = Connection::open(home.join("state_7.sqlite")).unwrap();
+        let late_home = home.clone();
+        let late_writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            insert_native_child(&late_home, "thread-late", "thread-root", 10, "open");
+        });
+        let record = poll_native_candidate_record(&state, "thread-late", 5).unwrap();
+        assert_eq!(record.thread_id, "thread-late");
+        assert!(poll_native_candidate_record(&state, "thread-never", 1).is_err());
+        late_writer.join().unwrap();
+        drop(state);
         std::fs::remove_dir_all(home).unwrap();
     }
 
