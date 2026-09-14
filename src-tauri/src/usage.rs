@@ -1140,12 +1140,30 @@ impl SqliteUsageRepository {
 
     fn upsert_snapshot(
         &mut self,
-        snapshot: UsageSnapshot,
+        mut snapshot: UsageSnapshot,
     ) -> Result<UsageUpsertResult, UsageServiceError> {
         let current_context_tokens = snapshot.current_context_tokens;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(execution_kind) =
+            authoritative_thread_execution_kind(&transaction, &snapshot.codex_thread_id)?
+        {
+            // Runtime 观察只能证明外部线程；调度/绑定记录可将其单向提升为已证明类型。
+            if snapshot.execution_kind == ExecutionKind::ObservedExternal {
+                snapshot.execution_kind = execution_kind;
+            }
+            transaction.execute(
+                "UPDATE token_usage_records
+                 SET execution_kind = ?2
+                 WHERE codex_thread_id = ?1
+                   AND execution_kind = 'OBSERVED_EXTERNAL'",
+                params![
+                    snapshot.codex_thread_id,
+                    execution_kind_storage(execution_kind)
+                ],
+            )?;
+        }
         let existing = find_by_thread(&transaction, &snapshot.codex_thread_id)?;
 
         let (outcome, record) = match existing {
@@ -2203,6 +2221,24 @@ impl SqliteUsageRepository {
             .collect::<Result<Vec<_>, _>>()
             .map_err(UsageRepositoryError::from)
     }
+}
+
+fn authoritative_thread_execution_kind(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+) -> Result<Option<ExecutionKind>, UsageRepositoryError> {
+    let execution_kind = transaction
+        .query_row(
+            "SELECT execution_kind
+             FROM agent_thread_instances
+             WHERE codex_thread_id = ?1",
+            [thread_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(execution_kind_from_storage)
+        .transpose()?;
+    Ok(execution_kind.filter(|kind| kind.is_dispatchable()))
 }
 
 #[derive(Debug)]
@@ -3349,6 +3385,52 @@ mod tests {
         assert_eq!(running[0].status, "RUNNING");
         assert_eq!(running[0].total_tokens, 200);
         assert_eq!(running[0].codex_thread_id, "thread-child-1");
+    }
+
+    #[test]
+    fn authoritative_native_binding_promotes_provisional_usage_kind() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+
+        let mut provisional = snapshot(100, "LIVE");
+        provisional.execution_kind = ExecutionKind::ObservedExternal;
+        service.upsert_snapshot(provisional).unwrap();
+        {
+            let repository = service.repository().unwrap();
+            repository
+                .connection
+                .execute(
+                    "UPDATE agent_thread_instances
+                     SET execution_kind = 'NATIVE_CHILD'
+                     WHERE codex_thread_id = 'thread-child-1'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let mut observed_after_binding = snapshot(120, "FINAL");
+        observed_after_binding.execution_kind = ExecutionKind::ObservedExternal;
+        let result = service.upsert_snapshot(observed_after_binding).unwrap();
+        assert_eq!(result.outcome, UsageUpsertOutcome::Updated);
+        assert_eq!(result.record.execution_kind, ExecutionKind::NativeChild);
+
+        let repository = service.repository().unwrap();
+        let kinds = repository
+            .connection
+            .query_row(
+                "SELECT usage.execution_kind, instance.execution_kind
+                 FROM token_usage_records usage
+                 JOIN agent_thread_instances instance
+                   ON instance.codex_thread_id = usage.codex_thread_id
+                 WHERE usage.codex_thread_id = 'thread-child-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            kinds,
+            ("NATIVE_CHILD".to_owned(), "NATIVE_CHILD".to_owned())
+        );
     }
 
     #[test]

@@ -11,10 +11,12 @@ use crate::orchestration_contract::{
 };
 use crate::persistence::{PersistenceError, open_database};
 
+mod native;
 pub(crate) mod query;
 mod review;
 mod reviewer;
 mod schedule;
+pub(crate) use native::{NativeBindingEvidence, NativeResultEvidence};
 pub(crate) use query::{OrchestrationJobListRequest, OrchestrationJobPageResponse};
 pub(crate) use review::{OrchestrationJobReviewRequest, OrchestrationJobReviewResponse};
 pub(crate) use reviewer::{

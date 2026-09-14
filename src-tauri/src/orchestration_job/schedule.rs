@@ -168,6 +168,33 @@ impl OrchestrationJobService {
         &self,
         request: AtomicScheduleRequest,
     ) -> Result<AtomicScheduleOutcome, OrchestrationError> {
+        self.schedule_atomic_inner(request, true)
+    }
+
+    /// Native Primary 没有可缓存的 UI Recommendation；helper 必须在同一事务中重算并
+    /// 直接取得派发许可。其余硬门槛、占用和审计路径与 Managed Worker 完全相同。
+    pub(crate) fn schedule_native_atomic(
+        &self,
+        task_packet: TaskPacket,
+        admission: DispatchAdmission,
+    ) -> Result<AtomicScheduleOutcome, OrchestrationError> {
+        self.schedule_atomic_inner(
+            AtomicScheduleRequest {
+                task_packet,
+                expected_decision: RouteAction::Spawn,
+                expected_candidate_thread_id: None,
+                planned_execution_kind: ExecutionKind::NativeChild,
+                admission,
+            },
+            false,
+        )
+    }
+
+    fn schedule_atomic_inner(
+        &self,
+        request: AtomicScheduleRequest,
+        validate_caller_expectation: bool,
+    ) -> Result<AtomicScheduleOutcome, OrchestrationError> {
         request.task_packet.validate()?;
         if !request.planned_execution_kind.is_dispatchable()
             || !request
@@ -188,7 +215,14 @@ impl OrchestrationJobService {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| persistence_error())?;
         let now = current_timestamp(&transaction)?;
-        schedule_in_transaction(transaction, request, canonical_packet, packet_hash, &now)
+        schedule_in_transaction(
+            transaction,
+            request,
+            canonical_packet,
+            packet_hash,
+            &now,
+            validate_caller_expectation,
+        )
     }
 
     /// 写入不可逆的派发边界。调用方只有拿到成功返回后才可调用 App Server。
@@ -271,6 +305,7 @@ fn schedule_in_transaction(
     canonical_packet: String,
     packet_hash: String,
     now: &str,
+    validate_caller_expectation: bool,
 ) -> Result<AtomicScheduleOutcome, OrchestrationError> {
     let packet = &request.task_packet;
     let mut revision = None;
@@ -395,7 +430,9 @@ fn schedule_in_transaction(
     };
 
     // Expected 仅与本次事务首次重算结果比较。后续 Claim 竞争是执行事实变化，不能误报 stale。
-    validate_expected(&request, &initial_recommendation, &packet.job_id)?;
+    if validate_caller_expectation {
+        validate_expected(&request, &initial_recommendation, &packet.job_id)?;
+    }
     let initial_decision_id = Uuid::new_v4().to_string();
     insert_schedule_decision(
         &transaction,

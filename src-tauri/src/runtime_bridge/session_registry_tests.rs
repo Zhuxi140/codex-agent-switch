@@ -42,7 +42,9 @@ fn bridge_with_sessions(
 ) -> (RuntimeBridgeService, PathBuf) {
     let root = std::env::temp_dir().join(format!("cas-session-registry-{}", Uuid::new_v4()));
     fs::create_dir_all(&root).unwrap();
-    let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+    let bridge =
+        RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe"))
+            .unwrap();
     let mut state = bridge.state().unwrap();
     state.status = status;
     state.managed_sessions = sessions

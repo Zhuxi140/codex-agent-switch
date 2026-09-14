@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::codex_config::ORCHESTRATION_RUNTIME_CONTRACT;
 use crate::configuration::{ConfigurationService, RuntimeModeSwitchRequest};
+use crate::orchestration_job::{OrchestrationJobListRequest, OrchestrationJobService};
 use cas_native_lifecycle::rollout_state;
 use cas_scheduler::normalize_workspace_scope_key;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -69,10 +70,20 @@ fn clone_database(source: &Path, target: &Path) -> Result<(), Rc1Failure> {
 fn reset_e2e_database(connection: &Connection, codex_home: &Path) -> Result<(), Rc1Failure> {
     stage(
         connection.execute_batch(
-            "DELETE FROM token_usage_records;
+            "DELETE FROM reviewer_reports;
+             DELETE FROM reviewer_assignments;
+             DELETE FROM review_decisions;
+             DELETE FROM delivery_receipts;
+             DELETE FROM runtime_receipt_events;
+             DELETE FROM job_attempts;
+             DELETE FROM runtime_delegation_leases;
+             DELETE FROM runtime_enforcement_events;
+             DELETE FROM runtime_hook_turns;
+             DELETE FROM token_usage_records;
              DELETE FROM agent_schedule_decisions;
              DELETE FROM agent_spawn_reservations;
              DELETE FROM agent_thread_instances;
+             DELETE FROM orchestration_jobs;
              DELETE FROM apply_transactions;
              DELETE FROM configuration_snapshot_resources;
              DELETE FROM configuration_snapshots;
@@ -363,12 +374,28 @@ fn child_is_idle(
     )
 }
 
+fn job_is_completed(database_path: &Path, job_id: &str) -> Result<bool, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    stage(
+        connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM orchestration_jobs
+                 WHERE job_id = ?1 AND state = 'COMPLETED'
+             )",
+            [job_id],
+            |row| row.get(0),
+        ),
+        "EVIDENCE_QUERY_FAILED",
+    )
+}
+
 fn wait_for_turn(
     bridge: &RuntimeBridgeService,
     database_path: &Path,
     parent_thread_id: &str,
     turn_id: &str,
     agent_id: &str,
+    job_id: &str,
     expected_output: &Path,
     timeout: Duration,
 ) -> Result<TurnCompletionMode, Rc1Failure> {
@@ -384,6 +411,7 @@ fn wait_for_turn(
             ManagedSessionStatus::Running if Instant::now() < deadline => {
                 if expected_output.is_file()
                     && child_is_idle(database_path, parent_thread_id, agent_id)?
+                    && job_is_completed(database_path, job_id)?
                 {
                     let completed_at = *child_completed_at.get_or_insert_with(Instant::now);
                     if completed_at.elapsed() >= Duration::from_secs(5) {
@@ -407,7 +435,7 @@ fn wait_for_turn(
                         }
                         return Err(Rc1Failure::new(
                             "STALLED_TURN_INTERRUPT_FAILED",
-                            "Child 已完成，但僵尸 Primary Turn 无法中断",
+                            "Job 已完成，但僵尸 Primary Turn 无法中断",
                         ));
                     }
                 }
@@ -521,6 +549,188 @@ fn decision_evidence(
         "DECISION_QUERY_FAILED",
     )?;
     stage(rows.collect::<Result<Vec<_>, _>>(), "DECISION_QUERY_FAILED")
+}
+
+#[derive(Debug)]
+struct RuntimeFirstEvidence {
+    job_ids: Vec<String>,
+    attempt_count: i64,
+    receipt_count: i64,
+    review_count: i64,
+    released_lease_count: i64,
+    tracking_count: usize,
+}
+
+fn runtime_first_evidence(
+    database_path: &Path,
+    connection: &Connection,
+    parent_thread_id: &str,
+    agent_id: &str,
+    workspace_scope_key: &str,
+) -> Result<RuntimeFirstEvidence, Rc1Failure> {
+    let mut statement = stage(
+        connection.prepare(
+            "SELECT job_id
+             FROM orchestration_jobs
+             WHERE parent_thread_id=?1 AND agent_id=?2
+               AND workspace_scope_key=?3 AND task_scope_key=?4
+             ORDER BY job_id",
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    let job_ids = stage(
+        statement.query_map(
+            params![
+                parent_thread_id,
+                agent_id,
+                workspace_scope_key,
+                TASK_SCOPE_KEY
+            ],
+            |row| row.get::<_, String>(0),
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    let job_ids = stage(
+        job_ids.collect::<Result<Vec<_>, _>>(),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    if job_ids != ["cas-rc1-first", "cas-rc1-second"] {
+        return Err(Rc1Failure::new(
+            "RUNTIME_FIRST_JOB_CHAIN_INVALID",
+            format!("期望两个确定 Job，实际为 {job_ids:?}"),
+        ));
+    }
+
+    let invalid_jobs: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM orchestration_jobs
+             WHERE job_id IN ('cas-rc1-first', 'cas-rc1-second')
+               AND (
+                   state <> 'COMPLETED'
+                   OR json_extract(task_packet, '$.agent_id') <> agent_id
+                   OR json_extract(task_packet, '$.parent_thread_id') <> parent_thread_id
+                   OR json_extract(task_packet, '$.workspace_scope_key') <> workspace_scope_key
+                   OR json_extract(task_packet, '$.task_scope_key') <> task_scope_key
+                   OR json_extract(task_packet, '$.execution_kind_policy') <> 'NATIVE_CHILD_REQUIRED'
+               )",
+            [],
+            |row| row.get(0),
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    let (attempt_count, spawn_count, reuse_count, successful_native_count): (i64, i64, i64, i64) =
+        stage(
+            connection.query_row(
+                "SELECT COUNT(*),
+                    SUM(CASE WHEN attempt.route_action='SPAWN' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN attempt.route_action='REUSE' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN attempt.state='SUCCEEDED'
+                                  AND attempt.planned_execution_kind='NATIVE_CHILD'
+                                  AND attempt.execution_kind='NATIVE_CHILD'
+                             THEN 1 ELSE 0 END)
+             FROM job_attempts attempt
+             WHERE attempt.job_id IN ('cas-rc1-first', 'cas-rc1-second')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ),
+            "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+        )?;
+    let (receipt_count, receipt_stage_count): (i64, i64) = stage(
+        connection.query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT stage)
+             FROM delivery_receipts
+             WHERE job_id IN ('cas-rc1-first', 'cas-rc1-second')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    let review_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM review_decisions
+             WHERE job_id IN ('cas-rc1-first', 'cas-rc1-second')
+               AND decision='APPROVE'",
+            [],
+            |row| row.get(0),
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    let released_lease_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*)
+             FROM runtime_delegation_leases lease
+             JOIN job_attempts attempt ON attempt.lease_id=lease.id
+             WHERE attempt.job_id IN ('cas-rc1-first', 'cas-rc1-second')
+               AND lease.state='RELEASED'",
+            [],
+            |row| row.get(0),
+        ),
+        "RUNTIME_FIRST_EVIDENCE_QUERY_FAILED",
+    )?;
+    if invalid_jobs != 0
+        || attempt_count != 2
+        || spawn_count != 1
+        || reuse_count != 1
+        || successful_native_count != 2
+        || receipt_count != 8
+        || receipt_stage_count != 4
+        || review_count != 2
+        || released_lease_count != 2
+    {
+        return Err(Rc1Failure::new(
+            "RUNTIME_FIRST_JOB_CHAIN_INVALID",
+            format!(
+                "invalidJobs={invalid_jobs}, attempts={attempt_count}, spawn={spawn_count}, reuse={reuse_count}, nativeSuccess={successful_native_count}, receipts={receipt_count}/{receipt_stage_count}, reviews={review_count}, releasedLeases={released_lease_count}"
+            ),
+        ));
+    }
+
+    let tracking = stage(
+        OrchestrationJobService::open(database_path),
+        "RUNTIME_FIRST_TRACKING_QUERY_FAILED",
+    )?;
+    let tracking = tracking
+        .list_tracking(OrchestrationJobListRequest {
+            workspace_scope_key: Some(workspace_scope_key.to_owned()),
+            agent_id: Some(agent_id.to_owned()),
+            page: 0,
+            page_size: 100,
+        })
+        .map_err(|error| {
+            Rc1Failure::new("RUNTIME_FIRST_TRACKING_QUERY_FAILED", format!("{error:?}"))
+        })?;
+    let tracked_jobs = tracking
+        .jobs
+        .iter()
+        .filter(|job| {
+            job.parent_thread_id == parent_thread_id && job.task_scope_key == TASK_SCOPE_KEY
+        })
+        .collect::<Vec<_>>();
+    if tracked_jobs.len() != 2
+        || tracked_jobs.iter().any(|job| {
+            job.state != "COMPLETED"
+                || job.attempts.len() != 1
+                || job.attempts[0].planned_execution_kind != "NATIVE_CHILD"
+                || job.attempts[0].execution_kind.as_deref() != Some("NATIVE_CHILD")
+                || job.attempts[0].receipt_stage.as_deref() != Some("PARENT_ACKNOWLEDGED")
+                || job.attempts[0].review_decision.as_deref() != Some("APPROVE")
+        })
+    {
+        return Err(Rc1Failure::new(
+            "RUNTIME_FIRST_TRACKING_MISMATCH",
+            "UI 查询 DTO 与数据库中的 Job/Attempt/Receipt/Review 不一致",
+        ));
+    }
+
+    Ok(RuntimeFirstEvidence {
+        job_ids,
+        attempt_count,
+        receipt_count,
+        review_count,
+        released_lease_count,
+        tracking_count: tracked_jobs.len(),
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1020,6 +1230,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     let database_path = required_path("CAS_DATABASE_PATH")?;
     let codex_home = root.join("codex-home");
     let data_home = root.join("cas-data");
+    let helper_home = root.join("cas-runtime");
     let workspace = root.join("workspace");
     if database_path.parent() != Some(data_home.as_path()) {
         return Err(Rc1Failure::new(
@@ -1029,8 +1240,9 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
     }
     stage(fs::create_dir_all(&codex_home), "TEMP_DIRECTORY_FAILED")?;
     stage(fs::create_dir_all(&data_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&helper_home), "TEMP_DIRECTORY_FAILED")?;
     stage(fs::create_dir_all(&workspace), "TEMP_DIRECTORY_FAILED")?;
-    let helper_path = data_home.join("cas-helper.exe");
+    let helper_path = helper_home.join("cas-helper.exe");
     stage(fs::copy(&helper_source, &helper_path), "HELPER_COPY_FAILED")?;
     stage(
         fs::write(
@@ -1076,7 +1288,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
         .unwrap_or(180);
     let timeout = Duration::from_secs(timeout_seconds);
     let bridge = stage(
-        RuntimeBridgeService::open(&database_path, &data_home),
+        RuntimeBridgeService::open(&database_path, &data_home, &helper_path),
         "BRIDGE_OPEN_FAILED",
     )?;
     let outcome = (|| {
@@ -1122,7 +1334,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             bridge.managed_turn_start_inner(ManagedTurnStartRequest {
                 thread_id: primary_thread_id.clone(),
                 input: format!(
-                    "在当前工作目录完成稳定任务 `{TASK_SCOPE_KEY}` 的第一步：创建 cas-rc1-first.txt，内容只写 CAS_RC1_FIRST，不得修改其他文件。按当前 CAS 编排规则执行。"
+                    "在当前工作目录完成稳定任务 `{TASK_SCOPE_KEY}` 的第一步：创建 cas-rc1-first.txt，内容只写 CAS_RC1_FIRST，不得修改其他文件。必须把本步骤作为新 Job `cas-rc1-first`（idempotency_key 同名）完整执行 CAS2 job-schedule → 原生委派 → job-bind → 等待完成 → job-observe → Primary 审查 → job-review(APPROVE)；spawn_agent 的初始 message 必须直接执行文件任务，禁止等待绑定占位或对同一 Attempt 二次补发；禁止使用兼容 CAS1 schedule/bind。"
                 ),
                 effort: None,
                 approval_policy: Some("on-request".to_owned()),
@@ -1143,6 +1355,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             &primary_thread_id,
             &first_turn.turn_id,
             &agent.id,
+            "cas-rc1-first",
             &first_output,
             timeout,
         )?;
@@ -1166,7 +1379,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             bridge.managed_turn_start_inner(ManagedTurnStartRequest {
                 thread_id: primary_thread_id.clone(),
                 input: format!(
-                    "继续同一个稳定任务 `{TASK_SCOPE_KEY}`：创建 cas-rc1-second.txt，内容只写 CAS_RC1_SECOND，不得修改其他文件。按当前 CAS 编排规则重新预检并执行。"
+                    "继续同一个稳定任务 `{TASK_SCOPE_KEY}`：创建 cas-rc1-second.txt，内容只写 CAS_RC1_SECOND，不得修改其他文件。必须把本步骤作为新 Job `cas-rc1-second`（idempotency_key 同名），保持相同 task_scope_key，完整执行 CAS2 job-schedule → 原生复用 → job-bind → 等待完成 → job-observe → Primary 审查 → job-review(APPROVE)；禁止使用兼容 CAS1 schedule/bind。"
                 ),
                 effort: None,
                 approval_policy: Some("on-request".to_owned()),
@@ -1187,6 +1400,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             &primary_thread_id,
             &second_turn.turn_id,
             &agent.id,
+            "cas-rc1-second",
             &second_output,
             timeout,
         )?;
@@ -1225,35 +1439,12 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             ),
             "EVIDENCE_QUERY_FAILED",
         )?;
-        let native_bind_count: i64 = stage(
-            connection.query_row(
-                "SELECT COUNT(*) FROM runtime_enforcement_events
-                 WHERE session_id = ?1
-                   AND reason_code = 'DELEGATION_NATIVE_BIND_CONFIRMED'",
-                [&primary_thread_id],
-                |row| row.get(0),
-            ),
-            "EVIDENCE_QUERY_FAILED",
-        )?;
-        let native_idle_release_count: i64 = stage(
-            connection.query_row(
-                "SELECT COUNT(*) FROM runtime_enforcement_events
-                 WHERE session_id = ?1
-                   AND reason_code = 'DELEGATION_LEASE_NATIVE_IDLE_RELEASED'",
-                [&primary_thread_id],
-                |row| row.get(0),
-            ),
-            "EVIDENCE_QUERY_FAILED",
-        )?;
-        let native_reuse_count: i64 = stage(
-            connection.query_row(
-                "SELECT COUNT(*) FROM runtime_enforcement_events
-                 WHERE session_id = ?1
-                   AND reason_code = 'DELEGATION_NATIVE_REUSE_CONFIRMED'",
-                [&primary_thread_id],
-                |row| row.get(0),
-            ),
-            "EVIDENCE_QUERY_FAILED",
+        let runtime_first = runtime_first_evidence(
+            &database_path,
+            &connection,
+            &primary_thread_id,
+            &agent.id,
+            &final_instance.workspace_scope_key,
         )?;
         let spawn = decisions
             .iter()
@@ -1291,14 +1482,6 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             return Err(Rc1Failure::new(
                 "USAGE_ATTRIBUTION_FAILED",
                 "没有找到归属于目标 Agent 的有效 Token 记录",
-            ));
-        }
-        if native_bind_count != 1 || native_idle_release_count != 1 || native_reuse_count != 1 {
-            return Err(Rc1Failure::new(
-                "RUNTIME_ENFORCEMENT_EVIDENCE_MISSING",
-                format!(
-                    "兼容准入证据不完整：bind={native_bind_count}, idleRelease={native_idle_release_count}, reuse={native_reuse_count}"
-                ),
             ));
         }
         drop(connection);
@@ -1397,6 +1580,7 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             "taskScopeKey": TASK_SCOPE_KEY,
             "primaryThreadId": primary_thread_id,
             "childThreadId": final_instance.thread_id,
+            "controlProtocol": "CAS2",
             "firstDecision": "SPAWN",
             "secondDecision": "REUSE",
             "firstPrimaryCompletion": first_completion.as_str(),
@@ -1406,9 +1590,14 @@ fn run_native_e2e(include_rc2_matrix: bool) -> Result<Value, Rc1Failure> {
             "firstTotalTokens": first_instance.total_tokens,
             "finalTotalTokens": final_instance.total_tokens,
             "usageAttributed": true,
-            "nativeBindEvidenceCount": native_bind_count,
-            "nativeIdleReleaseEvidenceCount": native_idle_release_count,
-            "nativeReuseEvidenceCount": native_reuse_count,
+            "runtimeFirst": {
+                "jobIds": runtime_first.job_ids,
+                "attemptCount": runtime_first.attempt_count,
+                "receiptCount": runtime_first.receipt_count,
+                "reviewCount": runtime_first.review_count,
+                "releasedLeaseCount": runtime_first.released_lease_count,
+                "trackingDtoCount": runtime_first.tracking_count
+            },
             "modeRoundTripVerified": true,
             "duplicateChildCount": child_count - 1,
             "decisionCount": decisions.len()
@@ -1462,7 +1651,11 @@ fn run_phase6_idle_recovery_e2e() -> Result<Value, Rc1Failure> {
     )?;
     let executable = env::var("CAS_E2E_CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".to_owned());
     let bridge = stage(
-        RuntimeBridgeService::open(&database_path, &data_home),
+        RuntimeBridgeService::open(
+            &database_path,
+            &data_home,
+            &root.join("cas-runtime").join("cas-helper.exe"),
+        ),
         "BRIDGE_OPEN_FAILED",
     )?;
     let outcome = (|| {
@@ -1618,7 +1811,11 @@ fn run_phase12_running_recovery_e2e() -> Result<Value, Rc1Failure> {
     )?;
     let executable = env::var("CAS_E2E_CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".to_owned());
     let bridge = stage(
-        RuntimeBridgeService::open(&database_path, &data_home),
+        RuntimeBridgeService::open(
+            &database_path,
+            &data_home,
+            &root.join("cas-runtime").join("cas-helper.exe"),
+        ),
         "BRIDGE_OPEN_FAILED",
     )?;
     let outcome = (|| {
@@ -1781,7 +1978,7 @@ fn run_phase12_startup_failure_e2e() -> Result<Value, Rc1Failure> {
     let _cleanup = TempRoot(root.clone());
     stage(fs::create_dir_all(&root), "TEMP_DIRECTORY_FAILED")?;
     let bridge = stage(
-        RuntimeBridgeService::open(&root.join("cas.db"), &root),
+        RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe")),
         "BRIDGE_OPEN_FAILED",
     )?;
     let missing = root.join("missing-codex.exe");
@@ -1817,7 +2014,7 @@ fn run_phase12_recovery_storm_e2e() -> Result<Value, Rc1Failure> {
     let _cleanup = TempRoot(root.clone());
     stage(fs::create_dir_all(&root), "TEMP_DIRECTORY_FAILED")?;
     let bridge = stage(
-        RuntimeBridgeService::open(&root.join("cas.db"), &root),
+        RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe")),
         "BRIDGE_OPEN_FAILED",
     )?;
     *stage(bridge.launch(), "BRIDGE_LAUNCH_STATE_FAILED")? = Some(RuntimeBridgeLaunch {

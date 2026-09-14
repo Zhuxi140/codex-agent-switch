@@ -8,6 +8,7 @@ mod delivery_receipt;
 mod diagnostics;
 mod domain;
 mod model;
+pub mod native_control;
 mod orchestration_contract;
 mod orchestration_job;
 mod orchestration_receipt;
@@ -875,8 +876,14 @@ pub fn run() {
             app.manage(AgentService::open(&database_path)?);
             app.manage(UsageService::open(&database_path)?);
             app.manage(NativeObserverService::default());
-            app.manage(RuntimeBridgeService::open(&database_path, &data_home)?);
-            app.manage(ConfigurationService::open(&database_path, &data_home)?);
+            let configuration = ConfigurationService::open(&database_path, &data_home)?;
+            let helper_path = configuration.helper_path()?;
+            app.manage(RuntimeBridgeService::open(
+                &database_path,
+                &data_home,
+                &helper_path,
+            )?);
+            app.manage(configuration);
             app.manage(OrchestrationJobService::open(&database_path)?);
             app.manage(DeliveryReceiptRepository::open(&database_path)?);
             app.manage(diagnostics::DiagnosticsService::open(&database_path)?);

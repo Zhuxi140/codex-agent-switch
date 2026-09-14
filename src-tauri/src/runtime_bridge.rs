@@ -40,6 +40,8 @@ const MAX_AUTO_RECOVERY_ATTEMPTS: u8 = 3;
 
 pub(crate) struct RuntimeBridgeService {
     data_home: PathBuf,
+    database_path: PathBuf,
+    helper_path: PathBuf,
     usage: Arc<UsageService>,
     receipt_events: Arc<OrchestrationReceiptEventService>,
     state: Arc<Mutex<RuntimeBridgeState>>,
@@ -49,9 +51,15 @@ pub(crate) struct RuntimeBridgeService {
 }
 
 impl RuntimeBridgeService {
-    pub(crate) fn open(database_path: &Path, data_home: &Path) -> Result<Self, RuntimeBridgeError> {
+    pub(crate) fn open(
+        database_path: &Path,
+        data_home: &Path,
+        helper_path: &Path,
+    ) -> Result<Self, RuntimeBridgeError> {
         Ok(Self {
             data_home: data_home.to_path_buf(),
+            database_path: database_path.to_path_buf(),
+            helper_path: helper_path.to_path_buf(),
             usage: Arc::new(UsageService::open(database_path)?),
             receipt_events: Arc::new(
                 OrchestrationReceiptEventService::open(database_path)
@@ -355,11 +363,8 @@ impl RuntimeBridgeService {
         let reader_stopping = Arc::clone(&stopping);
         let reader_pending_responses = Arc::clone(&pending_responses);
         let reader_stdin = Arc::clone(&stdin);
-        let helper_path = self.data_home.join(if cfg!(windows) {
-            "cas-helper.exe"
-        } else {
-            "cas-helper"
-        });
+        let helper_path = self.helper_path.clone();
+        let database_path = self.database_path.clone();
         let stdout_thread = thread::spawn(move || {
             read_app_server_stream(
                 stdout,
@@ -371,6 +376,7 @@ impl RuntimeBridgeService {
                 reader_pending_responses,
                 reader_stdin,
                 helper_path,
+                database_path,
             );
         });
         let stderr_thread = thread::spawn(move || {
@@ -1138,6 +1144,7 @@ fn read_app_server_stream(
     pending_responses: Arc<Mutex<HashMap<i64, PendingResponse>>>,
     stdin: SharedStdin,
     helper_path: PathBuf,
+    database_path: PathBuf,
 ) {
     let mut initialize_tx = Some(initialize_tx);
     let mut observer = RuntimeObserver::new(usage);
@@ -1178,7 +1185,7 @@ fn read_app_server_stream(
             continue;
         }
 
-        match respond_to_server_request(&message, &stdin, &helper_path) {
+        match respond_to_server_request(&message, &stdin, &helper_path, &database_path) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(error) => {
@@ -1270,6 +1277,7 @@ fn respond_to_server_request(
     message: &Value,
     stdin: &SharedStdin,
     helper_path: &Path,
+    database_path: &Path,
 ) -> Result<bool, RuntimeBridgeError> {
     let Some(method) = message.get("method").and_then(Value::as_str) else {
         return Ok(false);
@@ -1279,7 +1287,7 @@ fn respond_to_server_request(
     };
     let decision = match method {
         "item/commandExecution/requestApproval" => {
-            if is_cas_control_plane_request(message, helper_path)
+            if is_cas_control_plane_request(message, helper_path, database_path)
                 || is_isolated_e2e_workspace_request(message)
             {
                 "accept"
@@ -1349,7 +1357,7 @@ fn is_isolated_e2e_workspace_request(_message: &Value) -> bool {
     false
 }
 
-fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
+fn is_cas_control_plane_request(message: &Value, helper_path: &Path, database_path: &Path) -> bool {
     let Some(actions) = message
         .pointer("/params/commandActions")
         .and_then(Value::as_array)
@@ -1360,8 +1368,7 @@ fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
         return false;
     }
     let expected_helper = normalize_workspace_scope_key(&helper_path.to_string_lossy());
-    let expected_database = helper_path.with_file_name("cas.db");
-    let expected_database = normalize_workspace_scope_key(&expected_database.to_string_lossy());
+    let expected_database = normalize_workspace_scope_key(&database_path.to_string_lossy());
     actions.iter().all(|action| {
         let Some(command) = action.get("command").and_then(Value::as_str) else {
             return false;
@@ -1382,9 +1389,9 @@ fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
         let valid_argument = |value: &str| {
             !value.is_empty()
                 && value.len() <= 64
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                && value.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')
+                })
         };
         let valid_database = |value: &str| {
             expected_database.as_deref() == normalize_workspace_scope_key(value).as_deref()
@@ -1393,6 +1400,26 @@ fn is_cas_control_plane_request(message: &Value, helper_path: &Path) -> bool {
             Path::new(value).is_absolute() && normalize_workspace_scope_key(value).is_some()
         };
         match arguments.as_slice() {
+            ["job-schedule", database, agent_key, workspace] => {
+                valid_database(database) && valid_argument(agent_key) && valid_workspace(workspace)
+            }
+            [
+                "job-bind" | "job-observe",
+                database,
+                job_id,
+                attempt_id,
+                thread_id,
+                workspace,
+            ] => {
+                valid_database(database)
+                    && valid_argument(job_id)
+                    && valid_argument(attempt_id)
+                    && valid_argument(thread_id)
+                    && valid_workspace(workspace)
+            }
+            ["job-review", database, job_id, attempt_id] => {
+                valid_database(database) && valid_argument(job_id) && valid_argument(attempt_id)
+            }
             ["schedule", agent_key] => valid_argument(agent_key),
             ["schedule", agent_key, task_key] => {
                 valid_argument(agent_key) && valid_argument(task_key)
@@ -2664,7 +2691,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cas-runtime-dispatch-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let database_path = root.join("cas.db");
-        let bridge = RuntimeBridgeService::open(&database_path, &root).unwrap();
+        let bridge =
+            RuntimeBridgeService::open(&database_path, &root, &root.join("cas-helper.exe"))
+                .unwrap();
         let orchestration = OrchestrationJobService::open(&database_path).unwrap();
         seed_dispatch_agent(&database_path);
         {
@@ -2816,7 +2845,8 @@ mod tests {
 
     #[test]
     fn only_exact_cas_control_plane_commands_are_auto_approved() {
-        let helper = Path::new("C:\\CAS Data\\cas-helper.exe");
+        let helper = Path::new("C:\\Program Files\\CAS\\cas-helper.exe");
+        let database = Path::new("C:\\CAS Data\\cas.db");
         let request = |command: &str| {
             json!({
                 "params": {
@@ -2826,54 +2856,103 @@ mod tests {
         };
 
         assert!(is_cas_control_plane_request(
-            &request("& \"C:\\CAS Data\\cas-helper.exe\" schedule executor stable-task"),
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" job-schedule \"C:\\CAS Data\\cas.db\" executor \"C:\\Work Space\""
+            ),
             helper,
-        ));
-        assert!(is_cas_control_plane_request(
-            &request("& \"C:\\CAS Data\\cas-helper.exe\" bind executor 019ffb28-1234 stable-task"),
-            helper,
+            database,
         ));
         assert!(is_cas_control_plane_request(
             &request(
-                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor \"C:\\Work Space\" stable-task"
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" job-bind \"C:\\CAS Data\\cas.db\" job-1 attempt-1 019ffb28-1234 \"C:\\Work Space\""
             ),
             helper,
+            database,
         ));
         assert!(is_cas_control_plane_request(
             &request(
-                "& \"C:\\CAS Data\\cas-helper.exe\" bind \"C:\\CAS Data\\cas.db\" executor 019ffb28-1234 \"C:\\Work Space\" stable-task"
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" job-observe \"C:\\CAS Data\\cas.db\" job-1 attempt-1 019ffb28-1234 \"C:\\Work Space\""
             ),
             helper,
+            database,
         ));
         assert!(is_cas_control_plane_request(
             &request(
-                "& 'C:\\CAS Data\\cas-helper.exe' schedule 'C:\\CAS Data\\cas.db' executor 'C:\\Work Space' stable-task"
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" job-review \"C:\\CAS Data\\cas.db\" job-1 attempt-1"
             ),
             helper,
+            database,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request("& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule executor stable-task"),
+            helper,
+            database,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" bind executor 019ffb28-1234 stable-task"
+            ),
+            helper,
+            database,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor \"C:\\Work Space\" stable-task"
+            ),
+            helper,
+            database,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" bind \"C:\\CAS Data\\cas.db\" executor 019ffb28-1234 \"C:\\Work Space\" stable-task"
+            ),
+            helper,
+            database,
+        ));
+        assert!(is_cas_control_plane_request(
+            &request(
+                "& 'C:\\Program Files\\CAS\\cas-helper.exe' schedule 'C:\\CAS Data\\cas.db' executor 'C:\\Work Space' stable-task"
+            ),
+            helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
-            &request("& \"C:\\CAS Data\\cas-helper.exe\" token credential-id"),
+            &request("& \"C:\\Program Files\\CAS\\cas-helper.exe\" token credential-id"),
             helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
-            &request("& \"C:\\CAS Data\\cas-helper.exe\" schedule executor; Remove-Item victim"),
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule executor; Remove-Item victim"
+            ),
             helper,
+            database,
+        ));
+        assert!(!is_cas_control_plane_request(
+            &request(
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" job-review \"C:\\CAS Data\\cas.db\" job-1 attempt-1; Remove-Item victim"
+            ),
+            helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
             &request("& \"C:\\Other\\cas-helper.exe\" schedule executor stable-task"),
             helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
             &request(
-                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\Other\\cas.db\" executor \"C:\\Work Space\" stable-task"
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule \"C:\\Other\\cas.db\" executor \"C:\\Work Space\" stable-task"
             ),
             helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
             &request(
-                "& \"C:\\CAS Data\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor relative-workspace stable-task"
+                "& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule \"C:\\CAS Data\\cas.db\" executor relative-workspace stable-task"
             ),
             helper,
+            database,
         ));
         assert!(!is_cas_control_plane_request(
             &json!({
@@ -2881,13 +2960,14 @@ mod tests {
                     "commandActions": [
                         {
                             "type": "unknown",
-                            "command": "& \"C:\\CAS Data\\cas-helper.exe\" schedule executor stable-task"
+                            "command": "& \"C:\\Program Files\\CAS\\cas-helper.exe\" schedule executor stable-task"
                         },
                         {"type": "unknown", "command": "Remove-Item victim"}
                     ]
                 }
             }),
             helper,
+            database,
         ));
     }
 
@@ -3009,7 +3089,9 @@ mod tests {
     fn unavailable_schema_fails_closed_for_managed_sessions_and_agent_execution() {
         let root = std::env::temp_dir().join(format!("cas-runtime-schema-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        let bridge =
+            RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe"))
+                .unwrap();
         {
             let mut state = bridge.state().unwrap();
             state.managed_session_capability = SchemaCapability::Unavailable;
@@ -3037,7 +3119,9 @@ mod tests {
     fn startup_failure_does_not_leave_bridge_starting() {
         let root = std::env::temp_dir().join(format!("cas-runtime-start-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        let bridge =
+            RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe"))
+                .unwrap();
         let missing = root.join("missing-codex.exe");
 
         assert!(matches!(
@@ -3057,7 +3141,9 @@ mod tests {
     fn consecutive_recovery_failures_stop_at_the_retry_ceiling() {
         let root = std::env::temp_dir().join(format!("cas-runtime-storm-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
-        let bridge = RuntimeBridgeService::open(&root.join("cas.db"), &root).unwrap();
+        let bridge =
+            RuntimeBridgeService::open(&root.join("cas.db"), &root, &root.join("cas-helper.exe"))
+                .unwrap();
         *bridge.launch().unwrap() = Some(RuntimeBridgeLaunch {
             executable: root.join("missing-codex.exe"),
             codex_home: root.clone(),
@@ -3326,6 +3412,66 @@ mod tests {
     }
 
     #[test]
+    fn observer_preserves_authoritative_native_child_binding() {
+        let root = std::env::temp_dir().join(format!("cas-native-usage-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("cas.db");
+        let usage = Arc::new(UsageService::open(&database_path).unwrap());
+        seed_dispatch_agent(&database_path);
+        let connection = rusqlite::Connection::open(&database_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO agent_thread_instances (
+                    id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
+                    status, created_at, last_used_at, execution_kind
+                 ) VALUES (
+                    'native-child-instance', 'agent-dispatch', 'Executor', 'native-child',
+                    'root', 'RUNNING', '2026-09-13T00:00:00Z',
+                    '2026-09-13T00:00:00Z', 'NATIVE_CHILD'
+                 )",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut observer = RuntimeObserver::new(Arc::clone(&usage));
+        observer
+            .observe(NormalizedRuntimeEvent::ParentChild {
+                parent_thread_id: "root".to_owned(),
+                child_thread_ids: vec!["native-child".to_owned()],
+                model_slug: Some("gpt-test".to_owned()),
+                profile: ProtocolProfile::Modern,
+            })
+            .unwrap();
+        observer
+            .observe(NormalizedRuntimeEvent::Usage {
+                thread_id: "native-child".to_owned(),
+                usage: NormalizedUsage {
+                    cached_input_provided: true,
+                    input_tokens: 100,
+                    cached_input_tokens: 80,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 20,
+                    reasoning_output_tokens: 5,
+                    total_tokens: 120,
+                    current_context_tokens: Some(100),
+                    model_context_window: Some(1_000_000),
+                    partial: false,
+                },
+                profile: ProtocolProfile::Modern,
+            })
+            .unwrap();
+
+        let records =
+            serde_json::to_value(usage.list(UsageListRequest::default()).unwrap()).unwrap();
+        assert_eq!(records[0]["codexThreadId"], "native-child");
+        assert_eq!(records[0]["executionKind"], "NATIVE_CHILD");
+        drop(observer);
+        drop(usage);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_thread_started_is_not_upgraded_by_parent_child_evidence() {
         let usage = Arc::new(UsageService::in_memory());
         let mut observer = RuntimeObserver::new(Arc::clone(&usage));
@@ -3396,7 +3542,12 @@ mod tests {
         let test_root = std::env::temp_dir().join(format!("cas-runtime-e2e-{}", Uuid::new_v4()));
         fs::create_dir_all(&test_root).unwrap();
         let database_path = test_root.join("cas.db");
-        let bridge = RuntimeBridgeService::open(&database_path, &test_root).unwrap();
+        let bridge = RuntimeBridgeService::open(
+            &database_path,
+            &test_root,
+            &test_root.join("cas-helper.exe"),
+        )
+        .unwrap();
 
         bridge
             .start_inner(Path::new(&executable), Path::new(&codex_home), None)

@@ -417,7 +417,7 @@ function runSelfTest() {
         receiverThreadIds: ["child-1"],
         senderThreadId: "root-1",
         status: "completed",
-        tool: "followup_task",
+        tool: "send_input",
         type: "collabAgentToolCall",
       },
     },

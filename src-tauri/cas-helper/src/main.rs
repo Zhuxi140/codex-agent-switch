@@ -1,6 +1,6 @@
 use std::env;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -18,6 +18,7 @@ use cas_scheduler::{
     workspace_is_within,
 };
 use cas_secret_store::{CredentialId, SecretStoreError, read};
+use codex_agent_switch_lib::native_control;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 const EXIT_INVALID_ARGUMENTS: u8 = 2;
@@ -27,6 +28,7 @@ const EXIT_PERMISSION_DENIED: u8 = 5;
 const EXIT_RETRIEVAL_FAILED: u8 = 6;
 const EXIT_SCHEDULING_UNAVAILABLE: u8 = 7;
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_CONTROL_INPUT_BYTES: u64 = 128 * 1024;
 const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
 const RUNTIME_DELEGATION_LEASE_TTL_SECONDS: i64 = 3_600;
 
@@ -89,6 +91,42 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Ok(Command::JobSchedule {
+            database_path,
+            agent_key,
+            scope_key,
+        }) => job_schedule(database_path, &agent_key, &scope_key),
+        Ok(Command::JobBind {
+            database_path,
+            job_id,
+            attempt_id,
+            child_thread_id,
+            scope_key,
+        }) => job_bind(
+            database_path,
+            &job_id,
+            &attempt_id,
+            &child_thread_id,
+            &scope_key,
+        ),
+        Ok(Command::JobObserve {
+            database_path,
+            job_id,
+            attempt_id,
+            child_thread_id,
+            scope_key,
+        }) => job_observe(
+            database_path,
+            &job_id,
+            &attempt_id,
+            &child_thread_id,
+            &scope_key,
+        ),
+        Ok(Command::JobReview {
+            database_path,
+            job_id,
+            attempt_id,
+        }) => job_review(database_path, &job_id, &attempt_id),
         Ok(Command::Hook { database_path }) => runtime_hook(database_path),
         Err(()) => {
             eprintln!(
@@ -97,6 +135,10 @@ fn main() -> ExitCode {
                  cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
                  cas-helper bind <agent-key> <child-thread-id> [task-key]\n  \
                  cas-helper bind <database-path> <agent-key> <child-thread-id> <workspace-scope> [task-key]\n  \
+                 cas-helper job-schedule <database-path> <agent-key> <workspace-scope>  # TaskPacket draft from stdin\n  \
+                 cas-helper job-bind <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
+                 cas-helper job-observe <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
+                 cas-helper job-review <database-path> <job-id> <attempt-id>  # Review draft from stdin\n  \
                  cas-helper hook <database-path> cas-runtime-enforcement-v1"
             );
             ExitCode::from(EXIT_INVALID_ARGUMENTS)
@@ -118,6 +160,30 @@ enum Command {
         child_thread_id: String,
         scope_key: Option<String>,
         task_scope_key: Option<String>,
+    },
+    JobSchedule {
+        database_path: PathBuf,
+        agent_key: String,
+        scope_key: String,
+    },
+    JobBind {
+        database_path: PathBuf,
+        job_id: String,
+        attempt_id: String,
+        child_thread_id: String,
+        scope_key: String,
+    },
+    JobObserve {
+        database_path: PathBuf,
+        job_id: String,
+        attempt_id: String,
+        child_thread_id: String,
+        scope_key: String,
+    },
+    JobReview {
+        database_path: PathBuf,
+        job_id: String,
+        attempt_id: String,
     },
     Hook {
         database_path: PathBuf,
@@ -218,6 +284,74 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             child_thread_id,
             scope_key: Some(scope_key),
             task_scope_key,
+        });
+    }
+    if command == OsStr::new("job-schedule") {
+        let remaining = args.collect::<Vec<_>>();
+        if remaining.len() != 3 {
+            return Err(());
+        }
+        let database_path = PathBuf::from(&remaining[0]);
+        let agent_key = valid_argument(remaining[1].clone())?;
+        let scope_key =
+            normalize_workspace_scope_key(&valid_argument(remaining[2].clone())?).ok_or(())?;
+        if !database_path.is_absolute() {
+            return Err(());
+        }
+        return Ok(Command::JobSchedule {
+            database_path,
+            agent_key,
+            scope_key,
+        });
+    }
+    if matches!(command.to_str(), Some("job-bind" | "job-observe")) {
+        let observe = command == OsStr::new("job-observe");
+        let remaining = args.collect::<Vec<_>>();
+        if remaining.len() != 5 {
+            return Err(());
+        }
+        let database_path = PathBuf::from(&remaining[0]);
+        let job_id = valid_control_id(&valid_argument(remaining[1].clone())?).ok_or(())?;
+        let attempt_id = valid_control_id(&valid_argument(remaining[2].clone())?).ok_or(())?;
+        let child_thread_id = valid_control_id(&valid_argument(remaining[3].clone())?).ok_or(())?;
+        let scope_key =
+            normalize_workspace_scope_key(&valid_argument(remaining[4].clone())?).ok_or(())?;
+        if !database_path.is_absolute() {
+            return Err(());
+        }
+        return if observe {
+            Ok(Command::JobObserve {
+                database_path,
+                job_id,
+                attempt_id,
+                child_thread_id,
+                scope_key,
+            })
+        } else {
+            Ok(Command::JobBind {
+                database_path,
+                job_id,
+                attempt_id,
+                child_thread_id,
+                scope_key,
+            })
+        };
+    }
+    if command == OsStr::new("job-review") {
+        let remaining = args.collect::<Vec<_>>();
+        if remaining.len() != 3 {
+            return Err(());
+        }
+        let database_path = PathBuf::from(&remaining[0]);
+        let job_id = valid_control_id(&valid_argument(remaining[1].clone())?).ok_or(())?;
+        let attempt_id = valid_control_id(&valid_argument(remaining[2].clone())?).ok_or(())?;
+        if !database_path.is_absolute() {
+            return Err(());
+        }
+        return Ok(Command::JobReview {
+            database_path,
+            job_id,
+            attempt_id,
         });
     }
     if command == OsStr::new("hook") {
@@ -1898,6 +2032,353 @@ fn obvious_write_command(command: &str) -> bool {
         || command.contains('>')
 }
 
+fn read_control_payload() -> Result<Vec<u8>, ()> {
+    let mut payload = Vec::new();
+    io::stdin()
+        .lock()
+        .take(MAX_CONTROL_INPUT_BYTES + 1)
+        .read_until(b'\n', &mut payload)
+        .map_err(|_| ())?;
+    if payload.is_empty() || payload.len() as u64 > MAX_CONTROL_INPUT_BYTES {
+        return Err(());
+    }
+    Ok(payload)
+}
+
+fn current_parent_thread_id() -> Result<String, ()> {
+    env::var("CODEX_THREAD_ID")
+        .ok()
+        .and_then(|value| valid_runtime_key(&value))
+        .ok_or(())
+}
+
+fn verify_native_capability(database_path: &Path) -> Result<PathBuf, ScheduleError> {
+    let connection = Connection::open_with_flags(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    let codex_home = resolve_codex_home(
+        &connection,
+        env::var_os("CODEX_HOME"),
+        env::var_os("USERPROFILE"),
+        env::var_os("HOME"),
+    )?;
+    let state_path = find_codex_state_database(&codex_home)?;
+    let state_connection = Connection::open_with_flags(
+        state_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|_| ScheduleError::NativeStateUnavailable)?;
+    if !native_state_schema_supported(&state_connection) {
+        return Err(ScheduleError::NativeStateIncompatible);
+    }
+    Ok(codex_home)
+}
+
+fn job_schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCode {
+    let parent_thread_id = match current_parent_thread_id() {
+        Ok(value) => value,
+        Err(()) => {
+            eprintln!("CODEX_THREAD_ID unavailable; Runtime First scheduling stopped.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    if let Err(error) = verify_native_capability(&database_path) {
+        eprintln!(
+            "Native Runtime capability unavailable: {}",
+            error.diagnostic()
+        );
+        return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+    }
+    let payload = match read_control_payload() {
+        Ok(payload) => payload,
+        Err(()) => {
+            eprintln!("TaskPacket draft missing or too large.");
+            return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+        }
+    };
+    match native_control::schedule_native_task(
+        &database_path,
+        agent_key,
+        scope_key,
+        &parent_thread_id,
+        &payload,
+    ) {
+        Ok(result) => {
+            println!(
+                "CAS2|{}|{}|{}|{}|{}",
+                result.action,
+                result.thread_id.as_deref().unwrap_or("-"),
+                result.reason_code,
+                result.job_id,
+                result.attempt_id.as_deref().unwrap_or("-")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("CAS2 scheduling failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
+struct NativeJobContext {
+    agent_key: String,
+    parent_thread_id: String,
+    workspace_scope_key: String,
+    task_scope_key: String,
+    dispatch_recorded_at_epoch: Option<i64>,
+}
+
+fn load_native_job_context(
+    connection: &Connection,
+    job_id: &str,
+    attempt_id: &str,
+) -> Result<Option<NativeJobContext>, ScheduleError> {
+    connection
+        .query_row(
+            "SELECT agent.agent_key, job.parent_thread_id, job.workspace_scope_key,
+                    job.task_scope_key, unixepoch(attempt.dispatch_recorded_at)
+             FROM orchestration_jobs job
+             JOIN job_attempts attempt ON attempt.job_id=job.job_id
+             JOIN agents agent ON agent.id=job.agent_id
+             WHERE job.job_id=?1 AND attempt.attempt_id=?2
+               AND attempt.planned_execution_kind='NATIVE_CHILD'",
+            params![job_id, attempt_id],
+            |row| {
+                Ok(NativeJobContext {
+                    agent_key: row.get(0)?,
+                    parent_thread_id: row.get(1)?,
+                    workspace_scope_key: row.get(2)?,
+                    task_scope_key: row.get(3)?,
+                    dispatch_recorded_at_epoch: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(ScheduleError::from)
+}
+
+fn job_bind(
+    database_path: PathBuf,
+    job_id: &str,
+    attempt_id: &str,
+    child_thread_id: &str,
+    scope_key: &str,
+) -> ExitCode {
+    let parent_thread_id = match current_parent_thread_id() {
+        Ok(value) => value,
+        Err(()) => {
+            eprintln!("CODEX_THREAD_ID unavailable; Runtime First bind stopped.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    let codex_home = match verify_native_capability(&database_path) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "Native Runtime capability unavailable: {}",
+                error.diagnostic()
+            );
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    let mut connection = match Connection::open_with_flags(
+        &database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE),
+    };
+    let context = match load_native_job_context(&connection, job_id, attempt_id) {
+        Ok(Some(context)) => context,
+        _ => {
+            eprintln!("Native Job/Attempt not found.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    if context.parent_thread_id != parent_thread_id
+        || context.workspace_scope_key != scope_key
+        || bind_native_thread(
+            &mut connection,
+            &codex_home,
+            &context.agent_key,
+            child_thread_id,
+            scope_key,
+            &parent_thread_id,
+            Some(&context.task_scope_key),
+        )
+        .is_err()
+    {
+        eprintln!("Native Job bind verification failed.");
+        return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+    }
+    drop(connection);
+    let evidence_ref = format!("native-state:{parent_thread_id}:{child_thread_id}");
+    match native_control::accept_native_binding(
+        &database_path,
+        job_id,
+        attempt_id,
+        child_thread_id,
+        &evidence_ref,
+        "NATIVE_STATE_V1",
+    ) {
+        Ok(()) => {
+            println!("CAS2|BOUND|{child_thread_id}|NATIVE_STATE_DB|{job_id}|{attempt_id}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Native Job receipt failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
+fn native_result_is_fresh(updated_at: i64, dispatch_recorded_at_epoch: Option<i64>) -> bool {
+    // Native 状态库仅精确到秒；相等无法证明结果发生在派发之后，按 Fail Closed 处理。
+    dispatch_recorded_at_epoch.is_some_and(|dispatched_at| updated_at > dispatched_at)
+}
+
+fn job_observe(
+    database_path: PathBuf,
+    job_id: &str,
+    attempt_id: &str,
+    child_thread_id: &str,
+    scope_key: &str,
+) -> ExitCode {
+    let parent_thread_id = match current_parent_thread_id() {
+        Ok(value) => value,
+        Err(()) => return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE),
+    };
+    let cas_connection = match Connection::open_with_flags(
+        &database_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(connection) => connection,
+        Err(_) => return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE),
+    };
+    let context = match load_native_job_context(&cas_connection, job_id, attempt_id) {
+        Ok(Some(context))
+            if context.parent_thread_id == parent_thread_id
+                && context.workspace_scope_key == scope_key =>
+        {
+            context
+        }
+        _ => {
+            eprintln!("Native Job/Attempt identity verification failed.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    drop(cas_connection);
+    let codex_home = match verify_native_capability(&database_path) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!(
+                "Native Runtime capability unavailable: {}",
+                error.diagnostic()
+            );
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    let state_path = match find_codex_state_database(&codex_home) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("Native state unavailable: {}", error.diagnostic());
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    let state_connection = match Connection::open_with_flags(
+        state_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(value) => value,
+        Err(_) => return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE),
+    };
+    let record = match load_native_candidate_records(&state_connection)
+        .ok()
+        .and_then(|records| {
+            records
+                .into_iter()
+                .find(|record| record.thread_id == child_thread_id)
+        }) {
+        Some(record)
+            if record.parent_thread_id == parent_thread_id && record.scope_key == scope_key =>
+        {
+            record
+        }
+        _ => {
+            eprintln!("Native result identity verification failed.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    let state = rollout_state(Path::new(&record.rollout_path)).ok();
+    let reusable = match thread_state_from_rollout(&record.edge_status, state.as_ref()) {
+        NativeThreadState::Idle => true,
+        NativeThreadState::Closed => false,
+        NativeThreadState::Running | NativeThreadState::Unknown => {
+            eprintln!("Native Child has no proven terminal result.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
+    if !native_result_is_fresh(record.updated_at, context.dispatch_recorded_at_epoch) {
+        eprintln!("Native Child has no terminal result newer than Attempt dispatch.");
+        return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+    }
+    let evidence_ref = format!("native-result:{child_thread_id}:{}", record.updated_at);
+    match native_control::observe_native_result(
+        &database_path,
+        job_id,
+        attempt_id,
+        child_thread_id,
+        &evidence_ref,
+        "NATIVE_STATE_V1",
+        reusable,
+    ) {
+        Ok(()) => {
+            println!("CAS2|RESULT_OBSERVED|{child_thread_id}|RECOVERY_READ|{job_id}|{attempt_id}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Native result receipt failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
+fn job_review(database_path: PathBuf, job_id: &str, attempt_id: &str) -> ExitCode {
+    let parent_thread_id = match current_parent_thread_id() {
+        Ok(value) => value,
+        Err(()) => return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE),
+    };
+    let payload = match read_control_payload() {
+        Ok(payload) => payload,
+        Err(()) => {
+            eprintln!("Review draft missing or too large.");
+            return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+        }
+    };
+    match native_control::review_native_task(
+        &database_path,
+        job_id,
+        attempt_id,
+        &parent_thread_id,
+        &payload,
+    ) {
+        Ok(result) => {
+            println!(
+                "CAS2|REVIEWED|-|{}|{}|{}|{}",
+                result.state, result.job_id, attempt_id, result.review_id
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("Native review failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
 fn schedule(
     database_path: PathBuf,
     agent_key: &str,
@@ -2861,7 +3342,10 @@ fn bind_native_thread(
     let matching_leases = leases
         .iter()
         .filter(|lease| {
-            (lease.admission_tool_use_id.is_some()
+            let job_backed_admitted = matches!(lease.state.as_str(), "PENDING" | "ACTIVE")
+                && lease_has_job_attempt(&transaction, &lease.id).is_ok_and(|found| found);
+            (job_backed_admitted
+                || lease.admission_tool_use_id.is_some()
                 || (lease.state == "PENDING" && native_bind_admission)
                 || (lease.state == "ACTIVE" && native_reuse_admission))
                 && lease.task_scope_key.as_deref() == task_scope_key
@@ -2876,7 +3360,7 @@ fn bind_native_thread(
     };
     let lease = (*lease).clone();
     let job_backed = lease_has_job_attempt(&transaction, &lease.id)?;
-    if job_backed && lease.state != "PENDING" {
+    if job_backed && !matches!(lease.state.as_str(), "PENDING" | "ACTIVE") {
         return Err(ScheduleError::BindRejected);
     }
     let compatibility_admission = lease.admission_tool_use_id.is_none();
@@ -3291,6 +3775,20 @@ fn valid_runtime_key(value: &str) -> Option<String> {
         .then(|| value.to_owned())
 }
 
+fn valid_control_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    let bytes = value.as_bytes();
+    let Some(first) = bytes.first() else {
+        return None;
+    };
+    (bytes.len() <= 64
+        && first.is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-')))
+    .then(|| value.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3391,6 +3889,99 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn runtime_first_job_commands_require_frozen_shapes() {
+        let database = OsString::from(r"C:\CAS Data\cas.db");
+        let workspace = OsString::from(r"\\?\C:\Workspace\Project");
+
+        let Ok(Command::JobSchedule {
+            database_path,
+            agent_key,
+            scope_key,
+        }) = parse_args([
+            OsString::from("cas-helper"),
+            OsString::from("job-schedule"),
+            database.clone(),
+            OsString::from("executor"),
+            workspace.clone(),
+        ])
+        else {
+            panic!("job-schedule command should parse");
+        };
+        assert_eq!(database_path, PathBuf::from(r"C:\CAS Data\cas.db"));
+        assert_eq!(agent_key, "executor");
+        assert_eq!(scope_key, "c:/workspace/project");
+
+        for command in ["job-bind", "job-observe"] {
+            assert!(matches!(
+                parse_args([
+                    OsString::from("cas-helper"),
+                    OsString::from(command),
+                    database.clone(),
+                    OsString::from("job.release:1"),
+                    OsString::from("attempt.1"),
+                    OsString::from("0198ae47-1234-5678-9abc-0123456789ef"),
+                    workspace.clone(),
+                ]),
+                Ok(Command::JobBind { .. }) | Ok(Command::JobObserve { .. })
+            ));
+        }
+        assert!(matches!(
+            parse_args([
+                OsString::from("cas-helper"),
+                OsString::from("job-review"),
+                database.clone(),
+                OsString::from("job.release:1"),
+                OsString::from("attempt.1"),
+            ]),
+            Ok(Command::JobReview { .. })
+        ));
+
+        for invalid in [
+            vec![
+                OsString::from("cas-helper"),
+                OsString::from("job-schedule"),
+                OsString::from("relative.db"),
+                OsString::from("executor"),
+                workspace.clone(),
+            ],
+            vec![
+                OsString::from("cas-helper"),
+                OsString::from("job-review"),
+                database.clone(),
+                OsString::from("job|injected"),
+                OsString::from("attempt-1"),
+            ],
+            vec![
+                OsString::from("cas-helper"),
+                OsString::from("job-bind"),
+                database.clone(),
+                OsString::from("job-1"),
+                OsString::from("attempt-1"),
+                OsString::from("thread;injected"),
+                workspace.clone(),
+            ],
+            vec![
+                OsString::from("cas-helper"),
+                OsString::from("job-review"),
+                database,
+                OsString::from("job-1"),
+                OsString::from("attempt-1"),
+                OsString::from("extra"),
+            ],
+        ] {
+            assert!(parse_args(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn native_result_must_not_predate_attempt_dispatch() {
+        assert!(!native_result_is_fresh(100, None));
+        assert!(!native_result_is_fresh(99, Some(100)));
+        assert!(!native_result_is_fresh(100, Some(100)));
+        assert!(native_result_is_fresh(101, Some(100)));
     }
 
     #[test]
@@ -3651,7 +4242,7 @@ mod tests {
             "session_id": "session-1",
             "turn_id": "turn-primary",
             "cwd": "C:/workspace",
-            "tool_name": "followup_task",
+            "tool_name": "send_input",
             "tool_use_id": "tool-followup-1",
             "tool_input": { "target": "child-reuse" }
         });
@@ -3661,7 +4252,7 @@ mod tests {
             "session_id": "session-1",
             "turn_id": "turn-primary",
             "cwd": "C:/workspace",
-            "tool_name": "followup_task",
+            "tool_name": "send_input",
             "tool_use_id": "tool-followup-1",
             "tool_response": { "ok": true }
         });
@@ -3671,7 +4262,7 @@ mod tests {
             "session_id": "session-1",
             "turn_id": "turn-primary",
             "cwd": "C:/workspace",
-            "tool_name": "followup_task",
+            "tool_name": "send_input",
             "tool_use_id": "tool-followup-2",
             "tool_input": { "target": "child-reuse" }
         });
@@ -4371,6 +4962,73 @@ mod tests {
                 )
                 .unwrap(),
             "RETIRED"
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn native_bind_accepts_job_backed_lease_already_claimed_by_start_hook() {
+        let mut connection = scheduling_connection();
+        let home = native_state_home();
+        insert_native_child(&home, "thread-native", "thread-root", 10, "open");
+        connection
+            .execute_batch(
+                "INSERT INTO agent_schedule_decisions (
+                    id, created_at, source, agent_id, workspace_scope_key,
+                    parent_thread_id, decision, reason_code, cache_hint, claimed,
+                    task_scope_key
+                 ) VALUES (
+                    'decision-job', '2026-09-13T00:00:00Z', 'CAS', 'agent-1',
+                    'c:/workspace/project', 'thread-root', 'SPAWN', 'TEST',
+                    'UNKNOWN', 0, 'job-task'
+                 );
+                 INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id,
+                    codex_agent_id, workspace_scope_key, task_scope_key,
+                    schedule_decision_id, state, expires_at, admission_tool_use_id
+                 ) VALUES (
+                    'lease-job', '2026-09-13T00:00:00Z', '2026-09-13T00:00:00Z',
+                    'agent-1', 'thread-root', 'thread-native',
+                    'c:/workspace/project', 'job-task', 'decision-job', 'ACTIVE',
+                    '2099-01-01T00:00:00Z', 'spawn-tool'
+                 );
+                 INSERT INTO job_attempts (lease_id, state, dispatch_recorded_at)
+                 VALUES ('lease-job', 'DISPATCHING', '2026-09-13T00:00:00Z');",
+            )
+            .unwrap();
+
+        bind_native_thread(
+            &mut connection,
+            &home,
+            "executor",
+            "thread-native",
+            "c:/workspace/project",
+            "thread-root",
+            Some("job-task"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state || ':' || codex_agent_id
+                     FROM runtime_delegation_leases WHERE id='lease-job'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ACTIVE:thread-native"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM runtime_enforcement_events
+                     WHERE reason_code LIKE 'DELEGATION_NATIVE_%_CONFIRMED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
         );
         std::fs::remove_dir_all(home).unwrap();
     }

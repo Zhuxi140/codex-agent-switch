@@ -440,6 +440,7 @@ dependencies = [
  "cas-native-lifecycle",
  "cas-scheduler",
  "cas-secret-store",
+ "codex-agent-switch",
  "rusqlite",
  "serde_json",
 ]

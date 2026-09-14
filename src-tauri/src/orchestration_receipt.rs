@@ -516,7 +516,7 @@ fn observe_pending_success(
     now: &str,
 ) -> Result<(), OrchestrationError> {
     let events = {
-        let mut statement = tx.prepare("SELECT event_id, event_key, schema_profile, codex_turn_id FROM runtime_receipt_events WHERE event_type='TURN_FINISHED' AND successful=1 AND processed_at IS NULL AND codex_thread_id=?1 ORDER BY observed_at").map_err(|_| persistence_error())?;
+        let mut statement = tx.prepare("SELECT event_id, event_key, schema_profile, codex_turn_id, observed_at FROM runtime_receipt_events WHERE event_type='TURN_FINISHED' AND successful=1 AND processed_at IS NULL AND codex_thread_id=?1 ORDER BY observed_at, event_id").map_err(|_| persistence_error())?;
         statement
             .query_map([thread], |row| {
                 Ok((
@@ -524,17 +524,19 @@ fn observe_pending_success(
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
                 ))
             })
             .map_err(|_| persistence_error())?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|_| persistence_error())?
     };
-    for (event_id, event_key, profile, event_turn) in events {
+    for (event_id, event_key, profile, event_turn, observed_at) in events {
         if turn.is_some_and(|expected| event_turn.as_deref() != Some(expected)) {
             continue;
         }
-        let candidate = tx.query_row("SELECT attempt.attempt_id, attempt.job_id, attempt.execution_kind, attempt.codex_turn_id, job.parent_thread_id, instance.id FROM job_attempts attempt JOIN orchestration_jobs job ON job.job_id=attempt.job_id JOIN agent_thread_instances instance ON instance.id=attempt.thread_instance_id JOIN runtime_delegation_leases lease ON lease.id=attempt.lease_id WHERE instance.codex_thread_id=?1 AND attempt.state IN ('ACCEPTED','RUNNING') AND attempt.execution_kind IS NOT NULL AND job.state='RUNNING' AND lease.state='ACTIVE' AND lease.codex_agent_id=?1 LIMIT 1", [thread], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?))).optional().map_err(|_| persistence_error())?;
+        // Native Acceptance 没有 Turn ID；至少以 Attempt 的派发时刻隔离同一 Child 的旧终态。
+        let candidate = tx.query_row("SELECT attempt.attempt_id, attempt.job_id, attempt.execution_kind, attempt.codex_turn_id, job.parent_thread_id, instance.id FROM job_attempts attempt JOIN orchestration_jobs job ON job.job_id=attempt.job_id JOIN agent_thread_instances instance ON instance.id=attempt.thread_instance_id JOIN runtime_delegation_leases lease ON lease.id=attempt.lease_id WHERE instance.codex_thread_id=?1 AND attempt.state IN ('ACCEPTED','RUNNING') AND attempt.execution_kind IS NOT NULL AND job.state='RUNNING' AND lease.state='ACTIVE' AND lease.codex_agent_id=?1 AND (attempt.execution_kind='MANAGED_WORKER' OR (attempt.execution_kind='NATIVE_CHILD' AND attempt.dispatch_recorded_at IS NOT NULL AND julianday(?2) > julianday(attempt.dispatch_recorded_at))) LIMIT 1", params![thread, observed_at], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,Option<String>>(3)?,row.get::<_,String>(4)?,row.get::<_,String>(5)?))).optional().map_err(|_| persistence_error())?;
         let Some((attempt_id, job_id, kind, expected_turn, parent, instance_id)) = candidate else {
             continue;
         };
@@ -558,13 +560,13 @@ fn observe_pending_success(
                     evidence_ref: event_key,
                     parent_thread_id: parent,
                     codex_thread_id: Some(thread.to_owned()),
-                    codex_turn_id: event_turn,
+                    codex_turn_id: event_turn.clone(),
                     schema_profile: profile,
                     evidence_at: now.to_owned(),
                 }],
             },
         )?;
-        let changed = tx.execute("UPDATE job_attempts SET state='SUCCEEDED', terminal_at=COALESCE(terminal_at,?2), updated_at=?2 WHERE attempt_id=?1 AND state IN ('ACCEPTED','RUNNING')", params![attempt_id,now]).map_err(|_| persistence_error())?;
+        let changed = tx.execute("UPDATE job_attempts SET state='SUCCEEDED', codex_turn_id=COALESCE(codex_turn_id,?3), terminal_at=COALESCE(terminal_at,?2), updated_at=?2 WHERE attempt_id=?1 AND state IN ('ACCEPTED','RUNNING') AND (codex_turn_id IS NULL OR codex_turn_id=?3)", params![attempt_id,now,event_turn]).map_err(|_| persistence_error())?;
         if changed != 1 {
             return Err(invariant_error(&job_id, &attempt_id));
         }
@@ -1154,6 +1156,111 @@ mod tests {
             "child-1"
         );
         assert_eq!(connection.query_row("SELECT COUNT(*) FROM delivery_receipts WHERE attempt_id = 'attempt-1' AND stage = 'TURN_ACCEPTED'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        drop(connection);
+        drop(service);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn native_attempt_does_not_consume_a_terminal_event_older_than_dispatch() {
+        let path = database_path();
+        seed(&path, true);
+        let connection = open_database(&path).unwrap();
+        connection
+            .execute(
+                "UPDATE job_attempts
+                 SET dispatch_recorded_at='2000-01-02T00:00:00.000Z'
+                 WHERE attempt_id='attempt-1'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO runtime_receipt_events (
+                    event_id, event_key, event_type, raw_event, schema_profile,
+                    codex_thread_id, codex_turn_id, successful, observed_at
+                 ) VALUES (
+                    'event-old', 'TURN_FINISHED:child-1:turn-old:true',
+                    'TURN_FINISHED', '{}', 'MODERN', 'child-1', 'turn-old', 1,
+                    '2000-01-01T00:00:00.000Z'
+                 )",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let service = OrchestrationReceiptEventService::open(&path).unwrap();
+
+        service
+            .observe_runtime_event(
+                &NormalizedRuntimeEvent::ParentChild {
+                    parent_thread_id: "parent-1".to_owned(),
+                    child_thread_ids: vec!["child-1".to_owned()],
+                    model_slug: None,
+                    profile: ProtocolProfile::Modern,
+                },
+                r#"{"method":"item/started"}"#,
+            )
+            .unwrap();
+
+        let connection = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state FROM job_attempts WHERE attempt_id='attempt-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "ACCEPTED"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM delivery_receipts
+                     WHERE attempt_id='attempt-1' AND stage='RESULT_OBSERVED'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        drop(connection);
+
+        service
+            .observe_runtime_event(
+                &NormalizedRuntimeEvent::TurnFinished {
+                    thread_id: "child-1".to_owned(),
+                    turn_id: "turn-new".to_owned(),
+                    successful: true,
+                    failure_message: None,
+                    profile: ProtocolProfile::Modern,
+                },
+                r#"{"method":"turn/completed"}"#,
+            )
+            .unwrap();
+
+        let connection = open_database(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT state || ':' || codex_turn_id FROM job_attempts
+                     WHERE attempt_id='attempt-1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "SUCCEEDED:turn-new"
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT processed_at IS NULL FROM runtime_receipt_events
+                     WHERE event_id='event-old'",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap()
+        );
         drop(connection);
         drop(service);
         let _ = std::fs::remove_file(path);

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+codex-agent-switch = { path = ".." }
 cas-scheduler = { path = "../crates/cas-scheduler" }
 cas-native-lifecycle = { path = "../crates/cas-native-lifecycle" }
 cas-secret-store = { path = "../crates/cas-secret-store" }

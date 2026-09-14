@@ -124,11 +124,11 @@ try {
     }
     elseif ($Stage -eq "RC2") {
         $testName = "runtime_bridge::rc_e2e::managed_session_rc2_scheduling_matrix"
-        Write-Host "[RC2] Run real SPAWN -> bind -> IDLE -> REUSE, then scheduling matrix..."
+        Write-Host "[RC2] Run real CAS2 Job/Receipt/Review SPAWN -> REUSE, then compatibility scheduling matrix..."
     }
     else {
         $testName = "runtime_bridge::rc_e2e::managed_session_rc1_spawn_bind_idle_reuse"
-        Write-Host "[RC1] Run real SPAWN -> bind -> IDLE -> REUSE..."
+        Write-Host "[RC1] Run real CAS2 TaskPacket -> Job -> SPAWN/REUSE -> Receipt -> Review..."
     }
     & cargo test --quiet --manifest-path $manifestPath `
         $testName `
