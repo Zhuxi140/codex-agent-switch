@@ -23,6 +23,9 @@ jobs:
       - name: 安装前端依赖
         run: npm ci
 
+      - name: 准备 cas-helper sidecar
+        run: npm run prepare:sidecar
+
       - name: Rust 格式检查
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
 
