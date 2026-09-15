@@ -6622,11 +6622,23 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         let strict = strict_config["developer_instructions"].as_str().unwrap();
+        let helper_path = context.service.helper_path().unwrap();
+        let dynamic_path_chars = helper_path.to_string_lossy().chars().count()
+            + context.database.to_string_lossy().chars().count()
+            + helper_path
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .chars()
+                .count();
+        // 绝对路径长度随执行机变化；预算只约束 CAS 协议固定文本。
+        let protocol_chars = strict.chars().count() - dynamic_path_chars;
         assert!(
-            strict.chars().count() <= 2_600 && strict.lines().count() <= 36,
-            "编排提示词重新膨胀：{} chars / {} lines",
-            strict.chars().count(),
+            protocol_chars <= 2_320 && strict.lines().count() <= 36,
+            "编排协议固定文本重新膨胀：{} chars / {} lines（含运行时路径共 {} chars）",
+            protocol_chars,
             strict.lines().count(),
+            strict.chars().count(),
         );
         assert!(strict.contains("当前失败策略：Strict Stop"));
         assert!(strict.contains("严禁 Primary 自行接管写入"));
