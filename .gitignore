@@ -19,6 +19,7 @@ src-tauri/binaries/
 !/README.md
 !/SECURITY.md
 !/CONTRIBUTING.md
+!src-tauri/bundled-skills/**/SKILL.md
 
 # Local Codex skill installation metadata is not part of the application.
 skills-lock.json
