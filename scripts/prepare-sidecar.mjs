@@ -12,7 +12,14 @@ const extension = process.platform === "win32" ? ".exe" : "";
 execFileSync(
   "cargo",
   ["build", "--release", "--manifest-path", manifest, "-p", "cas-helper"],
-  { cwd: root, stdio: "inherit" },
+  {
+    cwd: root,
+    env: {
+      ...process.env,
+      TAURI_CONFIG: JSON.stringify({ bundle: { externalBin: [] } }),
+    },
+    stdio: "inherit",
+  },
 );
 
 const source = join(tauriRoot, "target", "release", `cas-helper${extension}`);
