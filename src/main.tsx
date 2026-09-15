@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ProjectMonitorWindow } from "./ProjectMonitorWindow";
 import { ProjectMonitorWindowPreview } from "./ProjectMonitorWindow.preview";
+import { OrchestrationTrackingPreview } from "./OrchestrationTracking.preview";
 import "./styles.css";
 
 const windowType = new URLSearchParams(window.location.search).get("window");
@@ -14,6 +15,8 @@ createRoot(document.getElementById("root")!).render(
       ? <ProjectMonitorWindow />
       : windowType === "project-monitor-preview"
         ? <ProjectMonitorWindowPreview />
+        : windowType === "orchestration-tracking-preview"
+          ? <OrchestrationTrackingPreview />
         : <App />}
   </StrictMode>,
 );

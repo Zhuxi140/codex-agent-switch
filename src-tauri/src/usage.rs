@@ -1146,12 +1146,12 @@ impl SqliteUsageRepository {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(execution_kind) =
-            authoritative_thread_execution_kind(&transaction, &snapshot.codex_thread_id)?
+        if let Some(identity) =
+            authoritative_thread_identity(&transaction, &snapshot.codex_thread_id)?
         {
             // Runtime 观察只能证明外部线程；调度/绑定记录可将其单向提升为已证明类型。
             if snapshot.execution_kind == ExecutionKind::ObservedExternal {
-                snapshot.execution_kind = execution_kind;
+                snapshot.execution_kind = identity.execution_kind;
             }
             transaction.execute(
                 "UPDATE token_usage_records
@@ -1160,9 +1160,20 @@ impl SqliteUsageRepository {
                    AND execution_kind = 'OBSERVED_EXTERNAL'",
                 params![
                     snapshot.codex_thread_id,
-                    execution_kind_storage(execution_kind)
+                    execution_kind_storage(identity.execution_kind)
                 ],
             )?;
+            if let Some(parent_thread_id) = identity.parent_thread_id {
+                if snapshot.parent_thread_id.is_none() {
+                    snapshot.parent_thread_id = Some(parent_thread_id.clone());
+                }
+                transaction.execute(
+                    "UPDATE token_usage_records
+                     SET parent_thread_id = COALESCE(parent_thread_id, ?2)
+                     WHERE codex_thread_id = ?1",
+                    params![snapshot.codex_thread_id, parent_thread_id],
+                )?;
+            }
         }
         let existing = find_by_thread(&transaction, &snapshot.codex_thread_id)?;
 
@@ -2223,22 +2234,34 @@ impl SqliteUsageRepository {
     }
 }
 
-fn authoritative_thread_execution_kind(
+struct AuthoritativeThreadIdentity {
+    execution_kind: ExecutionKind,
+    parent_thread_id: Option<String>,
+}
+
+fn authoritative_thread_identity(
     transaction: &Transaction<'_>,
     thread_id: &str,
-) -> Result<Option<ExecutionKind>, UsageRepositoryError> {
-    let execution_kind = transaction
+) -> Result<Option<AuthoritativeThreadIdentity>, UsageRepositoryError> {
+    let identity = transaction
         .query_row(
-            "SELECT execution_kind
+            "SELECT execution_kind, parent_thread_id
              FROM agent_thread_instances
              WHERE codex_thread_id = ?1",
             [thread_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
         )
-        .optional()?
-        .map(execution_kind_from_storage)
-        .transpose()?;
-    Ok(execution_kind.filter(|kind| kind.is_dispatchable()))
+        .optional()?;
+    let Some((execution_kind, parent_thread_id)) = identity else {
+        return Ok(None);
+    };
+    let execution_kind = execution_kind_from_storage(execution_kind)?;
+    Ok(execution_kind
+        .is_dispatchable()
+        .then_some(AuthoritativeThreadIdentity {
+            execution_kind,
+            parent_thread_id,
+        }))
 }
 
 #[derive(Debug)]
@@ -3430,6 +3453,55 @@ mod tests {
         assert_eq!(
             kinds,
             ("NATIVE_CHILD".to_owned(), "NATIVE_CHILD".to_owned())
+        );
+    }
+
+    #[test]
+    fn authoritative_managed_binding_backfills_usage_parent() {
+        let service = UsageService::in_memory();
+        seed_agent(&service);
+
+        let mut provisional = snapshot(100, "LIVE");
+        provisional.parent_thread_id = None;
+        provisional.execution_kind = ExecutionKind::ObservedExternal;
+        service.upsert_snapshot(provisional).unwrap();
+        {
+            let repository = service.repository().unwrap();
+            repository
+                .connection
+                .execute(
+                    "UPDATE agent_thread_instances
+                     SET execution_kind = 'MANAGED_WORKER',
+                         parent_thread_id = 'managed-parent'
+                     WHERE codex_thread_id = 'thread-child-1'",
+                    [],
+                )
+                .unwrap();
+        }
+
+        let mut observed_after_binding = snapshot(120, "FINAL");
+        observed_after_binding.parent_thread_id = None;
+        service.upsert_snapshot(observed_after_binding).unwrap();
+
+        let record = service.list(UsageListRequest::default()).unwrap().remove(0);
+        assert_eq!(record.parent_thread_id.as_deref(), Some("managed-parent"));
+        assert_eq!(record.execution_kind, ExecutionKind::ManagedWorker);
+        let repository = service.repository().unwrap();
+        let parents = repository
+            .connection
+            .query_row(
+                "SELECT usage.parent_thread_id, instance.parent_thread_id
+                 FROM token_usage_records usage
+                 JOIN agent_thread_instances instance
+                   ON instance.codex_thread_id = usage.codex_thread_id
+                 WHERE usage.codex_thread_id = 'thread-child-1'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            parents,
+            ("managed-parent".to_owned(), "managed-parent".to_owned())
         );
     }
 

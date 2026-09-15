@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("RC1", "RC2", "PHASE6")]
+    [ValidateSet("RC1", "RC2", "MANAGED", "PHASE6")]
     [string]$Stage = "RC1",
     [ValidateSet("Idle", "Running", "Storm", "StartupFailure")]
     [string]$Scenario = "Idle",
@@ -121,6 +121,10 @@ try {
                 Write-Host "[PHASE12/IDLE] Kill App Server -> resume same Primary -> explicit stop..."
             }
         }
+    }
+    elseif ($Stage -eq "MANAGED") {
+        $testName = "runtime_bridge::rc_e2e::managed_worker_spawn_reuse_receipt_review"
+        Write-Host "[MANAGED] Run real Managed Worker SPAWN -> REUSE -> Receipt -> Review..."
     }
     elseif ($Stage -eq "RC2") {
         $testName = "runtime_bridge::rc_e2e::managed_session_rc2_scheduling_matrix"

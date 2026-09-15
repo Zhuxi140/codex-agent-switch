@@ -9,7 +9,13 @@ use std::time::{Duration, Instant};
 
 use crate::codex_config::ORCHESTRATION_RUNTIME_CONTRACT;
 use crate::configuration::{ConfigurationService, RuntimeModeSwitchRequest};
-use crate::orchestration_job::{OrchestrationJobListRequest, OrchestrationJobService};
+use crate::orchestration_contract::{
+    ExecutionKindPolicy, JobState, OutputContract, PermissionPolicy, ReviewOutcome, ReviewPolicy,
+    TASK_PACKET_SCHEMA_VERSION,
+};
+use crate::orchestration_job::{
+    OrchestrationJobListRequest, OrchestrationJobReviewRequest, OrchestrationJobService,
+};
 use cas_native_lifecycle::rollout_state;
 use cas_scheduler::normalize_workspace_scope_key;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -17,6 +23,7 @@ use serde_json::{Value, json};
 
 const TASK_SCOPE_KEY: &str = "cas-rc1-proof";
 const CONCURRENT_TASK_SCOPE_KEY: &str = "cas-rc2-concurrent";
+const MANAGED_TASK_SCOPE_KEY: &str = "cas-managed-worker-proof";
 
 struct TempRoot(PathBuf);
 
@@ -1628,6 +1635,589 @@ fn managed_session_rc1_spawn_bind_idle_reuse() {
 #[ignore = "requires a configured CAS database, Codex login and a real provider"]
 fn managed_session_rc2_scheduling_matrix() {
     run_e2e_test(true, "CAS_RC2_RESULT");
+}
+
+fn managed_task_packet(
+    agent_id: &str,
+    parent_thread_id: &str,
+    workspace_scope_key: &str,
+    job_id: &str,
+    expected_output: &str,
+) -> TaskPacket {
+    TaskPacket {
+        schema_version: TASK_PACKET_SCHEMA_VERSION,
+        job_id: job_id.to_owned(),
+        idempotency_key: job_id.to_owned(),
+        agent_id: agent_id.to_owned(),
+        parent_thread_id: parent_thread_id.to_owned(),
+        workspace_scope_key: workspace_scope_key.to_owned(),
+        task_scope_key: MANAGED_TASK_SCOPE_KEY.to_owned(),
+        objective: format!("不调用工具，只回复 {expected_output}"),
+        allowed_scope: vec!["package.json".to_owned()],
+        constraints: vec!["不得调用工具或修改文件".to_owned()],
+        success_criteria: vec![format!("最终回复精确包含 {expected_output}")],
+        allowed_tools: Vec::new(),
+        permission_policy: PermissionPolicy::ReadOnly,
+        execution_kind_policy: ExecutionKindPolicy::ManagedWorkerRequired,
+        context_references: Vec::new(),
+        output_contract: OutputContract::StandardV1,
+        review_policy: ReviewPolicy::PrimaryRequired,
+    }
+}
+
+fn execute_managed(
+    bridge: &RuntimeBridgeService,
+    orchestration: &OrchestrationJobService,
+    task_packet: TaskPacket,
+    workspace: &Path,
+    input: &str,
+    expected_decision: RouteAction,
+    expected_candidate_thread_id: Option<String>,
+    failure_code: &'static str,
+) -> Result<AgentThreadExecutionResponse, Rc1Failure> {
+    bridge
+        .execute_agent_thread(
+            orchestration,
+            AgentThreadExecutionRequest {
+                task_packet,
+                cwd: workspace.to_string_lossy().into_owned(),
+                input: input.to_owned(),
+                expected_decision,
+                expected_candidate_thread_id,
+            },
+        )
+        .map_err(|error| Rc1Failure::new(failure_code, format!("{error:?}")))
+}
+
+fn wait_for_managed_review_pending(
+    bridge: &RuntimeBridgeService,
+    database_path: &Path,
+    thread_id: &str,
+    job_id: &str,
+    timeout: Duration,
+) -> Result<(), Rc1Failure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = stage(bridge.status_inner(), "MANAGED_BRIDGE_STATUS_FAILED")?;
+        let session = status
+            .managed_sessions
+            .iter()
+            .find(|session| session.thread_id == thread_id)
+            .ok_or_else(|| {
+                Rc1Failure::new(
+                    "MANAGED_SESSION_MISSING",
+                    format!("未找到 Managed Worker Thread {thread_id}"),
+                )
+            })?;
+        if matches!(
+            session.status,
+            ManagedSessionStatus::Failed | ManagedSessionStatus::RecoveryRequired
+        ) {
+            return Err(Rc1Failure::new(
+                "MANAGED_TURN_FAILED",
+                format!(
+                    "Managed Worker 结束状态为 {:?}：{:?}",
+                    session.status, status.last_error
+                ),
+            ));
+        }
+        let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+        let job_state = stage(
+            connection
+                .query_row(
+                    "SELECT state FROM orchestration_jobs WHERE job_id=?1",
+                    [job_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional(),
+            "EVIDENCE_QUERY_FAILED",
+        )?;
+        if session.status == ManagedSessionStatus::Idle
+            && job_state.as_deref() == Some("REVIEW_PENDING")
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(Rc1Failure::new(
+                "MANAGED_TURN_TIMEOUT",
+                format!(
+                    "Managed Worker 未进入 REVIEW_PENDING；thread={thread_id}, session={:?}, job={job_state:?}, summary={}",
+                    session.status,
+                    primary_summary(bridge, thread_id)
+                ),
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn verify_managed_turn(
+    bridge: &RuntimeBridgeService,
+    thread_id: &str,
+    turn_id: &str,
+    expected_output: &str,
+    expected_turn_count: usize,
+) -> Result<(), Rc1Failure> {
+    let thread = stage(
+        bridge.request(
+            AppServerMethod::ThreadRead.as_str(),
+            json!({"threadId": thread_id, "includeTurns": true}),
+        ),
+        "MANAGED_THREAD_READ_FAILED",
+    )?;
+    let (turn_count, occurrences) = thread_turn_evidence(&thread, turn_id).ok_or_else(|| {
+        Rc1Failure::new(
+            "MANAGED_NATIVE_TURN_MISSING",
+            "Native thread/read 缺少 turns",
+        )
+    })?;
+    let summary = primary_summary(bridge, thread_id);
+    if turn_count != expected_turn_count || occurrences != 1 || !summary.contains(expected_output) {
+        return Err(Rc1Failure::new(
+            "MANAGED_NATIVE_TURN_INVALID",
+            format!(
+                "期望 turns={expected_turn_count}/occurrences=1/output={expected_output}，实际 turns={turn_count}/occurrences={occurrences}/{summary}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn approve_managed_job(
+    orchestration: &OrchestrationJobService,
+    response: &AgentThreadExecutionResponse,
+    reviewer_thread_id: &str,
+) -> Result<(), Rc1Failure> {
+    let reviewed = orchestration
+        .review(OrchestrationJobReviewRequest {
+            job_id: response.job_id.clone(),
+            attempt_id: response.attempt_id.clone(),
+            decision: ReviewOutcome::Approve,
+            reviewer_thread_id: reviewer_thread_id.to_owned(),
+            reason: "真实 Managed Worker 输出与 Native thread/read 证据一致。".to_owned(),
+            evidence_refs: vec![
+                format!("thread:{}", response.thread_id),
+                format!("turn:{}", response.turn_id),
+            ],
+        })
+        .map_err(|error| Rc1Failure::new("MANAGED_REVIEW_FAILED", format!("{error:?}")))?;
+    if reviewed.job.state != JobState::Completed {
+        return Err(Rc1Failure::new(
+            "MANAGED_REVIEW_INCOMPLETE",
+            format!("Review 后 Job 状态为 {:?}", reviewed.job.state),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_managed_evidence(
+    database_path: &Path,
+    orchestration: &OrchestrationJobService,
+    agent: &ActiveAgent,
+    parent_thread_id: &str,
+    workspace_scope_key: &str,
+    thread_id: &str,
+) -> Result<Value, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    let invalid_jobs: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM orchestration_jobs
+             WHERE job_id IN ('cas-managed-first','cas-managed-second')
+               AND (state<>'COMPLETED' OR agent_id<>?1 OR parent_thread_id<>?2
+                    OR workspace_scope_key<>?3 OR task_scope_key<>?4
+                    OR json_extract(task_packet,'$.execution_kind_policy')<>'MANAGED_WORKER_REQUIRED')",
+            params![agent.id, parent_thread_id, workspace_scope_key, MANAGED_TASK_SCOPE_KEY],
+            |row| row.get(0),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let (attempt_count, spawn_count, reuse_count, managed_count, distinct_threads): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = stage(
+        connection.query_row(
+            "SELECT COUNT(*),
+                    SUM(CASE WHEN route_action='SPAWN' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN route_action='REUSE' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN state='SUCCEEDED'
+                                  AND planned_execution_kind='MANAGED_WORKER'
+                                  AND execution_kind='MANAGED_WORKER'
+                                  AND codex_turn_id IS NOT NULL THEN 1 ELSE 0 END),
+                    COUNT(DISTINCT thread_instance_id)
+             FROM job_attempts
+             WHERE job_id IN ('cas-managed-first','cas-managed-second')",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let (receipt_count, receipt_stages, dispatch_receipts, managed_receipts): (i64, i64, i64, i64) =
+        stage(
+            connection.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT stage),
+                    SUM(CASE WHEN stage='DISPATCH_RECORDED' AND execution_kind IS NULL
+                             THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN stage<>'DISPATCH_RECORDED'
+                                  AND execution_kind='MANAGED_WORKER'
+                             THEN 1 ELSE 0 END)
+             FROM delivery_receipts
+             WHERE job_id IN ('cas-managed-first','cas-managed-second')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            ),
+            "MANAGED_EVIDENCE_QUERY_FAILED",
+        )?;
+    let review_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM review_decisions
+             WHERE job_id IN ('cas-managed-first','cas-managed-second') AND decision='APPROVE'",
+            [],
+            |row| row.get(0),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let released_lease_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM runtime_delegation_leases lease
+             JOIN job_attempts attempt ON attempt.lease_id=lease.id
+             WHERE attempt.job_id IN ('cas-managed-first','cas-managed-second')
+               AND lease.state='RELEASED'",
+            [],
+            |row| row.get(0),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let managed_instance_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM agent_thread_instances
+             WHERE codex_thread_id=?1 AND agent_id=?2 AND parent_thread_id=?3
+               AND scope_key=?4 AND task_scope_key=?5 AND execution_kind='MANAGED_WORKER'
+               AND status='IDLE' AND reuse_state='ACTIVE' AND total_tokens>0",
+            params![
+                thread_id,
+                agent.id,
+                parent_thread_id,
+                workspace_scope_key,
+                MANAGED_TASK_SCOPE_KEY
+            ],
+            |row| row.get(0),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let usage_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM token_usage_records
+             WHERE codex_thread_id=?1 AND parent_thread_id=?2 AND agent_id=?3
+               AND execution_kind='MANAGED_WORKER' AND total_tokens>0",
+            params![thread_id, parent_thread_id, agent.id],
+            |row| row.get(0),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    let (finished_events, parent_child_events): (i64, i64) = stage(
+        connection.query_row(
+            "SELECT
+                SUM(CASE WHEN event_type='TURN_FINISHED' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN event_type='PARENT_CHILD' THEN 1 ELSE 0 END)
+             FROM runtime_receipt_events WHERE codex_thread_id=?1",
+            [thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ),
+        "MANAGED_EVIDENCE_QUERY_FAILED",
+    )?;
+    if invalid_jobs != 0
+        || attempt_count != 2
+        || spawn_count != 1
+        || reuse_count != 1
+        || managed_count != 2
+        || distinct_threads != 1
+        || receipt_count != 8
+        || receipt_stages != 4
+        || dispatch_receipts != 2
+        || managed_receipts != 6
+        || review_count != 2
+        || released_lease_count != 2
+        || managed_instance_count != 1
+        || usage_count == 0
+        || finished_events < 2
+        || parent_child_events != 0
+    {
+        return Err(Rc1Failure::new(
+            "MANAGED_EVIDENCE_INVALID",
+            format!(
+                "invalidJobs={invalid_jobs}, attempts={attempt_count}, spawn={spawn_count}, reuse={reuse_count}, managed={managed_count}, threads={distinct_threads}, receipts={receipt_count}/{receipt_stages}/{dispatch_receipts}/{managed_receipts}, reviews={review_count}, leases={released_lease_count}, instance={managed_instance_count}, usage={usage_count}, events={finished_events}/{parent_child_events}"
+            ),
+        ));
+    }
+    let tracking = orchestration
+        .list_tracking(OrchestrationJobListRequest {
+            workspace_scope_key: Some(workspace_scope_key.to_owned()),
+            agent_id: Some(agent.id.clone()),
+            page: 0,
+            page_size: 10,
+        })
+        .map_err(|error| Rc1Failure::new("MANAGED_TRACKING_QUERY_FAILED", format!("{error:?}")))?;
+    let tracking_jobs = tracking
+        .jobs
+        .iter()
+        .filter(|job| {
+            matches!(
+                job.job_id.as_str(),
+                "cas-managed-first" | "cas-managed-second"
+            )
+        })
+        .collect::<Vec<_>>();
+    let tracking_valid = tracking_jobs.len() == 2
+        && tracking_jobs.iter().all(|job| {
+            job.state == "COMPLETED"
+                && job.attempts.len() == 1
+                && job.attempts[0].state == "SUCCEEDED"
+                && job.attempts[0].execution_kind.as_deref() == Some("MANAGED_WORKER")
+                && job.attempts[0].codex_thread_id.as_deref() == Some(thread_id)
+                && job.attempts[0].receipt_stage.as_deref() == Some("PARENT_ACKNOWLEDGED")
+                && job.attempts[0].review_decision.as_deref() == Some("APPROVE")
+                && job.attempts[0].lease_state.as_deref() == Some("RELEASED")
+        });
+    if !tracking_valid {
+        return Err(Rc1Failure::new(
+            "MANAGED_TRACKING_DTO_INVALID",
+            "UI 使用的 Tracking DTO 与数据库证据不一致",
+        ));
+    }
+    Ok(json!({
+        "attemptCount": attempt_count,
+        "spawnCount": spawn_count,
+        "reuseCount": reuse_count,
+        "managedAttemptCount": managed_count,
+        "distinctThreadCount": distinct_threads,
+        "receiptCount": receipt_count,
+        "receiptStageCount": receipt_stages,
+        "dispatchReceiptCount": dispatch_receipts,
+        "managedReceiptCount": managed_receipts,
+        "reviewCount": review_count,
+        "releasedLeaseCount": released_lease_count,
+        "usageRecordCount": usage_count,
+        "turnFinishedEventCount": finished_events,
+        "parentChildEventCount": parent_child_events,
+        "trackingDtoCount": tracking_jobs.len()
+    }))
+}
+
+fn run_managed_worker_e2e() -> Result<Value, Rc1Failure> {
+    let root = required_path("CAS_E2E_ROOT")?;
+    let cleanup = TempRoot(root.clone());
+    let source_database = required_path("CAS_E2E_SOURCE_DATABASE_PATH")?;
+    let source_codex_home = required_path("CAS_E2E_SOURCE_CODEX_HOME")?;
+    let helper_source = required_path("CAS_E2E_HELPER_PATH")?;
+    let database_path = required_path("CAS_DATABASE_PATH")?;
+    let codex_home = root.join("codex-home");
+    let data_home = root.join("cas-data");
+    let helper_home = root.join("cas-runtime");
+    let workspace = root.join("workspace");
+    stage(fs::create_dir_all(&codex_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&data_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&helper_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&workspace), "TEMP_DIRECTORY_FAILED")?;
+    let helper_path = helper_home.join("cas-helper.exe");
+    stage(fs::copy(&helper_source, &helper_path), "HELPER_COPY_FAILED")?;
+    stage(
+        fs::write(
+            workspace.join("package.json"),
+            b"{\n  \"name\": \"cas-managed-e2e\",\n  \"private\": true\n}\n",
+        ),
+        "FIXTURE_WRITE_FAILED",
+    )?;
+    clone_database(&source_database, &database_path)?;
+    let connection = stage(Connection::open(&database_path), "E2E_DATABASE_FAILED")?;
+    reset_e2e_database(&connection, &codex_home)?;
+    let agent = active_agent(&connection)?;
+    drop(connection);
+    copy_runtime_identity(&source_codex_home, &codex_home)?;
+    stage(
+        fs::write(
+            codex_home.join("config.toml"),
+            b"approval_policy = \"on-request\"\nsandbox_mode = \"workspace-write\"\n",
+        ),
+        "NON_INTERACTIVE_CONFIG_FAILED",
+    )?;
+    let configuration = ConfigurationService::for_e2e(
+        database_path.clone(),
+        data_home.clone(),
+        codex_home.clone(),
+        helper_path.clone(),
+    );
+    let switch_request: RuntimeModeSwitchRequest = stage(
+        serde_json::from_value(json!({ "activeAgentIds": [agent.id.clone()] })),
+        "CONFIGURATION_REQUEST_FAILED",
+    )?;
+    stage(
+        configuration.switch_runtime_mode(switch_request),
+        "CONFIGURATION_APPLY_FAILED",
+    )?;
+    let executable = env::var("CAS_E2E_CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".to_owned());
+    let timeout = Duration::from_secs(
+        env::var("CAS_E2E_TIMEOUT_SECONDS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 30)
+            .unwrap_or(180),
+    );
+    let workspace_scope_key = normalize_workspace_scope_key(&workspace.to_string_lossy())
+        .ok_or_else(|| Rc1Failure::new("WORKSPACE_SCOPE_INVALID", "无法规范化 E2E workspace"))?;
+    let bridge = stage(
+        RuntimeBridgeService::open(&database_path, &data_home, &helper_path),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    let orchestration = stage(
+        OrchestrationJobService::open(&database_path),
+        "ORCHESTRATION_OPEN_FAILED",
+    )?;
+    let outcome = (|| {
+        stage(
+            bridge.start_inner_for_e2e(Path::new(&executable), &codex_home, None),
+            "BRIDGE_START_FAILED",
+        )?;
+        let primary = stage(
+            bridge.managed_session_start_inner(ManagedSessionStartRequest {
+                cwd: workspace.to_string_lossy().into_owned(),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox: Some("workspace-write".to_owned()),
+            }),
+            "PRIMARY_START_FAILED",
+        )?;
+        let first = execute_managed(
+            &bridge,
+            &orchestration,
+            managed_task_packet(
+                &agent.id,
+                &primary.thread_id,
+                &workspace_scope_key,
+                "cas-managed-first",
+                "CAS_MANAGED_FIRST",
+            ),
+            &workspace,
+            "不要调用任何工具，只回复 CAS_MANAGED_FIRST。",
+            RouteAction::Spawn,
+            None,
+            "MANAGED_FIRST_DISPATCH_FAILED",
+        )?;
+        if first.action != AgentThreadExecutionAction::Spawned
+            || first.decision != RouteAction::Spawn
+        {
+            return Err(Rc1Failure::new(
+                "MANAGED_FIRST_DECISION_INVALID",
+                format!("首次决策不为 SPAWN：{first:?}"),
+            ));
+        }
+        wait_for_managed_review_pending(
+            &bridge,
+            &database_path,
+            &first.thread_id,
+            &first.job_id,
+            timeout,
+        )?;
+        verify_managed_turn(
+            &bridge,
+            &first.thread_id,
+            &first.turn_id,
+            "CAS_MANAGED_FIRST",
+            1,
+        )?;
+        approve_managed_job(&orchestration, &first, &primary.thread_id)?;
+
+        let second = execute_managed(
+            &bridge,
+            &orchestration,
+            managed_task_packet(
+                &agent.id,
+                &primary.thread_id,
+                &workspace_scope_key,
+                "cas-managed-second",
+                "CAS_MANAGED_SECOND",
+            ),
+            &workspace,
+            "继续同一任务，不要调用任何工具，只回复 CAS_MANAGED_SECOND。",
+            RouteAction::Reuse,
+            Some(first.thread_id.clone()),
+            "MANAGED_SECOND_DISPATCH_FAILED",
+        )?;
+        if second.action != AgentThreadExecutionAction::Reused
+            || second.decision != RouteAction::Reuse
+            || second.thread_id != first.thread_id
+        {
+            return Err(Rc1Failure::new(
+                "MANAGED_SECOND_DECISION_INVALID",
+                format!("第二次未复用首次 Worker：{second:?}"),
+            ));
+        }
+        wait_for_managed_review_pending(
+            &bridge,
+            &database_path,
+            &second.thread_id,
+            &second.job_id,
+            timeout,
+        )?;
+        verify_managed_turn(
+            &bridge,
+            &second.thread_id,
+            &second.turn_id,
+            "CAS_MANAGED_SECOND",
+            2,
+        )?;
+        approve_managed_job(&orchestration, &second, &primary.thread_id)?;
+        let evidence = verify_managed_evidence(
+            &database_path,
+            &orchestration,
+            &agent,
+            &primary.thread_id,
+            &workspace_scope_key,
+            &second.thread_id,
+        )?;
+        stage(bridge.stop_inner(), "BRIDGE_STOP_FAILED")?;
+        Ok(json!({
+            "status": "PASS",
+            "agentKey": agent.key,
+            "agentName": agent.name,
+            "providerKey": agent.provider,
+            "model": agent.model,
+            "executionKind": "MANAGED_WORKER",
+            "taskScopeKey": MANAGED_TASK_SCOPE_KEY,
+            "primaryThreadId": primary.thread_id,
+            "workerThreadId": second.thread_id,
+            "firstTurnId": first.turn_id,
+            "secondTurnId": second.turn_id,
+            "firstDecision": "SPAWN",
+            "secondDecision": "REUSE",
+            "nativeThreadReadVerified": true,
+            "databaseVerified": true,
+            "trackingDtoVerified": true,
+            "evidence": evidence
+        }))
+    })();
+    let _ = bridge.stop_inner();
+    if outcome.is_ok() {
+        drop(cleanup);
+    } else {
+        std::mem::forget(cleanup);
+    }
+    outcome
+}
+
+#[test]
+#[ignore = "requires a configured CAS database, Codex login and a real provider"]
+fn managed_worker_spawn_reuse_receipt_review() {
+    write_e2e_result(run_managed_worker_e2e(), "CAS_MANAGED_RESULT");
 }
 
 fn run_phase6_idle_recovery_e2e() -> Result<Value, Rc1Failure> {

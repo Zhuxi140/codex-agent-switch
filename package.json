@@ -1,7 +1,7 @@
 {
   "name": "codex-agent-switch",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.5.0-rc.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,6 +11,7 @@
     "bundle:windows": "tauri build --bundles nsis",
     "e2e:orchestration": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1",
     "e2e:orchestration:matrix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1 -Stage RC2",
+    "e2e:orchestration:managed": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1 -Stage MANAGED",
     "e2e:runtime-recovery": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/rc1-native-orchestration-e2e.ps1 -Stage PHASE6",
     "poc:app-server": "node scripts/cas-app-server-poc.mjs",
     "poc:app-server:self-test": "node scripts/cas-app-server-poc.mjs --self-test",

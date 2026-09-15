@@ -20,11 +20,8 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: 前端构建（tsc + vite build）
-        run: npm ci && npm run build
-
-      - name: 准备 cas-helper sidecar
-        run: npm run prepare:sidecar
+      - name: 安装前端依赖
+        run: npm ci
 
       - name: Rust 格式检查
         run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
@@ -32,12 +29,35 @@ jobs:
       - name: Rust 单元测试
         run: cargo test --manifest-path src-tauri/Cargo.toml --workspace
 
-      - name: Rust Release 编译
-        run: cargo build --release --manifest-path src-tauri/Cargo.toml
+      - name: 构建前端、sidecar 与 Windows NSIS 候选包
+        run: npm run bundle:windows
 
-      - name: 上传 Release 可执行文件
+      - name: 收集候选产物并生成 SHA-256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $config = Get-Content -LiteralPath "src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json
+          $installerName = "$($config.productName)_$($config.version)_x64-setup.exe"
+          $installer = Get-Item -LiteralPath (Join-Path "src-tauri/target/release/bundle/nsis" $installerName)
+          $application = Get-Item -LiteralPath "src-tauri/target/release/codex-agent-switch.exe"
+          $artifactDirectory = New-Item -ItemType Directory -Force -Path "release-artifacts"
+
+          Copy-Item -LiteralPath $installer.FullName -Destination $artifactDirectory.FullName
+          Copy-Item -LiteralPath $application.FullName -Destination $artifactDirectory.FullName
+
+          $checksums = Get-ChildItem -LiteralPath $artifactDirectory.FullName -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+              "$hash *$($_.Name)"
+            }
+          $checksums | Set-Content -LiteralPath (Join-Path $artifactDirectory.FullName "SHA256SUMS") -Encoding utf8
+          $checksums | Write-Output
+
+      - name: 上传 Windows 候选产物
         uses: actions/upload-artifact@v4
         with:
-          name: codex-agent-switch-release-exe
-          path: src-tauri/target/release/codex-agent-switch.exe
+          name: codex-agent-switch-windows-${{ github.sha }}
+          path: release-artifacts/
           if-no-files-found: error
+          compression-level: 0

@@ -2913,12 +2913,31 @@ function OrchestrationJobTrackingSection({
   }, [load]);
 
   return (
+    <OrchestrationJobTrackingView
+      error={error}
+      onRefresh={() => void load()}
+      page={page}
+    />
+  );
+}
+
+export function OrchestrationJobTrackingView({
+  error,
+  onRefresh,
+  page,
+}: {
+  error: string | null;
+  onRefresh: () => void;
+  page: OrchestrationJobPageResponse | null;
+}) {
+
+  return (
     <div className="orchestration-tracking" aria-label="编排任务追踪">
       <div className="orchestration-tracking-header">
         <h3>编排任务（Runtime First）</h3>
         <button
           className="secondary-button"
-          onClick={() => void load()}
+          onClick={onRefresh}
           type="button"
         >
           刷新
@@ -2931,22 +2950,45 @@ function OrchestrationJobTrackingSection({
       {page && page.jobs.length > 0 && (
         <ul className="orchestration-job-list">
           {page.jobs.map((job) => (
-            <li key={job.jobId} className="orchestration-job-row">
+            <li
+              key={job.jobId}
+              className="orchestration-job-row"
+              data-job-id={job.jobId}
+              data-parent-thread-id={job.parentThreadId}
+              aria-label={`Job ${job.jobId}，状态 ${job.state}`}
+            >
               <div className="orchestration-job-main">
                 <span className={`orchestration-job-state state-${job.state.toLowerCase()}`}>
                   {job.state}
                 </span>
+                <Tooltip content={job.jobId} label="Job ID">
+                  <code>{job.jobId}</code>
+                </Tooltip>
                 <span className="orchestration-job-scope">
                   task <code>{job.taskScopeKey}</code>
                 </span>
+                <Tooltip content={job.parentThreadId} label="Parent Thread ID">
+                  <code>{job.parentThreadId.slice(0, 12)}…</code>
+                </Tooltip>
                 {job.lastErrorCode && (
                   <span className="orchestration-job-error">{job.lastErrorCode}</span>
                 )}
               </div>
               <ul className="orchestration-attempt-list">
                 {job.attempts.map((attempt) => (
-                  <li key={attempt.attemptId} className="orchestration-attempt-row">
-                    <span className="orchestration-attempt-no">#{attempt.attemptNo}</span>
+                  <li
+                    key={attempt.attemptId}
+                    className="orchestration-attempt-row"
+                    data-attempt-id={attempt.attemptId}
+                    data-execution-kind={attempt.executionKind ?? "UNKNOWN"}
+                    data-thread-id={attempt.codexThreadId ?? ""}
+                    data-turn-id={attempt.codexTurnId ?? ""}
+                    aria-label={`Attempt ${attempt.attemptNo}，${attempt.state}，${attempt.executionKind ?? "身份未证明"}`}
+                  >
+                    <Tooltip content={attempt.attemptId} label="Attempt ID">
+                      <span className="orchestration-attempt-no">#{attempt.attemptNo}</span>
+                    </Tooltip>
+                    <span>Attempt {attempt.state}</span>
                     <span>{attempt.routeAction}</span>
                     <span
                       className={attempt.executionKind === "NATIVE_CHILD"
@@ -2957,12 +2999,17 @@ function OrchestrationJobTrackingSection({
                     >
                       {attempt.executionKind ?? "身份未证明"}
                     </span>
-                    <span>{attempt.plannedExecutionKind}</span>
+                    <span>Plan {attempt.plannedExecutionKind}</span>
                     {attempt.codexThreadId && (
                       <Tooltip content={attempt.codexThreadId} label="Child Thread ID">
                         <code className="orchestration-thread-id">
                           {attempt.codexThreadId.slice(0, 12)}…
                         </code>
+                      </Tooltip>
+                    )}
+                    {attempt.codexTurnId && (
+                      <Tooltip content={attempt.codexTurnId} label="Turn ID">
+                        <code>{attempt.codexTurnId.slice(0, 12)}…</code>
                       </Tooltip>
                     )}
                     {attempt.leaseState && <span>Lease {attempt.leaseState}</span>}

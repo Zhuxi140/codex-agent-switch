@@ -12,7 +12,7 @@
 CAS 是面向 Codex CLI 的 Windows 桌面应用：用图形界面管理 Provider、Model 与 Agent 绑定，并将多 Agent 编排、原生 Thread 生命周期和 Token 用量集中到同一处。它通过官方 `codex app-server` 接口工作，无需手改 Codex TOML。
 
 > [!WARNING]
-> **v0.4.1 及当前主分支开发快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 会改写 Codex 的 `config.toml` 相关片段、在当前生效的全局 `AGENTS.md` 或 `AGENTS.override.md` 中维护一段 CAS Primary 编排协议，并投影 Agent、模型目录与 Skill 资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
+> **已发布的 v0.4.1 与当前 0.5.0-rc.1 候选快照仍暂不推荐安装使用，更不应作为稳定生产工具部署。** 项目仍处于快速迭代阶段，Apply 会改写 Codex 的 `config.toml` 相关片段、在当前生效的全局 `AGENTS.md` 或 `AGENTS.override.md` 中维护一段 CAS Primary 编排协议，并投影 Agent、模型目录与 Skill 资源；第三方 Provider 的兼容性会因 Provider 和模型的工具协议而存在差异；安装包也尚未进行代码签名。建议仅在隔离的测试环境尝鲜，使用前备份现有配置，并在 Apply 前后仔细核对 Preview 与 Snapshot。
 
 ## 核心理念
 
@@ -72,24 +72,26 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 ## 测试状态与客观数据
 
-以下结果区分已发布的 v0.4.1 与当前主分支开发快照；主分支新增能力尚未进入 v0.4.1 安装包。
+以下结果区分已发布的 v0.4.1 与当前 0.5.0-rc.1 候选快照；候选版新增能力尚未进入 v0.4.1 安装包。
 
-### 当前主分支开发验证（2026-09-14）
+### 当前 0.5.0-rc.1 候选验证（2026-09-14）
 
 | 验证项 | 真实结果 |
 | --- | --- |
-| Rust Workspace 测试 | 375 passed、0 failed、8 ignored（cas-helper 33、lifecycle 8、scheduler 72〔含 4 个矩阵测试〕、secret-store 2、主 lib 260） |
+| Rust Workspace 测试 | 376 passed、0 failed、9 ignored（cas-helper 33、lifecycle 8、scheduler 72〔含 4 个矩阵测试〕、secret-store 2、主 lib 261） |
 | 前端生产构建 | 通过 |
 | V-01 多版本 Adapter 契约矩阵 | Modern + 较早别名 + Unsupported Fixture 共 13 格可重复报告通过 |
 | Runtime First R0～Phase F | 契约冻结、Adapter/Session Registry、TaskPacket/Job/幂等、原子调度、Receipt/Review/Release、Runtime Enforcement、AGENTS 去侵入、可观察性与脱敏诊断已落地；R0-02 已补充冻结 CAS2 Native Control Envelope |
 | CAS2 Native Control 确定性验证 | 两个 Job 的 SPAWN/REUSE、Native bind/observe、8 条 Receipt、2 个 Review 与 Lease Release 链已由数据库测试覆盖 |
 | Codex Native CAS2 RC-1 | 通过（2026-09-14，`gpt5_6terra`）：同一 Child 完成 SPAWN→REUSE，2 Job / 2 Attempt / 8 Receipt / 2 Review / 2 Lease Release；Evidence：`%TEMP%/cas-rc1-results/4b55fc077d3f45bc959f1634449d94d8.json` |
 | Codex Native RC-2 | 通过（2026-09-14，`gpt5_6terra`）：先完成 CAS2 RC-1，再通过并发 1 SPAWN + 1 WAIT、Workspace、Fingerprint、Task Scope 与 Context Pressure 矩阵；Evidence：`%TEMP%/cas-rc2-results/2675fdb0de5e42a58df884624e5f60bf.json` |
+| Managed Worker V-02 | 通过（2026-09-14，`gpt5_6terra`）：同一 Worker 完成 SPAWN→REUSE，2 Job / 2 Attempt / 8 Receipt / 2 Review / 2 Lease Release；Native `thread/read`、数据库与 Tracking DTO 一致，真实关键 ID/状态链的 UI 预览通过，且 Usage Parent 归属已验证；Evidence：`%TEMP%/cas-managed-results/606248f59a574a4f9e4840c9053cc832.json` |
 | Phase 12 恢复矩阵 | 空闲/运行中断、恢复风暴上限和启动失败真实 E2E 已通过；证据见 Runtime First 验收清单 |
+| 0.4.1 → 0.5.0-rc.1 本地发布门 | 通过（2026-09-14）：真实 v0.4.1 安装后启动并生成 schema 26 数据库，写入哨兵设置，再由候选 NSIS 原位升级；候选启动后迁移至 schema 40，哨兵逐字段不变、完整性检查通过、sidecar 哈希一致；卸载清理程序与快捷方式并保留应用数据。原生窗口句柄和标题已验证，像素级桌面 UI 验证因当前自动化表面不可用而待补；Evidence：`%TEMP%/cas-release-gate/release-gate-0.4.1-to-0.5.0-rc.1.json` |
 
-当前快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E 脚本。Runtime First 改造（R0～Phase F）进一步落地：冻结的 TaskPacket/Job/Attempt 契约与幂等语义、按 Thread 的 Session Registry、原子调度事务（硬门槛 + 软评分 + Agent Type Lease）、四阶段 Delivery Receipt、Primary Review Gate 与 `HELD_FOR_REVIEW`、Revision Attempt、可选只读 Reviewer、Runtime Hook Admission 接线、AGENTS 最小兼容片段迁移、三态生效提示、Job 分层追踪查询与脱敏诊断包。CAS2 Native Control Envelope 现把真实 Native Child 接入同一 Job/Receipt/Review 状态机；CAS1 `schedule/bind` 仅保留兼容。同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态；只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。它仍是开发快照，不应当作新的 Release 安装包分发。
+当前候选快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E 脚本。Runtime First 改造（R0～Phase F）进一步落地：冻结的 TaskPacket/Job/Attempt 契约与幂等语义、按 Thread 的 Session Registry、原子调度事务（硬门槛 + 软评分 + Agent Type Lease）、四阶段 Delivery Receipt、Primary Review Gate 与 `HELD_FOR_REVIEW`、Revision Attempt、可选只读 Reviewer、Runtime Hook Admission 接线、AGENTS 最小兼容片段迁移、三态生效提示、Job 分层追踪查询与脱敏诊断包。CAS2 Native Control Envelope 现把真实 Native Child 接入同一 Job/Receipt/Review 状态机；CAS1 `schedule/bind` 仅保留兼容。同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态；只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。0.5.0-rc.1 仍是本地、未签名的候选快照，不应当作稳定 Release 分发。
 
-当前 workspace 的 8 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 5 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
+当前 workspace 的 9 个 ignored 测试包括 1 个会写入当前 Windows 用户凭据库的合成凭据测试、2 个按需输出 Phase 12 结构化证据的确定性场景，以及 6 个依赖 Codex 登录、真实 Provider 或外部配置的 E2E；它们均不计入默认测试通过结论。
 
 ### v0.4.1 发布验证
 
@@ -108,6 +110,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 | 链路 | 状态 | 覆盖边界 |
 | --- | --- | --- |
 | Codex Native `gpt-5.6-terra` 子 Agent | RC-1、RC-2、Phase 12 自动化通过 | 同一 Primary 下完成 SPAWN → bind → IDLE → REUSE；并发与失配矩阵通过；空闲及运行中断流均恢复同一 Primary，原 Turn 未重放，显式停止后不自动拉起 |
+| App Server Managed Worker | V-02 自动化通过 | 同一 Primary 下完成 SPAWN → REVIEW → REUSE → REVIEW；两个 Attempt 均为 `MANAGED_WORKER`，复用同一 Worker、使用不同 Turn，且无 Native ParentChild 事件；Tracking DTO 与数据库一致，真实关键 ID/状态链的 UI 预览通过 |
 | DeepSeek Responses 子 Agent | 已有成功实测 | 仅说明该实测配置可运行，不外推至其他 Provider 或模型 |
 | 外部配置 E2E 自动化 | 已提供独立命令，未纳入默认测试 | 依赖当前 Codex 登录、活动 Agent、真实 Provider 与模型；失败会保留 JSON 证据 |
 | 阿里及其他 Provider | 待测试 | 不声明已通过 |
@@ -226,9 +229,9 @@ Primary 专属协议以最小兼容片段同步到两个位置：`config.toml` �
 ## Roadmap（下一阶段：v0.5 RC）
 
 - **Runtime First 改造（R0～Phase F 已完成）**：TaskPacket/Job/Attempt 契约、Session Registry、原子调度、Receipt/Review/Release、Runtime Enforcement 与 AGENTS 去侵入、可观察性与脱敏诊断已全部落地；实施记录见 docs/orchestration。
-- **真实编排闭环（V-02 部分完成）**：CAS2 Native Child 的 Job→Attempt→Receipt→Review→Release 与 RC-2 兼容矩阵已真实通过；仍需独立补齐 Managed Worker 与 UI/数据库/原生事件三方一致证据。
+- **真实编排闭环（V-02 已完成）**：CAS2 Native Child 与 Managed Worker 均完成真实 SPAWN→REUSE、Job→Attempt→Receipt→Review→Release；Tracking DTO、数据库与原生 `thread/read` 一致，真实关键 ID/状态链也已通过生产 Tracking 组件预览。
 - **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
-- **发布候选**：在干净环境完成 NSIS 全新安装、0.4.1 升级、卸载边界和 sidecar 校验；CI 产出可核验的安装包。
+- **发布候选（本地门禁已通过）**：0.5.0-rc.1 已完成 NSIS 全新安装、真实 0.4.1 原位升级、卸载边界和 sidecar 校验；剩余门禁为真实桌面的像素级 UI 冒烟，以及 CI 产出可核验安装包并完成签名/发布决策。
 
 在上述门槛通过前，不继续增加 Reuse Score、AI 任务分类或费用估算。
 
@@ -244,11 +247,12 @@ npm.cmd run bundle:windows
 
 `bundle:windows` 会生成 NSIS x64 安装包，并携带 `cas-helper.exe`。
 
-需要真实 Codex 登录和活动 Agent 时，可单独执行 RC-1、RC-2 或 Phase 6；它们不会进入默认测试：
+需要真实 Codex 登录和活动 Agent 时，可单独执行 RC-1、RC-2、Managed Worker 或 Phase 6；它们不会进入默认测试：
 
 ```powershell
 npm.cmd run e2e:orchestration -- -AgentKey <agent-key> -TimeoutSeconds 420
 npm.cmd run e2e:orchestration:matrix -- -AgentKey <codex-native-agent-key> -TimeoutSeconds 420
+npm.cmd run e2e:orchestration:managed -- -AgentKey <agent-key> -TimeoutSeconds 420
 npm.cmd run e2e:runtime-recovery -- -Scenario Idle -TimeoutSeconds 120
 npm.cmd run e2e:runtime-recovery -- -Scenario Running -TimeoutSeconds 120
 npm.cmd run e2e:runtime-recovery -- -Scenario Storm
