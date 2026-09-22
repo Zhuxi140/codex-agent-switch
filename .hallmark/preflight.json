@@ -1,13 +1,15 @@
 {
-  "scope": "component",
+  "scope": "app",
   "framework": "React 19 + TypeScript + Tauri 2",
   "genre": "modern-minimal",
   "tone": "technical",
-  "theme": "existing CAS cool-neutral",
-  "typography": "system font with user-configured system font override",
-  "motion": "existing restrained CSS transitions; reduced-motion supported",
-  "component": "project monitor window",
-  "responsiveWidths": [320, 375, 414, 768],
+  "theme": "ccSwitch-derived layered neutral dual-mode with one Cobalt product accent and semantic state colours",
+  "macrostructure": "Topbar Workbench",
+  "navigation": "ccSwitch-derived 64px segmented topbar with icon-first responsive labels",
+  "typography": "Segoe UI Variable Display + user-configurable body + Cascadia Code mono",
+  "motion": "Workbench restrained stance; no backdrop blur; button press and state transitions only; reduced-motion supported",
+  "pages": ["overview", "usage", "agents", "providers", "models", "diagnostics", "settings", "project-monitor"],
+  "responsiveWidths": [320, 375, 414, 768, 900, 1000, 1280],
   "states": ["default", "hover", "focus", "active", "disabled", "loading", "error", "success"],
   "dependenciesAdded": []
 }

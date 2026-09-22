@@ -23,3 +23,7 @@ src-tauri/binaries/
 
 # Local Codex skill installation metadata is not part of the application.
 skills-lock.json
+
+# Local UI references and Hallmark run logs are development inputs, not product source.
+docs/frontend/
+.hallmark/log.json

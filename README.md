@@ -74,7 +74,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 
 以下结果区分已发布的 v0.4.1 与当前 0.5.0-rc.1 候选快照；候选版新增能力尚未进入 v0.4.1 安装包。
 
-### 当前 0.5.0-rc.1 候选验证（2026-09-14）
+### 当前 0.5.0-rc.1 候选验证（截至 2026-09-22）
 
 | 验证项 | 真实结果 |
 | --- | --- |
@@ -87,7 +87,7 @@ Codex 原生支持子 Agent 协作（`agents/*.toml` + `[model_providers.*]`）�
 | Codex Native RC-2 | 通过（2026-09-14，`gpt5_6terra`）：先完成 CAS2 RC-1，再通过并发 1 SPAWN + 1 WAIT、Workspace、Fingerprint、Task Scope 与 Context Pressure 矩阵；Evidence：`%TEMP%/cas-rc2-results/2675fdb0de5e42a58df884624e5f60bf.json` |
 | Managed Worker V-02 | 通过（2026-09-14，`gpt5_6terra`）：同一 Worker 完成 SPAWN→REUSE，2 Job / 2 Attempt / 8 Receipt / 2 Review / 2 Lease Release；Native `thread/read`、数据库与 Tracking DTO 一致，真实关键 ID/状态链的 UI 预览通过，且 Usage Parent 归属已验证；Evidence：`%TEMP%/cas-managed-results/606248f59a574a4f9e4840c9053cc832.json` |
 | Phase 12 恢复矩阵 | 空闲/运行中断、恢复风暴上限和启动失败真实 E2E 已通过；证据见 Runtime First 验收清单 |
-| 0.4.1 → 0.5.0-rc.1 本地发布门 | 通过（2026-09-14）：真实 v0.4.1 安装后启动并生成 schema 26 数据库，写入哨兵设置，再由候选 NSIS 原位升级；候选启动后迁移至 schema 40，哨兵逐字段不变、完整性检查通过、sidecar 哈希一致；卸载清理程序与快捷方式并保留应用数据。原生窗口句柄和标题已验证，像素级桌面 UI 验证因当前自动化表面不可用而待补；Evidence：`%TEMP%/cas-release-gate/release-gate-0.4.1-to-0.5.0-rc.1.json` |
+| 0.4.1 → 0.5.0-rc.1 本地发布门 | 通过（2026-09-14）：真实 v0.4.1 安装后启动并生成 schema 26 数据库，写入哨兵设置，再由候选 NSIS 原位升级；候选启动后迁移至 schema 40，哨兵逐字段不变、完整性检查通过、sidecar 哈希一致；卸载清理程序与快捷方式并保留应用数据。2026-09-22 又完成真实 Tauri 窗口的浅色/深色、键盘导航、顶部导航热切换与整页滚动冒烟；响应式宽屏和 Project Monitor 320/375/414px 视口同时通过。升级 Evidence：`%TEMP%/cas-release-gate/release-gate-0.4.1-to-0.5.0-rc.1.json` |
 
 当前候选快照增加了 Provider 凭据删除恢复、用量按项目分组、Task Scope、SPAWN Reservation、`WAIT` 决策、Thread 复用池管理、角色感知的 `AUTO` 复用策略、Agent 级 Skill 与 MCP Server / 工具权限，以及可重复的 RC-1 / RC-2 / Phase 12 原生 E2E 脚本。Runtime First 改造（R0～Phase F）进一步落地：冻结的 TaskPacket/Job/Attempt 契约与幂等语义、按 Thread 的 Session Registry、原子调度事务（硬门槛 + 软评分 + Agent Type Lease）、四阶段 Delivery Receipt、Primary Review Gate 与 `HELD_FOR_REVIEW`、Revision Attempt、可选只读 Reviewer、Runtime Hook Admission 接线、AGENTS 最小兼容片段迁移、三态生效提示、Job 分层追踪查询与脱敏诊断包。CAS2 Native Control Envelope 现把真实 Native Child 接入同一 Job/Receipt/Review 状态机；CAS1 `schedule/bind` 仅保留兼容。同时显式启用 `features.multi_agent=true`，并通过当前 Codex 的 `hooks/list` 读取真实的启用、来源与信任状态；只有 Codex 明确报告全部 CAS Hook 为 `trusted` / `managed` 才显示就绪，接口缺失或返回不兼容时 Fail Closed。Windows 检测优先使用当前运行中的 Codex 可执行文件。关闭 CAS 不再自动切回 Default，运行模式会保持到用户显式切换。0.5.0-rc.1 仍是本地、未签名的候选快照，不应当作稳定 Release 分发。
 
@@ -231,7 +231,7 @@ Primary 专属协议以最小兼容片段同步到两个位置：`config.toml` �
 - **Runtime First 改造（R0～Phase F 已完成）**：TaskPacket/Job/Attempt 契约、Session Registry、原子调度、Receipt/Review/Release、Runtime Enforcement 与 AGENTS 去侵入、可观察性与脱敏诊断已全部落地；实施记录见 docs/orchestration。
 - **真实编排闭环（V-02 已完成）**：CAS2 Native Child 与 Managed Worker 均完成真实 SPAWN→REUSE、Job→Attempt→Receipt→Review→Release；Tracking DTO、数据库与原生 `thread/read` 一致，真实关键 ID/状态链也已通过生产 Tracking 组件预览。
 - **复用池生命周期（已完成）**：支持按 Thread 移出、完成后退休、受控恢复和客观条件批量清理；退休记录继续保留 Token 与调度证据。
-- **发布候选（本地门禁已通过）**：0.5.0-rc.1 已完成 NSIS 全新安装、真实 0.4.1 原位升级、卸载边界和 sidecar 校验；剩余门禁为真实桌面的像素级 UI 冒烟，以及 CI 产出可核验安装包并完成签名/发布决策。
+- **发布候选（本地门禁已通过）**：0.5.0-rc.1 已完成 NSIS 全新安装、真实 0.4.1 原位升级、卸载边界、sidecar 校验和真实桌面 UI 冒烟；剩余门禁为 CI 产出可核验安装包，并完成签名/发布决策。
 
 在上述门槛通过前，不继续增加 Reuse Score、AI 任务分类或费用估算。
 
