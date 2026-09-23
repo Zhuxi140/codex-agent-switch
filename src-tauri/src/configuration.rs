@@ -48,11 +48,13 @@ const MODEL_CATALOG_RESOURCE: &str = "MODEL_CATALOG";
 const SESSION_CATALOG_RESOURCE: &str = "CODEX_SESSION_CATALOG";
 const ORCHESTRATION_RESOURCE: &str = "CODEX_ORCHESTRATION";
 const GLOBAL_INSTRUCTIONS_RESOURCE: &str = "CODEX_GLOBAL_INSTRUCTIONS";
+const ORCHESTRATION_RULES_RESOURCE: &str = "CODEX_ORCHESTRATION_RULES";
 const BUNDLED_SKILL_RESOURCE: &str = "CODEX_BUNDLED_SKILL";
 const EXEC_POLICY_RESOURCE: &str = "CODEX_EXEC_POLICY";
 const CONFIG_RELATIVE_PATH: &str = "config.toml";
 const GLOBAL_INSTRUCTIONS_PATH: &str = "AGENTS.md";
 const GLOBAL_OVERRIDE_INSTRUCTIONS_PATH: &str = "AGENTS.override.md";
+const ORCHESTRATION_RULES_RELATIVE_PATH: &str = "cas/CAS_ORCHESTRATION.md";
 const EXEC_POLICY_RELATIVE_PATH: &str = "rules/cas-runtime.rules";
 const MIXED_CATALOG_KEY: &str = "mixed-v1";
 const ACTIVE_TRANSACTION_STATUSES: [&str; 5] = [
@@ -1262,6 +1264,7 @@ impl ConfigurationService {
                         | SESSION_CATALOG_RESOURCE
                         | ORCHESTRATION_RESOURCE
                         | GLOBAL_INSTRUCTIONS_RESOURCE
+                        | ORCHESTRATION_RULES_RESOURCE
                         | BUNDLED_SKILL_RESOURCE
                         | EXEC_POLICY_RESOURCE
                 ) && !desired_keys
@@ -2628,12 +2631,28 @@ fn load_desired_resources(
                 serde_json::from_str::<OrchestrationBaseline>(&json)
                     .map_err(ConfigurationError::from)
             })?;
-        let instructions =
+        let protocol =
             render_orchestration_instructions(&agents, failure_policy, helper_path, database_path);
+        let rules_path = safe_join(codex_home, ORCHESTRATION_RULES_RELATIVE_PATH)?;
+        let rules_document = render_orchestration_rules_document(&protocol);
+        resources.push(DesiredResource {
+            resource_type: ORCHESTRATION_RULES_RESOURCE.to_owned(),
+            logical_key: ORCHESTRATION_RULES_RELATIVE_PATH.to_owned(),
+            relative_path: ORCHESTRATION_RULES_RELATIVE_PATH.to_owned(),
+            target_path: rules_path.clone(),
+            semantic: rules_document.clone(),
+            content: Some(rules_document),
+            summary: "配置 CAS Runtime First 按需调用规则".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: "cas-runtime-orchestration-rules".to_owned(),
+            provider: None,
+            session_catalog_path: None,
+        });
+        let bootstrap = render_orchestration_bootstrap(&rules_path);
         let hook_command = runtime_hook_command(helper_path, database_path);
         let rendered = upsert_orchestration_projection_with_hooks(
             "",
-            &instructions,
+            &bootstrap,
             &baseline,
             runtime_hooks_available.then_some(hook_command.as_str()),
         )?;
@@ -2645,9 +2664,9 @@ fn load_desired_resources(
             relative_path: CONFIG_RELATIVE_PATH.to_owned(),
             target_path: codex_home.join(CONFIG_RELATIVE_PATH),
             semantic,
-            content: Some(instructions.clone()),
+            content: Some(bootstrap.clone()),
             summary: format!(
-                "启用 Primary {} 自动编排规则",
+                "启用 Primary {} Runtime 入口",
                 orchestration_failure_policy_value(failure_policy)
             ),
             origin_entity_type: "RUNTIME".to_owned(),
@@ -2656,17 +2675,13 @@ fn load_desired_resources(
             session_catalog_path: None,
         });
 
-        // E-03 去侵入：委派准入、排除、租约与写入强制由 Runtime Hook 与调度数据库
-        // 承担，全局 AGENTS 只保留 CAS-owned 最小兼容片段。config.toml 投影与全局
-        // AGENTS 来自同一渲染结果，不允许漂移。
+        // AGENTS 与 developer_instructions 只保留同源的按需入口；完整调用契约位于
+        // 独立 CAS-owned 规则文件。委派准入、租约与写入强制仍由 Runtime/Hook/DB 承担。
         let relative_path = resolve_global_instructions_path(codex_home)?;
         let target_path = safe_join(codex_home, &relative_path)?;
         reject_symlink(&target_path)?;
-        let global_instructions = primary_delegation_gate(&instructions);
-        let content = upsert_global_orchestration_projection(
-            &read_optional_utf8(&target_path)?,
-            &global_instructions,
-        )?;
+        let content =
+            upsert_global_orchestration_projection(&read_optional_utf8(&target_path)?, &bootstrap)?;
         let semantic = global_orchestration_projection_semantic(&content)?
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         resources.push(DesiredResource {
@@ -2676,7 +2691,7 @@ fn load_desired_resources(
             target_path,
             semantic,
             content: Some(content),
-            summary: "启用 Primary 子 Agent 自动编排协议".to_owned(),
+            summary: "标注 Primary 的 CAS Runtime 规则入口".to_owned(),
             origin_entity_type: "RUNTIME".to_owned(),
             origin_entity_id: "primary-delegation-gate".to_owned(),
             provider: None,
@@ -2720,10 +2735,10 @@ fn load_desired_resources(
             "EXECUTION_AGENT_NOT_ACTIVE",
             match failure_policy {
                 OrchestrationFailurePolicy::StrictStop => {
-                    "当前未启用 EXECUTION Agent；Strict Stop 将阻止 Primary 执行写入任务。"
+                    "当前未启用 EXECUTION Agent；需写入的大任务无法委派，Strict Stop 要求停止该委派任务；普通任务仍由 Primary 处理。"
                 }
                 OrchestrationFailurePolicy::PrimaryFallback => {
-                    "当前未启用 EXECUTION Agent；Primary Fallback 会在显式警告后由 Primary 接管写入任务。"
+                    "当前未启用 EXECUTION Agent；需写入的大任务委派失败后可按 Primary Fallback 接管；普通任务由 Primary 处理。"
                 }
             },
         ));
@@ -2778,6 +2793,11 @@ fn render_control_plane_exec_policy(helper_path: &Path, database_path: &Path) ->
     format!(
         "# Managed by Codex Agent Switch. Remove through CAS Default mode.\n\
 prefix_rule(\n\
+    pattern = [{helper}, \"job-assess\", {database}],\n\
+    decision = \"allow\",\n\
+    justification = \"CAS evaluates delegation candidates locally and read-only.\",\n\
+)\n\n\
+prefix_rule(\n\
     pattern = [{helper}, \"job-schedule\", {database}],\n\
     decision = \"allow\",\n\
     justification = \"CAS Runtime First creates only validated Job state.\",\n\
@@ -2821,12 +2841,12 @@ fn render_orchestration_instructions(
     let (failure_policy_label, write_rule, failure_rule) = match failure_policy {
         OrchestrationFailurePolicy::StrictStop => (
             "Strict Stop",
-            "写入/外部变更必须委派给 phase=EXECUTION；严禁 Primary 自行接管写入。",
+            "已选中委派的写入/外部变更交给 phase=EXECUTION；失败后严禁 Primary 自行接管。",
             "缺 phase Agent、续接/replacement、spawn、bind、验证失败或 replacement 无进展：停并报阶段/Agent/错误/恢复；禁静默 fallback。",
         ),
         OrchestrationFailurePolicy::PrimaryFallback => (
             "Primary Fallback",
-            "写入文件、执行实现命令或改变外部状态必须先委派给 phase=EXECUTION；仅在委派失败并执行失败规则后，Primary 可以接管同一任务。",
+            "已选中委派的写入/外部变更先交给 phase=EXECUTION；仅在委派失败并执行失败规则后，Primary 可以接管同一任务。",
             "缺少所需 phase Agent，或续接/replacement、spawn、bind、验证失败，或连续 replacement 无可验证进展：先显式警告失败阶段、Agent、错误与接管风险，再由 Primary 接管；最终结果必须记录回退原因、Primary 改动与验证，严禁静默 fallback。",
         ),
     };
@@ -2838,11 +2858,15 @@ fn render_orchestration_instructions(
         "CAS Primary 编排协议（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\
 当前失败策略：{failure_policy_label}\n\n\
 - 规则只约束 Primary/root；Child 忽略本块且不递归委派。\n\
+- 默认由 Primary 完成；用户/项目禁委派优先。任务优先级只决定先后，不单独触发委派。\n\
+- 小任务直接完成，不运行评估；仅候选调用本地 `job-assess`，无额外模型。只选 phase 匹配的 Active Agent；边界/验收不明或交接成本高则留 Primary。\n\
+- 角色门槛：DISCOVERY 两条调用链/三模块（须文件行号证据）；EXECUTION 两个非机械目标或跨模块且有测试；REVIEW 高风险或用户明确要求；VERIFICATION 跨环境/多阶段（须独立验收）。普通检索、单点修复和单命令测试留 Primary。\n\
 - Child 继承权限；父任务必须使用 Auto 或 Workspace；Read Only 写前提示 `/permissions`。\n\
 - 直输 `CAS:OFF`/`CAS:ON` 才生效：OFF Primary 负责，ON 恢复。\n\n\
 {active_agents}\n\n\
 CAS2\n\
 1. H=`\"{}\"`、D=`\"{}\"`、W=绝对 `cwd`；`workdir=\"{}\"`（禁用项目目录）；`sandbox_permissions=require_escalated`；Parent=`CODEX_THREAD_ID`。\n\
+1a. 候选用 PTY `H job-assess D <agent-key> W`，stdin JSON 必填 `{{\"bounded\":true,\"acceptance_defined\":true,\"independent\":true,\"handoff_small\":true}}`；选填 `call_chains/modules/work_units/tests_defined/high_risk/environments/stages/estimated_minutes/explicit_request/delegation_forbidden`。返回 `CAS2|ASSESS|<PRIMARY/DELEGATE/UNAVAILABLE>|<score>|5|<reason>|<phase>`；仅 DELEGATE 进 2。评分非准入。\n\
 2. 不可变 draft：`{{\"schema_version\":1,\"job_id\":\"...\",\"idempotency_key\":\"...\",\"task_scope_key\":\"...\",\"objective\":\"...\",\"allowed_scope\":[\"...\"],\"constraints\":[],\"success_criteria\":[\"...\"],\"allowed_tools\":[],\"permission_policy\":\"INHERIT\",\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\",\"context_references\":[],\"output_contract\":\"STANDARD_V1\",\"review_policy\":\"PRIMARY_REQUIRED\"}}`。ID 稳定；`task_scope_key`=`[a-z0-9][a-z0-9_-]{{0,63}}`；Runtime 补身份，禁止猜 Scope。\n\
 3. PTY：`H job-schedule D <agent-key> W`；`write_stdin` 发 JSON 行；禁管道/重定向/临时文件。只接受 `CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>|<thread-id或->|<reason>|<job-id>|<attempt-id或->`。\n\
 4. SPAWN：使用 `agent_type=<name>`、`fork_turns=\"none\"` 和完整任务调 `spawn_agent`→bind；禁占位/补发；不得覆盖 `model` / `reasoning_effort`。REUSE=bind→`send_input(target=<child>,message=<任务>)`；缺搜 `multi_agent_v1.send_input`。bind=`H job-bind D <job-id> <attempt-id> <child-thread-id> W`；验 NATIVE_STATE_DB。bind 失败不算已委派；无 Job/Attempt 准入则 Hook 拒绝。\n\
@@ -2857,13 +2881,24 @@ CAS2\n\
     )
 }
 
-fn primary_delegation_gate(instructions: &str) -> String {
+fn render_orchestration_rules_document(instructions: &str) -> String {
     format!(
-        "## CAS Primary delegation gate\n\n\
-- 仅适用于 Primary/root；Child 忽略 CAS 管理块、执行自身配置且不递归委派同职责 Agent。\n\
-- CAS 开启后 Primary 必须执行下述契约；不得因为用户没有逐次写出“请使用子 Agent”而跳过委派。\n\
-- 本段仅提醒调用；准入、租约与写入由 CAS Runtime 强制，不替代 Codex 沙箱与用户权限审批。\n\n\
-{instructions}"
+        "# CAS Runtime First 调用规则\n\n\
+> 此文件由 Codex Agent Switch 管理，只提供 Primary 调用 Runtime 与原生子 Agent 的契约。\n\
+> 调度、准入、权限、租约、审计和状态事实以 CAS Runtime、Hook 与数据库为准。\n\
+> 不要把本文复制回 `AGENTS.md` 或 `config.toml`。\n\n\
+{instructions}\n"
+    )
+}
+
+fn render_orchestration_bootstrap(rules_path: &Path) -> String {
+    format!(
+        "## CAS Primary delegation gate（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\n\
+- 仅适用于 Primary/root；Child 忽略本入口并执行自身 Agent 配置，不递归委派同职责 Agent。\n\
+- 默认由 Primary 处理；优先级或耗时不单独触发委派。用户明确要求，或任务可能需要跨模块调查/有界实现、多阶段验证、高风险独立审查时，先读取 `{}` 的角色门槛再决定；单点修复、少量检索、单命令测试直接由 Primary 完成。用户/项目禁令优先。\n\
+- `CAS:OFF`/`CAS:ON` 是显式会话逃生口：OFF 由 Primary 负责，ON 恢复。\n\
+- 本入口与规则文件都不是强制事实源；调度、准入、权限、租约和审计以 CAS Runtime、Hook 与数据库为准，且不替代 Codex 沙箱或用户审批。",
+        rules_path.to_string_lossy()
     )
 }
 
@@ -3286,7 +3321,7 @@ fn current_semantic(
     }
     if matches!(
         resource.resource_type.as_str(),
-        BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+        BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE | ORCHESTRATION_RULES_RESOURCE
     ) {
         return Ok(resource
             .target_path
@@ -3336,7 +3371,11 @@ fn current_managed_semantic(
     }
     if matches!(
         resource.resource_type.as_str(),
-        AGENT_RESOURCE | MODEL_CATALOG_RESOURCE | BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+        AGENT_RESOURCE
+            | MODEL_CATALOG_RESOURCE
+            | BUNDLED_SKILL_RESOURCE
+            | EXEC_POLICY_RESOURCE
+            | ORCHESTRATION_RULES_RESOURCE
     ) {
         let relative_path =
             managed_relative_path(resource).ok_or(ConfigurationError::InvalidSnapshot)?;
@@ -3348,7 +3387,7 @@ fn current_managed_semantic(
                 json_semantic(&content)?
             } else if matches!(
                 resource.resource_type.as_str(),
-                BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
+                BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE | ORCHESTRATION_RULES_RESOURCE
             ) {
                 content
             } else {
@@ -3439,6 +3478,8 @@ fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
                 || resource.relative_path.starts_with("skills/")))
         || (resource.resource_type == EXEC_POLICY_RESOURCE
             && resource.relative_path == EXEC_POLICY_RELATIVE_PATH)
+        || (resource.resource_type == ORCHESTRATION_RULES_RESOURCE
+            && resource.relative_path == ORCHESTRATION_RULES_RELATIVE_PATH)
 }
 
 fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
@@ -3450,6 +3491,7 @@ fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
             | GLOBAL_INSTRUCTIONS_RESOURCE
             | AGENT_RESOURCE
             | MODEL_CATALOG_RESOURCE
+            | ORCHESTRATION_RULES_RESOURCE
             | BUNDLED_SKILL_RESOURCE
             | EXEC_POLICY_RESOURCE
     )
@@ -3999,7 +4041,7 @@ fn diagnose_orchestration(
     let mut issues = vec![match policy {
         OrchestrationFailurePolicy::StrictStop => DiagnosticIssue::info(
             "ORCHESTRATION_STRICT_STOP",
-            "失败策略为 Strict Stop：子 Agent 不可用时 Primary 必须停止，不得接管写入。",
+            "失败策略为 Strict Stop：仅已选中委派的任务在子 Agent 不可用时停止；普通任务由 Primary 处理。",
         ),
         OrchestrationFailurePolicy::PrimaryFallback => DiagnosticIssue::warning(
             "ORCHESTRATION_PRIMARY_FALLBACK",
@@ -4347,6 +4389,11 @@ fn managed_relative_path(resource: &ManagedResource) -> Option<String> {
         EXEC_POLICY_RESOURCE if resource.logical_key == EXEC_POLICY_RELATIVE_PATH => {
             Some(EXEC_POLICY_RELATIVE_PATH.to_owned())
         }
+        ORCHESTRATION_RULES_RESOURCE
+            if resource.logical_key == ORCHESTRATION_RULES_RELATIVE_PATH =>
+        {
+            Some(ORCHESTRATION_RULES_RELATIVE_PATH.to_owned())
+        }
         GLOBAL_INSTRUCTIONS_RESOURCE
             if matches!(
                 resource.logical_key.as_str(),
@@ -4452,6 +4499,7 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
                     | SESSION_CATALOG_RESOURCE
                     | ORCHESTRATION_RESOURCE
                     | GLOBAL_INSTRUCTIONS_RESOURCE
+                    | ORCHESTRATION_RULES_RESOURCE
                     | BUNDLED_SKILL_RESOURCE
                     | EXEC_POLICY_RESOURCE
             )
@@ -4498,6 +4546,12 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
         if resource.resource_type == EXEC_POLICY_RESOURCE
             && (resource.relative_path != EXEC_POLICY_RELATIVE_PATH
                 || resource.logical_key != EXEC_POLICY_RELATIVE_PATH)
+        {
+            return Err(ConfigurationError::InvalidSnapshot);
+        }
+        if resource.resource_type == ORCHESTRATION_RULES_RESOURCE
+            && (resource.relative_path != ORCHESTRATION_RULES_RELATIVE_PATH
+                || resource.logical_key != ORCHESTRATION_RULES_RELATIVE_PATH)
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }
@@ -4599,109 +4653,110 @@ fn sync_managed_after_restore(
             )?;
             continue;
         }
-        let (semantic, content_hash, physical_location) =
-            if resource.resource_type == PROVIDER_RESOURCE {
-                let provider_id = resource
-                    .logical_key
-                    .strip_prefix("model_providers.")
-                    .ok_or(ConfigurationError::InvalidSnapshot)?;
-                let Some(semantic) = provider_projection_semantic(&config, provider_id)? else {
-                    transaction.execute(
+        let (semantic, content_hash, physical_location) = if resource.resource_type
+            == PROVIDER_RESOURCE
+        {
+            let provider_id = resource
+                .logical_key
+                .strip_prefix("model_providers.")
+                .ok_or(ConfigurationError::InvalidSnapshot)?;
+            let Some(semantic) = provider_projection_semantic(&config, provider_id)? else {
+                transaction.execute(
                     "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
                     params![resource.resource_type, resource.logical_key],
                 )?;
-                    continue;
-                };
-                (
-                    semantic,
-                    hash_bytes(config.as_bytes()),
-                    snapshot
-                        .codex_home
-                        .join(CONFIG_RELATIVE_PATH)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
-                let Some(semantic) = model_catalog_projection_semantic(&config)? else {
-                    transaction.execute(
-                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
-                    params![resource.resource_type, resource.logical_key],
-                )?;
-                    continue;
-                };
-                (
-                    semantic,
-                    hash_bytes(config.as_bytes()),
-                    snapshot
-                        .codex_home
-                        .join(CONFIG_RELATIVE_PATH)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else if resource.resource_type == ORCHESTRATION_RESOURCE {
-                let Some(semantic) = orchestration_projection_semantic(&config)? else {
-                    transaction.execute(
-                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
-                    params![resource.resource_type, resource.logical_key],
-                )?;
-                    continue;
-                };
-                (
-                    semantic,
-                    hash_bytes(config.as_bytes()),
-                    snapshot
-                        .codex_home
-                        .join(CONFIG_RELATIVE_PATH)
-                        .to_string_lossy()
-                        .into_owned(),
-                )
-            } else if resource.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE {
-                let path = safe_join(&snapshot.codex_home, &resource.relative_path)?;
-                if !path.is_file() {
-                    transaction.execute(
-                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
-                    params![resource.resource_type, resource.logical_key],
-                )?;
-                    continue;
-                }
-                let content = fs::read_to_string(&path)?;
-                let Some(semantic) = global_orchestration_projection_semantic(&content)? else {
-                    transaction.execute(
-                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
-                    params![resource.resource_type, resource.logical_key],
-                )?;
-                    continue;
-                };
-                (
-                    semantic,
-                    hash_bytes(content.as_bytes()),
-                    path.to_string_lossy().into_owned(),
-                )
-            } else {
-                let path = safe_join(&snapshot.codex_home, &resource.relative_path)?;
-                if !path.is_file() {
-                    transaction.execute(
-                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
-                    params![resource.resource_type, resource.logical_key],
-                )?;
-                    continue;
-                }
-                let content = fs::read_to_string(&path)?;
-                (
-                    if resource.resource_type == MODEL_CATALOG_RESOURCE {
-                        json_semantic(&content)?
-                    } else if matches!(
-                        resource.resource_type.as_str(),
-                        BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE
-                    ) {
-                        content.clone()
-                    } else {
-                        document_semantic(&content)?
-                    },
-                    hash_bytes(content.as_bytes()),
-                    path.to_string_lossy().into_owned(),
-                )
+                continue;
             };
+            (
+                semantic,
+                hash_bytes(config.as_bytes()),
+                snapshot
+                    .codex_home
+                    .join(CONFIG_RELATIVE_PATH)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else if resource.resource_type == SESSION_CATALOG_RESOURCE {
+            let Some(semantic) = model_catalog_projection_semantic(&config)? else {
+                transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                continue;
+            };
+            (
+                semantic,
+                hash_bytes(config.as_bytes()),
+                snapshot
+                    .codex_home
+                    .join(CONFIG_RELATIVE_PATH)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else if resource.resource_type == ORCHESTRATION_RESOURCE {
+            let Some(semantic) = orchestration_projection_semantic(&config)? else {
+                transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                continue;
+            };
+            (
+                semantic,
+                hash_bytes(config.as_bytes()),
+                snapshot
+                    .codex_home
+                    .join(CONFIG_RELATIVE_PATH)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else if resource.resource_type == GLOBAL_INSTRUCTIONS_RESOURCE {
+            let path = safe_join(&snapshot.codex_home, &resource.relative_path)?;
+            if !path.is_file() {
+                transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                continue;
+            }
+            let content = fs::read_to_string(&path)?;
+            let Some(semantic) = global_orchestration_projection_semantic(&content)? else {
+                transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                continue;
+            };
+            (
+                semantic,
+                hash_bytes(content.as_bytes()),
+                path.to_string_lossy().into_owned(),
+            )
+        } else {
+            let path = safe_join(&snapshot.codex_home, &resource.relative_path)?;
+            if !path.is_file() {
+                transaction.execute(
+                    "DELETE FROM managed_resources WHERE resource_type = ?1 AND logical_key = ?2",
+                    params![resource.resource_type, resource.logical_key],
+                )?;
+                continue;
+            }
+            let content = fs::read_to_string(&path)?;
+            (
+                if resource.resource_type == MODEL_CATALOG_RESOURCE {
+                    json_semantic(&content)?
+                } else if matches!(
+                    resource.resource_type.as_str(),
+                    BUNDLED_SKILL_RESOURCE | EXEC_POLICY_RESOURCE | ORCHESTRATION_RULES_RESOURCE
+                ) {
+                    content.clone()
+                } else {
+                    document_semantic(&content)?
+                },
+                hash_bytes(content.as_bytes()),
+                path.to_string_lossy().into_owned(),
+            )
+        };
         let semantic_hash = hash_text(&semantic);
         transaction.execute(
             "INSERT INTO managed_resources (
@@ -5596,7 +5651,7 @@ mod tests {
             fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap(),
             config_before
         );
-        assert_eq!(managed_resource_count(&context.database), 8);
+        assert_eq!(managed_resource_count(&context.database), 9);
     }
 
     #[test]
@@ -5665,7 +5720,7 @@ mod tests {
         );
         let global = fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert!(global.contains("CAS Primary delegation gate"));
-        assert_eq!(managed_resource_count(&context.database), 8);
+        assert_eq!(managed_resource_count(&context.database), 9);
     }
 
     #[test]
@@ -6102,9 +6157,13 @@ mod tests {
         let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
         let global = fs::read_to_string(&global_path).unwrap();
         assert!(global.contains("CAS Primary delegation gate"));
-        assert!(global.contains("不得因为用户没有逐次写出"));
-        assert!(global.contains("CAS Primary 编排协议（"));
-        assert!(global.contains("必须委派给 phase=EXECUTION"));
+        assert!(global.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!global.contains("H job-schedule"));
+        let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
+        let rules = fs::read_to_string(&rules_path).unwrap();
+        assert!(rules.contains("CAS Primary 编排协议（"));
+        assert!(rules.contains("默认由 Primary 完成"));
+        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
 
         context
             .service
@@ -6113,10 +6172,11 @@ mod tests {
             })
             .unwrap();
         assert!(!global_path.exists());
+        assert!(!rules_path.exists());
     }
 
     #[test]
-    fn active_apply_replaces_legacy_global_orchestration_with_executable_protocol() {
+    fn active_apply_replaces_legacy_global_protocol_with_rules_reference() {
         let context = TestContext::new();
         let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
         let user_rules = "# 用户全局规则\n\n保留这段内容。\n";
@@ -6160,22 +6220,34 @@ mod tests {
         let active_global = fs::read_to_string(global_path).unwrap();
         assert!(active_global.starts_with(user_rules));
         assert!(active_global.contains("CAS Primary delegation gate"));
-        assert!(active_global.contains("CAS Primary 编排协议（"));
-        assert!(active_global.contains("必须委派给 phase=EXECUTION"));
-        assert!(active_global.contains("send_input(target=<child>"));
-        assert!(active_global.contains("禁占位/补发"));
-        assert!(!active_global.contains("原生 `followup_task`"));
+        assert!(active_global.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(active_global.contains("默认由 Primary 处理"));
+        assert!(active_global.contains("优先级或耗时不单独触发委派"));
+        assert!(!active_global.contains("任何写入/外部变更前"));
+        assert!(!active_global.contains("CAS Primary 编排协议（"));
+        assert!(!active_global.contains("send_input(target=<child>"));
         assert!(!active_global.contains("旧版完整 Primary 编排协议"));
+        let rules =
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH)).unwrap();
+        assert!(rules.contains("CAS Primary 编排协议（"));
+        assert!(rules.contains("默认由 Primary 完成"));
+        assert!(rules.contains("单点修复和单命令测试留 Primary"));
+        assert!(rules.contains("普通检索、单点修复和单命令测试留 Primary"));
+        assert!(rules.contains("单命令测试留 Primary"));
+        assert!(rules.contains("只选 phase 匹配的 Active Agent"));
+        assert!(rules.contains("同一任务同时只运行一个 Child"));
+        assert!(rules.contains("REVIEW 高风险或用户明确要求"));
+        assert!(!rules.contains("30 分钟"));
+        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
+        assert!(rules.contains("send_input(target=<child>"));
+        assert!(rules.contains("禁占位/补发"));
         let primary = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH))
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        assert!(
-            primary["developer_instructions"]
-                .as_str()
-                .unwrap()
-                .contains("CAS Primary 编排协议")
-        );
+        let primary = primary["developer_instructions"].as_str().unwrap();
+        assert!(primary.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!primary.contains("CAS Primary 编排协议"));
         assert_eq!(
             open_database(&context.database)
                 .unwrap()
@@ -6293,15 +6365,20 @@ mod tests {
         );
         let primary_instructions = active_config["developer_instructions"].as_str().unwrap();
         assert!(primary_instructions.contains("<<< CAS ORCHESTRATION v1 >>>"));
-        assert!(primary_instructions.contains("严禁 Primary 自行接管写入"));
+        assert!(primary_instructions.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!primary_instructions.contains("H job-schedule"));
         let active_global =
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert!(active_global.starts_with("# 用户全局规则\n\n保留这段内容。\n"));
         assert!(active_global.contains("CAS Primary delegation gate"));
-        assert!(active_global.contains("不得因为用户没有逐次写出"));
-        assert!(active_global.contains("CAS Primary 编排协议（"));
-        assert!(active_global.contains("必须委派给 phase=EXECUTION"));
-        assert!(active_global.contains("CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>"));
+        assert!(active_global.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!active_global.contains("H job-schedule"));
+        let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
+        let rules = fs::read_to_string(&rules_path).unwrap();
+        assert!(rules.contains("CAS Primary 编排协议（"));
+        assert!(rules.contains("默认由 Primary 完成"));
+        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
+        assert!(rules.contains("CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>"));
         let exec_policy_path = context.codex_home.join(EXEC_POLICY_RELATIVE_PATH);
         assert_eq!(
             fs::read_to_string(&exec_policy_path).unwrap(),
@@ -6310,62 +6387,54 @@ mod tests {
                 &context.database,
             )
         );
-        assert!(primary_instructions.contains("规则只约束 Primary/root"));
-        assert!(!primary_instructions.contains("model=`"));
-        assert!(!primary_instructions.contains("reasoning_effort=`"));
-        assert!(primary_instructions.contains("使用 `agent_type=<name>`"));
-        assert!(primary_instructions.contains("`fork_turns=\"none\"`"));
-        assert!(primary_instructions.contains("不得覆盖 `model` / `reasoning_effort`"));
-        assert!(primary_instructions.contains("Child prompt 仅含"));
-        assert!(primary_instructions.contains("`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`"));
-        assert!(primary_instructions.contains("`TOOLS` 只列名"));
-        assert!(primary_instructions.contains("不附对话、工具说明或控制协议"));
-        assert!(primary_instructions.contains("RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED"));
-        assert!(primary_instructions.contains("禁止未审查就追加"));
-        assert!(primary_instructions.contains("严禁 `close_agent`"));
-        assert!(primary_instructions.contains("成功保留 Thread"));
-        assert!(
-            primary_instructions.contains("CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>")
-        );
-        assert!(!primary_instructions.contains("CAS1|"));
-        assert!(primary_instructions.contains("CODEX_THREAD_ID"));
-        assert!(primary_instructions.contains("Primary 不读 Thread、Token、Cache"));
+        assert!(rules.contains("规则只约束 Primary/root"));
+        assert!(!rules.contains("model=`"));
+        assert!(!rules.contains("reasoning_effort=`"));
+        assert!(rules.contains("使用 `agent_type=<name>`"));
+        assert!(rules.contains("`fork_turns=\"none\"`"));
+        assert!(rules.contains("不得覆盖 `model` / `reasoning_effort`"));
+        assert!(rules.contains("Child prompt 仅含"));
+        assert!(rules.contains("`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`"));
+        assert!(rules.contains("`TOOLS` 只列名"));
+        assert!(rules.contains("不附对话、工具说明或控制协议"));
+        assert!(rules.contains("RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED"));
+        assert!(rules.contains("禁止未审查就追加"));
+        assert!(rules.contains("严禁 `close_agent`"));
+        assert!(rules.contains("成功保留 Thread"));
+        assert!(!rules.contains("CAS1|"));
+        assert!(rules.contains("CODEX_THREAD_ID"));
+        assert!(rules.contains("Primary 不读 Thread、Token、Cache"));
         let database_argument = format!("\"{}\"", context.database.to_string_lossy());
-        assert!(primary_instructions.contains(&format!("D=`{database_argument}`")));
-        assert!(primary_instructions.contains("H job-schedule D <agent-key> W"));
-        assert!(
-            primary_instructions.contains("H job-bind D <job-id> <attempt-id> <child-thread-id> W")
-        );
-        assert!(
-            primary_instructions
-                .contains("H job-observe D <job-id> <attempt-id> <child-thread-id> W")
-        );
-        assert!(primary_instructions.contains("H job-review D <job-id> <attempt-id>"));
-        assert!(
-            primary_instructions.contains("\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\"")
-        );
-        assert!(primary_instructions.contains("NATIVE_STATE_DB"));
-        assert!(primary_instructions.contains("RECOVERY_READ"));
-        assert!(primary_instructions.contains("至少两个不同非空证据"));
-        assert!(primary_instructions.contains("禁用项目目录"));
-        assert!(primary_instructions.contains(&format!(
+        assert!(rules.contains(&format!("D=`{database_argument}`")));
+        assert!(rules.contains("H job-schedule D <agent-key> W"));
+        assert!(rules.contains("H job-assess D <agent-key> W"));
+        assert!(rules.contains("小任务直接完成，不运行评估"));
+        assert!(rules.contains("H job-bind D <job-id> <attempt-id> <child-thread-id> W"));
+        assert!(rules.contains("H job-observe D <job-id> <attempt-id> <child-thread-id> W"));
+        assert!(rules.contains("H job-review D <job-id> <attempt-id>"));
+        assert!(rules.contains("\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\""));
+        assert!(rules.contains("NATIVE_STATE_DB"));
+        assert!(rules.contains("RECOVERY_READ"));
+        assert!(rules.contains("至少两个不同非空证据"));
+        assert!(rules.contains("禁用项目目录"));
+        assert!(rules.contains(&format!(
             "workdir=\"{}\"",
             context.database.parent().unwrap().to_string_lossy()
         )));
-        assert!(primary_instructions.contains("bind 失败不算已委派"));
-        assert!(primary_instructions.contains("task_scope_key"));
-        assert!(primary_instructions.contains("禁止猜 Scope"));
-        assert!(primary_instructions.contains(ORCHESTRATION_RUNTIME_CONTRACT));
-        assert!(primary_instructions.contains("父任务必须使用 Auto 或 Workspace"));
-        assert!(primary_instructions.contains("sandbox_permissions=require_escalated"));
-        assert!(!primary_instructions.contains("显式传入 model"));
+        assert!(rules.contains("bind 失败不算已委派"));
+        assert!(rules.contains("task_scope_key"));
+        assert!(rules.contains("禁止猜 Scope"));
+        assert!(rules.contains(ORCHESTRATION_RUNTIME_CONTRACT));
+        assert!(rules.contains("父任务必须使用 Auto 或 Workspace"));
+        assert!(rules.contains("sandbox_permissions=require_escalated"));
+        assert!(!rules.contains("显式传入 model"));
         // E-03 去侵入：Runtime 已证明的事实不再投影到提示词。
-        assert!(primary_instructions.contains("本协议只是调用提醒，不是强制来源"));
-        assert!(!primary_instructions.contains("排除（优先）"));
-        assert!(!primary_instructions.contains("multi_agent_version=v2"));
-        assert!(!primary_instructions.contains("encrypted_content"));
-        assert!(!primary_instructions.contains("无 `commandExecution`"));
-        assert!(active_global.contains("不替代 Codex 沙箱与用户权限审批"));
+        assert!(rules.contains("本协议只是调用提醒，不是强制来源"));
+        assert!(!rules.contains("排除（优先）"));
+        assert!(!rules.contains("multi_agent_version=v2"));
+        assert!(!rules.contains("encrypted_content"));
+        assert!(!rules.contains("无 `commandExecution`"));
+        assert!(active_global.contains("不替代 Codex 沙箱或用户审批"));
         assert!(!active_global.contains("排除（优先）"));
 
         let default_response = context
@@ -6398,6 +6467,7 @@ mod tests {
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap(),
             "# 用户全局规则\n\n保留这段内容。\n"
         );
+        assert!(!rules_path.exists());
         assert!(!exec_policy_path.exists());
     }
 
@@ -6541,9 +6611,13 @@ mod tests {
         assert!(active_override.contains("# Override user rules"));
         assert!(active_override.contains("keep override"));
         assert!(active_override.contains("CAS Primary delegation gate"));
-        assert!(active_override.contains("不得因为用户没有逐次写出"));
-        assert!(active_override.contains("CAS Primary 编排协议（"));
-        assert!(active_override.contains("必须委派给 phase=EXECUTION"));
+        assert!(active_override.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!active_override.contains("H job-schedule"));
+        assert!(
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH))
+                .unwrap()
+                .contains("已选中委派的写入/外部变更交给 phase=EXECUTION")
+        );
         assert!(
             !fs::read_to_string(&global_path)
                 .unwrap()
@@ -6621,7 +6695,12 @@ mod tests {
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        let strict = strict_config["developer_instructions"].as_str().unwrap();
+        let bootstrap = strict_config["developer_instructions"].as_str().unwrap();
+        assert!(bootstrap.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
+        assert!(!bootstrap.contains("H job-schedule"));
+        assert!(bootstrap.chars().count() <= 700 && bootstrap.lines().count() <= 12);
+        let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
+        let strict = fs::read_to_string(&rules_path).unwrap();
         let helper_path = context.service.helper_path().unwrap();
         let dynamic_path_chars = helper_path.to_string_lossy().chars().count()
             + context.database.to_string_lossy().chars().count()
@@ -6631,17 +6710,17 @@ mod tests {
                 .to_string_lossy()
                 .chars()
                 .count();
-        // 绝对路径长度随执行机变化；预算只约束 CAS 协议固定文本。
+        // 独立规则文件按需读取；包含四角色门槛，但限制固定协议膨胀。
         let protocol_chars = strict.chars().count() - dynamic_path_chars;
         assert!(
-            protocol_chars <= 2_320 && strict.lines().count() <= 36,
-            "编排协议固定文本重新膨胀：{} chars / {} lines（含运行时路径共 {} chars）",
+            protocol_chars <= 3_100 && strict.lines().count() <= 50,
+            "按需规则固定文本重新膨胀：{} chars / {} lines（含运行时路径共 {} chars）",
             protocol_chars,
             strict.lines().count(),
             strict.chars().count(),
         );
         assert!(strict.contains("当前失败策略：Strict Stop"));
-        assert!(strict.contains("严禁 Primary 自行接管写入"));
+        assert!(strict.contains("失败后严禁 Primary 自行接管"));
         assert!(strict.contains("无 Job/Attempt 准入则 Hook 拒绝"));
         assert!(strict.contains("同一任务同时只运行一个 Child"));
         assert!(strict.contains("等待超时不等于失败"));
@@ -6675,7 +6754,9 @@ mod tests {
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        let fallback = fallback_config["developer_instructions"].as_str().unwrap();
+        let fallback_bootstrap = fallback_config["developer_instructions"].as_str().unwrap();
+        assert_eq!(fallback_bootstrap, bootstrap);
+        let fallback = fs::read_to_string(rules_path).unwrap();
         assert!(fallback.contains("当前失败策略：Primary Fallback"));
         assert!(fallback.contains("Primary 可以接管同一任务"));
         assert!(fallback.contains("最终结果必须记录回退原因"));
@@ -6785,7 +6866,12 @@ mod tests {
         let primary = primary["developer_instructions"].as_str().unwrap();
         assert!(primary.contains("CAS:OFF"));
         assert!(primary.contains("CAS:ON"));
-        assert!(primary.contains("/permissions"));
+        assert!(!primary.contains("/permissions"));
+        assert!(
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH))
+                .unwrap()
+                .contains("/permissions")
+        );
         // E-03 去侵入：排除清单由 Runtime Policy 判定，不再投影到提示词。
         assert!(!primary.contains(&added.project_path));
 

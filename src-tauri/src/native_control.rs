@@ -6,7 +6,7 @@ use std::fmt;
 use std::path::Path;
 
 use cas_scheduler::hard_gates::{CacheRequirement, Capability};
-use rusqlite::OptionalExtension;
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::Deserialize;
 
 use crate::orchestration_contract::{
@@ -39,6 +39,153 @@ pub struct NativeReviewResult {
 pub struct NativeControlError {
     pub code: String,
     pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeAssessmentResult {
+    pub action: &'static str,
+    pub score: u8,
+    pub threshold: u8,
+    pub reason_code: &'static str,
+    pub phase: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativeAssessmentDraft {
+    bounded: bool,
+    acceptance_defined: bool,
+    independent: bool,
+    handoff_small: bool,
+    #[serde(default)]
+    delegation_forbidden: bool,
+    #[serde(default)]
+    explicit_request: bool,
+    #[serde(default)]
+    estimated_minutes: u16,
+    #[serde(default)]
+    work_units: u8,
+    #[serde(default)]
+    modules: u8,
+    #[serde(default)]
+    call_chains: u8,
+    #[serde(default)]
+    tests_defined: bool,
+    #[serde(default)]
+    high_risk: bool,
+    #[serde(default)]
+    environments: u8,
+    #[serde(default)]
+    stages: u8,
+}
+
+/// 只读、无模型调用的候选价值评估；Job 准入仍由 schedule_native_task 决定。
+pub fn assess_native_task(
+    database_path: &Path,
+    agent_key: &str,
+    workspace_scope_key: &str,
+    payload: &[u8],
+) -> Result<NativeAssessmentResult, NativeControlError> {
+    let draft = serde_json::from_slice::<NativeAssessmentDraft>(payload).map_err(|_| {
+        NativeControlError {
+            code: "ASSESSMENT_INPUT_INVALID".to_owned(),
+            message: "委派评估需要冻结的 JSON 字段。".to_owned(),
+        }
+    })?;
+    let workspace_scope_key = cas_scheduler::normalize_workspace_scope_key(workspace_scope_key)
+        .ok_or_else(|| input_error("workspace_scope_key 不是可规范化的绝对路径。"))?;
+    let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| persistence_error())?;
+    connection
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|_| persistence_error())?;
+    let phase = connection
+        .query_row(
+            "SELECT a.orchestration_phase FROM active_agent_bindings b
+             JOIN agents a ON a.id=b.agent_id AND a.enabled=1
+             WHERE a.agent_key=?1",
+            [agent_key],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|_| persistence_error())?
+        .flatten();
+    let Some(phase) = phase else {
+        return Ok(assessment_result(
+            "UNAVAILABLE",
+            0,
+            "AGENT_NOT_EXECUTABLE",
+            "-",
+        ));
+    };
+    let mut excluded = connection
+        .prepare("SELECT project_path FROM project_orchestration_exclusions")
+        .map_err(|_| persistence_error())?;
+    let excluded = excluded
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| persistence_error())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| persistence_error())?;
+    if excluded.iter().any(|path| {
+        cas_scheduler::normalize_workspace_scope_key(path)
+            .is_some_and(|path| cas_scheduler::workspace_is_within(&workspace_scope_key, &path))
+    }) {
+        return Ok(assessment_result("PRIMARY", 0, "PROJECT_EXCLUDED", &phase));
+    }
+    Ok(score_assessment(&phase, &draft))
+}
+
+fn score_assessment(phase: &str, draft: &NativeAssessmentDraft) -> NativeAssessmentResult {
+    if draft.delegation_forbidden {
+        return assessment_result("PRIMARY", 0, "USER_FORBIDDEN", phase);
+    }
+    if !draft.bounded || !draft.acceptance_defined || !draft.independent {
+        return assessment_result("PRIMARY", 0, "TASK_NOT_INDEPENDENT", phase);
+    }
+    if !draft.handoff_small {
+        return assessment_result("PRIMARY", 0, "HANDOFF_COST_HIGH", phase);
+    }
+    let role_evidence = draft.explicit_request
+        || match phase {
+            "DISCOVERY" => draft.call_chains >= 2 || draft.modules >= 3,
+            "EXECUTION" => draft.work_units >= 2 || (draft.modules >= 2 && draft.tests_defined),
+            "REVIEW" => draft.high_risk,
+            "VERIFICATION" => draft.environments >= 2 || draft.stages >= 2,
+            _ => false,
+        };
+    if !matches!(phase, "DISCOVERY" | "EXECUTION" | "REVIEW" | "VERIFICATION") {
+        return assessment_result("UNAVAILABLE", 0, "PHASE_UNSUPPORTED", phase);
+    }
+    // 时长和工作单元强相关，只计一次；审查的高风险不受时长门槛限制。
+    let amortized = draft.estimated_minutes >= 15
+        || draft.work_units >= 2
+        || (phase == "REVIEW" && draft.high_risk)
+        || draft.explicit_request;
+    let score = u8::from(role_evidence) * 3 + u8::from(amortized) + 1;
+    let action = if score >= 5 { "DELEGATE" } else { "PRIMARY" };
+    let reason_code = if score >= 5 {
+        "ROLE_GATE_MET"
+    } else if !role_evidence {
+        "ROLE_GATE_NOT_MET"
+    } else {
+        "BENEFIT_NOT_PROVEN"
+    };
+    assessment_result(action, score, reason_code, phase)
+}
+
+fn assessment_result(
+    action: &'static str,
+    score: u8,
+    reason_code: &'static str,
+    phase: &str,
+) -> NativeAssessmentResult {
+    NativeAssessmentResult {
+        action,
+        score,
+        threshold: 5,
+        reason_code,
+        phase: phase.to_owned(),
+    }
 }
 
 impl fmt::Display for NativeControlError {
@@ -326,6 +473,101 @@ mod tests {
     use uuid::Uuid;
 
     const NOW: &str = "2026-09-13T00:00:00.000Z";
+
+    #[test]
+    fn assessment_scores_role_evidence_without_double_counting_size_and_time() {
+        let mut facts = serde_json::json!({
+            "bounded": true,
+            "acceptance_defined": true,
+            "independent": true,
+            "handoff_small": true,
+            "work_units": 1,
+            "estimated_minutes": 120
+        });
+        let draft = |value| serde_json::from_value::<NativeAssessmentDraft>(value).unwrap();
+        let small = score_assessment("EXECUTION", &draft(facts.clone()));
+        assert_eq!(
+            (small.action, small.reason_code),
+            ("PRIMARY", "ROLE_GATE_NOT_MET")
+        );
+        facts["work_units"] = 2.into();
+        let execution = score_assessment("EXECUTION", &draft(facts.clone()));
+        assert_eq!((execution.action, execution.score), ("DELEGATE", 5));
+        facts["handoff_small"] = false.into();
+        assert_eq!(
+            score_assessment("EXECUTION", &draft(facts.clone())).action,
+            "PRIMARY"
+        );
+        facts["handoff_small"] = true.into();
+        facts["delegation_forbidden"] = true.into();
+        assert_eq!(
+            score_assessment("EXECUTION", &draft(facts.clone())).reason_code,
+            "USER_FORBIDDEN"
+        );
+        facts["delegation_forbidden"] = false.into();
+        facts["work_units"] = 0.into();
+        facts["estimated_minutes"] = 0.into();
+        facts["high_risk"] = true.into();
+        assert_eq!(
+            score_assessment("REVIEW", &draft(facts.clone())).action,
+            "DELEGATE"
+        );
+        facts["high_risk"] = false.into();
+        facts["call_chains"] = 2.into();
+        facts["estimated_minutes"] = 15.into();
+        assert_eq!(
+            score_assessment("DISCOVERY", &draft(facts.clone())).action,
+            "DELEGATE"
+        );
+        facts["environments"] = 2.into();
+        assert_eq!(
+            score_assessment("VERIFICATION", &draft(facts)).action,
+            "DELEGATE"
+        );
+    }
+
+    #[test]
+    fn assessment_checks_active_agent_and_project_exclusion() {
+        let root = std::env::temp_dir().join(format!("cas-native-assess-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("cas.db");
+        let connection = open_database(&database_path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO agents (
+                id, agent_key, name, description, instruction, agent_type, enabled,
+                sandbox_policy, reasoning_policy, source, managed, role_key,
+                orchestration_phase, created_at, updated_at
+             ) VALUES (
+                'agent-assess', 'executor', 'Executor', 'test', '执行', 'CUSTOM', 1,
+                'WORKSPACE_WRITE', 'MEDIUM', 'CAS', 1, 'executor', 'EXECUTION',
+                '{NOW}', '{NOW}'
+             );
+             INSERT INTO active_agent_bindings (role_key, agent_id, created_at, updated_at)
+             VALUES ('executor', 'agent-assess', '{NOW}', '{NOW}');"
+            ))
+            .unwrap();
+        let payload = br#"{"bounded":true,"acceptance_defined":true,"independent":true,"handoff_small":true,"work_units":2}"#;
+        let assess = |key| {
+            assess_native_task(&database_path, key, &root.to_string_lossy(), payload).unwrap()
+        };
+        assert_eq!(assess("executor").action, "DELEGATE");
+        assert_eq!(assess("missing").action, "UNAVAILABLE");
+        connection
+            .execute(
+                "INSERT INTO project_orchestration_exclusions (
+                id, project_path, normalized_path, config_existed, baseline_json,
+                created_at, updated_at
+             ) VALUES ('exclude-assess', ?1, ?2, 0, '{}', ?3, ?3)",
+                rusqlite::params![
+                    root.to_string_lossy().to_string(),
+                    cas_scheduler::normalize_workspace_scope_key(&root.to_string_lossy()).unwrap(),
+                    NOW
+                ],
+            )
+            .unwrap();
+        assert_eq!(assess("executor").reason_code, "PROJECT_EXCLUDED");
+    }
 
     #[test]
     fn native_control_plane_persists_full_job_receipt_and_review_chain() {

@@ -96,6 +96,11 @@ fn main() -> ExitCode {
             agent_key,
             scope_key,
         }) => job_schedule(database_path, &agent_key, &scope_key),
+        Ok(Command::JobAssess {
+            database_path,
+            agent_key,
+            scope_key,
+        }) => job_assess(database_path, &agent_key, &scope_key),
         Ok(Command::JobBind {
             database_path,
             job_id,
@@ -136,6 +141,7 @@ fn main() -> ExitCode {
                  cas-helper bind <agent-key> <child-thread-id> [task-key]\n  \
                  cas-helper bind <database-path> <agent-key> <child-thread-id> <workspace-scope> [task-key]\n  \
                  cas-helper job-schedule <database-path> <agent-key> <workspace-scope>  # TaskPacket draft from stdin\n  \
+                 cas-helper job-assess <database-path> <agent-key> <workspace-scope>  # Assessment draft from stdin\n  \
                  cas-helper job-bind <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
                  cas-helper job-observe <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
                  cas-helper job-review <database-path> <job-id> <attempt-id>  # Review draft from stdin\n  \
@@ -162,6 +168,11 @@ enum Command {
         task_scope_key: Option<String>,
     },
     JobSchedule {
+        database_path: PathBuf,
+        agent_key: String,
+        scope_key: String,
+    },
+    JobAssess {
         database_path: PathBuf,
         agent_key: String,
         scope_key: String,
@@ -286,7 +297,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             task_scope_key,
         });
     }
-    if command == OsStr::new("job-schedule") {
+    if matches!(command.to_str(), Some("job-schedule" | "job-assess")) {
+        let assess = command == OsStr::new("job-assess");
         let remaining = args.collect::<Vec<_>>();
         if remaining.len() != 3 {
             return Err(());
@@ -298,11 +310,19 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         if !database_path.is_absolute() {
             return Err(());
         }
-        return Ok(Command::JobSchedule {
-            database_path,
-            agent_key,
-            scope_key,
-        });
+        return if assess {
+            Ok(Command::JobAssess {
+                database_path,
+                agent_key,
+                scope_key,
+            })
+        } else {
+            Ok(Command::JobSchedule {
+                database_path,
+                agent_key,
+                scope_key,
+            })
+        };
     }
     if matches!(command.to_str(), Some("job-bind" | "job-observe")) {
         let observe = command == OsStr::new("job-observe");
@@ -716,18 +736,49 @@ fn enforce_pre_tool_use(database_path: &Path, payload: &serde_json::Value) -> Ex
             "当前子 Agent 角色只负责发现、审查或验证，不允许执行写入。",
         ),
         Some("UNMANAGED") | Some(_) => return ExitCode::SUCCESS,
-        None => match orchestration_failure_policy(&connection).as_str() {
-            "PRIMARY_FALLBACK" => (
-                "WARN",
-                "PRIMARY_FALLBACK_WRITE_WARNING",
-                "Primary 正在接管明确写入；CAS 已按 Primary Fallback 放行并记录审计。",
-            ),
-            _ => (
-                "DENY",
-                "PRIMARY_STRICT_STOP_WRITE_DENIED",
-                "Strict Stop 已阻止 Primary 直接写入；请委派给 EXECUTION Agent。",
-            ),
-        },
+        None => {
+            let primary_state: rusqlite::Result<(bool, bool)> = connection.query_row(
+                "SELECT
+                    EXISTS (SELECT 1 FROM agent_thread_instances WHERE codex_thread_id = ?1),
+                    EXISTS (
+                        SELECT 1 FROM runtime_delegation_leases
+                        WHERE parent_thread_id = ?1 AND state IN ('PENDING', 'ACTIVE')
+                    )",
+                [session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            );
+            match primary_state {
+                Ok((true, _)) => (
+                    "DENY",
+                    "CHILD_IDENTITY_UNVERIFIED",
+                    "已知 Child Thread 的角色或租约无法核验，已拒绝写入。",
+                ),
+                Ok((false, false)) => (
+                    "ALLOW",
+                    "PRIMARY_DIRECT_WRITE_ALLOWED",
+                    "当前没有进行中的委派，Primary 可直接处理任务。",
+                ),
+                Ok((false, true))
+                    if orchestration_failure_policy(&connection) == "PRIMARY_FALLBACK" =>
+                {
+                    (
+                        "WARN",
+                        "PRIMARY_FALLBACK_WRITE_WARNING",
+                        "Primary 正在接管明确写入；CAS 已按 Primary Fallback 放行并记录审计。",
+                    )
+                }
+                Ok((false, true)) => (
+                    "DENY",
+                    "PRIMARY_STRICT_STOP_WRITE_DENIED",
+                    "Strict Stop 已阻止 Primary 接管已委派任务的写入。",
+                ),
+                Err(_) => (
+                    "DENY",
+                    "RUNTIME_POLICY_UNAVAILABLE",
+                    "CAS Runtime Enforcement 无法核验委派状态，已拒绝明确写入。",
+                ),
+            }
+        }
     };
     record_enforcement_event(
         &connection,
@@ -2118,6 +2169,29 @@ fn job_schedule(database_path: PathBuf, agent_key: &str, scope_key: &str) -> Exi
         }
         Err(error) => {
             eprintln!("CAS2 scheduling failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
+fn job_assess(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCode {
+    let payload = match read_control_payload() {
+        Ok(payload) => payload,
+        Err(()) => {
+            eprintln!("Assessment draft missing or too large.");
+            return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+        }
+    };
+    match native_control::assess_native_task(&database_path, agent_key, scope_key, &payload) {
+        Ok(result) => {
+            println!(
+                "CAS2|ASSESS|{}|{}|{}|{}|{}",
+                result.action, result.score, result.threshold, result.reason_code, result.phase
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("CAS2 assessment failed: {error}");
             ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
         }
     }
@@ -3896,6 +3970,17 @@ mod tests {
         let database = OsString::from(r"C:\CAS Data\cas.db");
         let workspace = OsString::from(r"\\?\C:\Workspace\Project");
 
+        assert!(matches!(
+            parse_args([
+                OsString::from("cas-helper"),
+                OsString::from("job-assess"),
+                database.clone(),
+                OsString::from("executor"),
+                workspace.clone(),
+            ]),
+            Ok(Command::JobAssess { .. })
+        ));
+
         let Ok(Command::JobSchedule {
             database_path,
             agent_key,
@@ -4186,6 +4271,25 @@ mod tests {
             .unwrap();
         drop(connection);
 
+        let small_primary_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "session-small",
+            "turn_id": "turn-small",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &small_primary_write);
+        let unidentified_child_write = serde_json::json!({
+            "hook_event_name": "PreToolUse",
+            "session_id": "child-1",
+            "turn_id": "turn-unidentified-child",
+            "cwd": "C:/workspace",
+            "tool_name": "apply_patch",
+            "tool_input": {}
+        });
+        enforce_pre_tool_use(&database_path, &unidentified_child_write);
+
         let spawn = serde_json::json!({
             "hook_event_name": "PreToolUse",
             "session_id": "session-1",
@@ -4433,6 +4537,8 @@ mod tests {
         assert_eq!(
             decisions,
             vec![
+                "ALLOW:PRIMARY_DIRECT_WRITE_ALLOWED",
+                "DENY:CHILD_IDENTITY_UNVERIFIED",
                 "ALLOW:DELEGATION_ALLOWED",
                 "DENY:DELEGATION_LEASE_ALREADY_CONSUMED",
                 "ALLOW:DELEGATION_LEASE_ACTIVATED",
