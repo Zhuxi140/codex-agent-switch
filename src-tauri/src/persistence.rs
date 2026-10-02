@@ -439,6 +439,117 @@ mod tests {
     }
 
     #[test]
+    fn v041_database_upgrades_to_current_without_losing_configuration() {
+        let path =
+            std::env::temp_dir().join(format!("cas-v041-upgrade-{}.db", uuid::Uuid::new_v4()));
+        let read_sentinel = |connection: &Connection| {
+            connection
+                .query_row(
+                    "SELECT p.name, p.base_url, p.enabled, m.display_name, m.enabled,
+                            a.instruction, a.reasoning_policy, b.model_id, b.enabled,
+                            (SELECT setting_value FROM application_settings
+                             WHERE setting_key = 'appearance')
+                     FROM providers p
+                     JOIN models m ON m.provider_id = p.id
+                     JOIN agent_model_bindings b ON b.model_id = m.id
+                     JOIN agents a ON a.id = b.agent_id
+                     WHERE p.id = 'provider-v041'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, String>(9)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let expected = {
+            let mut connection = Connection::open(&path).unwrap();
+            let v041_migrations = MIGRATIONS
+                .iter()
+                .copied()
+                .filter(|(version, _, _)| *version <= 22)
+                .collect::<Vec<_>>();
+            apply_migrations(&mut connection, &v041_migrations).unwrap();
+            connection
+                .execute_batch(
+                    "INSERT INTO providers (
+                        id, provider_key, name, provider_type, base_url, protocol, auth_type,
+                        enabled, source, preset_id, created_at, updated_at
+                     ) VALUES (
+                        'provider-v041', 'provider-v041', '0.4.1 供应商', 'CUSTOM',
+                        'https://v041.example/v1/', 'RESPONSES', 'BEARER_TOKEN',
+                        1, 'USER', NULL, 'before-upgrade', 'before-upgrade'
+                     );
+                     INSERT INTO models (
+                        id, provider_id, model_id, display_name, enabled, source,
+                        created_at, updated_at
+                     ) VALUES (
+                        'model-v041', 'provider-v041', 'model-v041', '0.4.1 模型',
+                        1, 'USER', 'before-upgrade', 'before-upgrade'
+                     );
+                     INSERT INTO agents (
+                        id, agent_key, name, description, instruction, agent_type, enabled,
+                        sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+                     ) VALUES (
+                        'agent-v041', 'agent-v041', '0.4.1 Agent', '升级哨兵',
+                        '保留这段指令', 'CUSTOM', 1, 'WORKSPACE_WRITE', 'MEDIUM',
+                        'USER', 1, 'before-upgrade', 'before-upgrade'
+                     );
+                     INSERT INTO agent_model_bindings (
+                        id, agent_id, model_id, enabled, source, created_at, updated_at
+                     ) VALUES (
+                        'binding-v041', 'agent-v041', 'model-v041', 1, 'USER',
+                        'before-upgrade', 'before-upgrade'
+                     );
+                     UPDATE application_settings
+                     SET setting_value = 'DARK', source = 'USER', updated_at = 'before-upgrade'
+                    WHERE setting_key = 'appearance';",
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                22
+            );
+            read_sentinel(&connection)
+        };
+
+        let connection = open_database(&path).unwrap();
+        assert_eq!(read_sentinel(&connection), expected);
+        assert_eq!(
+            connection
+                .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            LATEST_SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn gpt6_catalog_upgrade_preserves_existing_models_and_bindings() {
         let mut connection = Connection::open_in_memory().unwrap();
         let legacy_migrations = MIGRATIONS
