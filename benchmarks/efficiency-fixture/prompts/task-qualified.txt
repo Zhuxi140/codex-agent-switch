@@ -1,0 +1,6 @@
+只完成以下两个目标，不添加额外功能：
+
+1. 在 src/ranges.mjs 实现 normalizeRanges(ranges)。输入是闭区间数组，每个区间为 [start, end]。验证 start/end 为有限安全整数且 start <= end，非法输入抛出 TypeError；按起点排序并合并重叠或相邻区间；不得修改输入；空数组返回空数组。
+2. 在同一文件实现 subtractRanges(ranges, exclusions)。两组输入均按上述规则验证、规范化；扣除可能覆盖整个区间、头部、尾部或中间，也可能跨越多个区间；不得修改输入；exclusions 为空时返回 ranges 的规范化结果。
+
+只允许修改 src/ranges.mjs，不得修改 acceptance、package.json、prompts 或其他文件。运行 node --test acceptance/task-1a.test.mjs acceptance/task-1b.test.mjs 验证。完成后简洁报告修改和验证结果。

@@ -27,6 +27,18 @@ export interface DiagnosticsResponse {
   checkedAt: string;
 }
 
+export interface OrphanCleanupPreview {
+  fingerprint: string;
+  items: { relativePath: string; summary: string }[];
+  warnings: string[];
+}
+
+export interface OrphanCleanupResponse {
+  snapshotId: string | null;
+  cleanedCount: number;
+  restartRecommended: boolean;
+}
+
 export interface CodexEnvironmentResponse extends CodexEnvironmentSummary {
   executablePath: string | null;
   codexHome: string | null;
@@ -454,6 +466,16 @@ export function runDiagnostics(includeNetworkChecks = false): Promise<Diagnostic
   });
 }
 
+export function previewOrphanCleanup(): Promise<OrphanCleanupPreview> {
+  return invoke<OrphanCleanupPreview>("configuration_orphan_cleanup_preview");
+}
+
+export function applyOrphanCleanup(fingerprint: string): Promise<OrphanCleanupResponse> {
+  return invoke<OrphanCleanupResponse>("configuration_orphan_cleanup_apply", {
+    request: { expectedFingerprint: fingerprint, confirmed: true },
+  });
+}
+
 export type SettingsEffectivenessLevel = "IMMEDIATE" | "NEXT_TURN" | "RESTART_REQUIRED";
 
 export interface SettingsEffectiveness {
@@ -596,7 +618,7 @@ export function restoreSnapshot(snapshotId: string): Promise<SnapshotRestoreResp
   return invoke<SnapshotRestoreResponse>("snapshot_restore", { request: { snapshotId } });
 }
 
-export type ProviderProtocol = "RESPONSES";
+export type ProviderProtocol = "RESPONSES" | "CHAT_COMPLETIONS";
 export type ProviderStatus = "READY" | "DISABLED";
 export type CredentialStatus =
   | "CONFIGURED"
@@ -883,9 +905,7 @@ export type OrchestrationPhase = "DISCOVERY" | "EXECUTION" | "VERIFICATION" | "R
 export type AgentReuseStrategy = "AUTO" | "HOT" | "COLD";
 export type AgentSkillKey =
   | "caveman"
-  | "caveman-slim"
-  | "ponytail"
-  | "ponytail-slim";
+  | "cas-slim";
 export type AgentMcpToolPolicyMode = "ALLOW_ONLY" | "DENY";
 
 export interface AgentMcpToolPolicy {

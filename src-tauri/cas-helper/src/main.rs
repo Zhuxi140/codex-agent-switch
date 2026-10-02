@@ -21,6 +21,8 @@ use cas_secret_store::{CredentialId, SecretStoreError, read};
 use codex_agent_switch_lib::native_control;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
+mod mcp_assessment;
+
 const EXIT_INVALID_ARGUMENTS: u8 = 2;
 const EXIT_NOT_FOUND: u8 = 3;
 const EXIT_STORE_UNAVAILABLE: u8 = 4;
@@ -31,10 +33,15 @@ const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_CONTROL_INPUT_BYTES: u64 = 128 * 1024;
 const RUNTIME_HOOK_MARKER: &str = "cas-runtime-enforcement-v1";
 const RUNTIME_DELEGATION_LEASE_TTL_SECONDS: i64 = 3_600;
+const CAS_PRIMARY_SLIM_CONTEXT: &str = "CAS 精简规则：先核对相关实现，复用现有代码，只做必要改动与验证；汇报先说结果，保留证据、风险和未完成项。不得削弱安全或明确验收要求。";
 
 fn main() -> ExitCode {
     match parse_args(env::args_os()) {
         Ok(Command::Token(id)) => deliver(id),
+        Ok(Command::GatewayToken(id)) => {
+            println!("cas-gateway-{id}");
+            ExitCode::SUCCESS
+        }
         Ok(Command::Schedule {
             database_path,
             agent_key,
@@ -96,11 +103,23 @@ fn main() -> ExitCode {
             agent_key,
             scope_key,
         }) => job_schedule(database_path, &agent_key, &scope_key),
+        Ok(Command::JobPlan {
+            database_path,
+            agent_key,
+            scope_key,
+        }) => job_plan(database_path, &agent_key, &scope_key),
         Ok(Command::JobAssess {
             database_path,
             agent_key,
             scope_key,
         }) => job_assess(database_path, &agent_key, &scope_key),
+        Ok(Command::McpAssess { database_path }) => match mcp_assessment::serve(&database_path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("CAS MCP assessment failed: {error}");
+                ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+            }
+        },
         Ok(Command::JobBind {
             database_path,
             job_id,
@@ -136,12 +155,15 @@ fn main() -> ExitCode {
         Err(()) => {
             eprintln!(
                 "Usage:\n  cas-helper token <credential-id>\n  \
+                 cas-helper gateway-token <credential-id>\n  \
                  cas-helper schedule <agent-key> [task-key]\n  \
                  cas-helper schedule <database-path> <agent-key> <workspace-scope> [task-key]\n  \
                  cas-helper bind <agent-key> <child-thread-id> [task-key]\n  \
                  cas-helper bind <database-path> <agent-key> <child-thread-id> <workspace-scope> [task-key]\n  \
                  cas-helper job-schedule <database-path> <agent-key> <workspace-scope>  # TaskPacket draft from stdin\n  \
+                 cas-helper job-plan <database-path> <agent-key> <workspace-scope>  # assessment; explicit request also needs task_packet from stdin\n  \
                  cas-helper job-assess <database-path> <agent-key> <workspace-scope>  # Assessment draft from stdin\n  \
+                 cas-helper mcp-assess <database-path>  # read-only STDIO MCP server\n  \
                  cas-helper job-bind <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
                  cas-helper job-observe <database-path> <job-id> <attempt-id> <child-thread-id> <workspace-scope>\n  \
                  cas-helper job-review <database-path> <job-id> <attempt-id>  # Review draft from stdin\n  \
@@ -154,6 +176,7 @@ fn main() -> ExitCode {
 
 enum Command {
     Token(CredentialId),
+    GatewayToken(CredentialId),
     Schedule {
         database_path: Option<PathBuf>,
         agent_key: String,
@@ -172,10 +195,18 @@ enum Command {
         agent_key: String,
         scope_key: String,
     },
+    JobPlan {
+        database_path: PathBuf,
+        agent_key: String,
+        scope_key: String,
+    },
     JobAssess {
         database_path: PathBuf,
         agent_key: String,
         scope_key: String,
+    },
+    McpAssess {
+        database_path: PathBuf,
     },
     JobBind {
         database_path: PathBuf,
@@ -205,14 +236,24 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
     let mut args = args.into_iter();
     let _program = args.next();
     let command = args.next().ok_or(())?;
-    if command == OsStr::new("token") {
+    if matches!(command.to_str(), Some("token" | "gateway-token")) {
         let credential_id = args.next().ok_or(())?;
         if args.next().is_some() {
             return Err(());
         }
-        return CredentialId::from_str(credential_id.to_str().ok_or(())?)
-            .map(Command::Token)
-            .map_err(|_| ());
+        let id = CredentialId::from_str(credential_id.to_str().ok_or(())?).map_err(|_| ())?;
+        return Ok(if command == OsStr::new("token") {
+            Command::Token(id)
+        } else {
+            Command::GatewayToken(id)
+        });
+    }
+    if command == OsStr::new("mcp-assess") {
+        let database_path = PathBuf::from(args.next().ok_or(())?);
+        if args.next().is_some() || !database_path.is_absolute() {
+            return Err(());
+        }
+        return Ok(Command::McpAssess { database_path });
     }
     if command == OsStr::new("schedule") {
         let remaining = args.collect::<Vec<_>>();
@@ -297,8 +338,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
             task_scope_key,
         });
     }
-    if matches!(command.to_str(), Some("job-schedule" | "job-assess")) {
+    if matches!(
+        command.to_str(),
+        Some("job-schedule" | "job-assess" | "job-plan")
+    ) {
         let assess = command == OsStr::new("job-assess");
+        let plan = command == OsStr::new("job-plan");
         let remaining = args.collect::<Vec<_>>();
         if remaining.len() != 3 {
             return Err(());
@@ -312,6 +357,12 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, ()> {
         }
         return if assess {
             Ok(Command::JobAssess {
+                database_path,
+                agent_key,
+                scope_key,
+            })
+        } else if plan {
+            Ok(Command::JobPlan {
                 database_path,
                 agent_key,
                 scope_key,
@@ -394,25 +445,18 @@ fn valid_argument(value: OsString) -> Result<String, ()> {
 }
 
 fn default_database_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("CAS_DATABASE_PATH").map(PathBuf::from)
-        && path.is_absolute()
-    {
-        return Some(path);
+    if let Some(path) = env::var_os("CAS_DATABASE_PATH").map(PathBuf::from) {
+        return path.is_absolute().then_some(path);
     }
-    let base = if cfg!(windows) {
-        env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else if cfg!(target_os = "macos") {
-        env::var_os("HOME")
-            .map(PathBuf::from)
-            .map(|home| home.join("Library").join("Application Support"))
+    let user_home = if cfg!(windows) {
+        env::var_os("USERPROFILE")
     } else {
-        env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local").join("share"))
-        })
-    }?;
-    Some(base.join("com.codexagentswitch.desktop").join("cas.db"))
+        env::var_os("HOME")
+    }
+    .map(PathBuf::from)?;
+    codex_agent_switch_lib::storage::data_home(&user_home, "com.codexagentswitch.desktop")
+        .ok()
+        .map(|home| home.join("cas.db"))
 }
 
 fn deliver(id: CredentialId) -> ExitCode {
@@ -470,12 +514,82 @@ fn runtime_hook(database_path: PathBuf) -> ExitCode {
         .get("hook_event_name")
         .and_then(serde_json::Value::as_str)
     {
+        Some("UserPromptSubmit") => inject_primary_slim_context(&database_path, &payload),
         Some("SubagentStart") => record_subagent_start(&database_path, &payload),
         Some("PreToolUse") => enforce_pre_tool_use(&database_path, &payload),
         Some("PostToolUse") => record_delegation_tool_result(&database_path, &payload),
         Some("SubagentStop") => record_subagent_stop(&database_path, &payload),
         _ => ExitCode::SUCCESS,
     }
+}
+
+fn inject_primary_slim_context(database_path: &Path, payload: &serde_json::Value) -> ExitCode {
+    let Some(session_id) = hook_string(payload, "session_id").and_then(valid_runtime_key) else {
+        return ExitCode::SUCCESS;
+    };
+    let Some(turn_id) = hook_string(payload, "turn_id").and_then(valid_runtime_key) else {
+        return ExitCode::SUCCESS;
+    };
+    let Ok(mut connection) = open_runtime_database(database_path) else {
+        return ExitCode::SUCCESS;
+    };
+    if primary_slim_context_due(&mut connection, &session_id, &turn_id).unwrap_or(false) {
+        println!(
+            "{}",
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": CAS_PRIMARY_SLIM_CONTEXT
+                }
+            })
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn primary_slim_context_due(
+    connection: &mut Connection,
+    session_id: &str,
+    turn_id: &str,
+) -> rusqlite::Result<bool> {
+    let state: Option<(String, Option<String>)> = connection
+        .query_row(
+            "SELECT first_turn_id, injected_turn_id FROM primary_prompt_injections WHERE session_id = ?1",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if state
+        .as_ref()
+        .is_some_and(|(first_turn_id, injected_turn_id)| {
+            first_turn_id == turn_id || injected_turn_id.is_some()
+        })
+    {
+        return Ok(false);
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO primary_prompt_injections (session_id, first_turn_id)
+         VALUES (?1, ?2)",
+        params![session_id, turn_id],
+    )?;
+    let (first_turn_id, injected_turn_id): (String, Option<String>) = transaction.query_row(
+        "SELECT first_turn_id, injected_turn_id FROM primary_prompt_injections WHERE session_id = ?1",
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let due = if first_turn_id != turn_id && injected_turn_id.is_none() {
+        transaction.execute(
+            "UPDATE primary_prompt_injections SET injected_turn_id = ?2
+             WHERE session_id = ?1 AND injected_turn_id IS NULL",
+            params![session_id, turn_id],
+        )? == 1
+    } else {
+        false
+    };
+    transaction.commit()?;
+    Ok(due)
 }
 
 #[derive(Debug, Clone)]
@@ -689,6 +803,12 @@ fn resolve_start_lease(
 
 fn enforce_pre_tool_use(database_path: &Path, payload: &serde_json::Value) -> ExitCode {
     let tool_name = hook_string(payload, "tool_name").unwrap_or("Unknown");
+    if tool_name == "mcp__cas_assessment__cas_runtime_hook" {
+        return emit_hook_deny(
+            "RUNTIME_HOOK_DIRECT_CALL_DENIED",
+            "CAS Runtime Hook 仅供 Codex 生命周期调用，不接受模型直接调用。",
+        );
+    }
     if let Some(kind) = delegation_tool_kind(tool_name) {
         return enforce_delegation_tool(database_path, payload, tool_name, kind);
     }
@@ -1097,6 +1217,7 @@ fn admit_spawn_delegation(
          AND julianday(expires_at) > julianday('now')",
         [agent_id.as_str(), session_id],
     )?;
+    let has_agent_parent_lease = !leases.is_empty();
     let scoped = leases
         .into_iter()
         .filter(|lease| workspace_is_within(&cwd_scope, &lease.workspace_scope_key))
@@ -1116,9 +1237,7 @@ fn admit_spawn_delegation(
                 "DELEGATION_LEASE_ALREADY_CONSUMED",
                 "本次 CAS 委派租约已被使用，已拒绝重复创建子 Agent。",
             ))
-        } else if scoped.is_empty()
-            && !leases_for_agent_parent(connection, &agent_id, session_id)?.is_empty()
-        {
+        } else if scoped.is_empty() && has_agent_parent_lease {
             Err((
                 "WORKSPACE_SCOPE_MISMATCH",
                 "当前工作区与 CAS 调度租约不一致，已拒绝子 Agent 委派。",
@@ -1280,19 +1399,6 @@ fn claim_delegation_lease(
         "DELEGATION_LEASE_ALREADY_CONSUMED",
         "本次 CAS 委派租约已失效或已被其他工具调用使用。",
     ))
-}
-
-fn leases_for_agent_parent(
-    connection: &Connection,
-    agent_id: &str,
-    session_id: &str,
-) -> Result<Vec<RuntimeLease>, rusqlite::Error> {
-    load_runtime_leases(
-        connection,
-        "agent_id = ?1 AND parent_thread_id = ?2 AND state IN ('PENDING', 'ACTIVE') \
-         AND julianday(expires_at) > julianday('now')",
-        [agent_id, session_id],
-    )
 }
 
 fn runtime_identity_for_lease(
@@ -1813,7 +1919,7 @@ fn expire_runtime_leases(connection: &Connection) -> Result<(), rusqlite::Error>
     // C-05：TTL 本身不能证明请求未发送。只有尚未经过委派 Hook，且关联 Attempt
     // 仍明确停在派发边界之前（或旧 Lease 根本没有 Attempt）时，才可释放占用。
     // ACTIVE、已有 admission_tool_use_id 或越过 PLANNED 的 Lease 保持 live，等待恢复证据。
-    connection.execute(
+    let mut update = connection.prepare(
         "UPDATE runtime_delegation_leases AS lease
          SET state = 'EXPIRED', released_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
@@ -1835,8 +1941,21 @@ fn expire_runtime_leases(connection: &Connection) -> Result<(), rusqlite::Error>
                     )
                 )
            )",
-        [],
     )?;
+    let has_expired_pending = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM runtime_delegation_leases
+            WHERE state = 'PENDING'
+              AND julianday(expires_at) <= julianday('now')
+              AND admission_tool_use_id IS NULL
+         )",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_expired_pending {
+        return Ok(());
+    }
+    update.execute([])?;
     Ok(())
 }
 
@@ -2035,7 +2154,7 @@ fn policy_relevant_write(tool_name: &str, command: &str) -> bool {
 
 fn obvious_write_command(command: &str) -> bool {
     let command = format!(" {} ", command.trim().to_ascii_lowercase());
-    // ponytail: v1 只拦截明确写入，不实现跨 PowerShell/cmd/POSIX 的完整 shell 解析器。
+    // v1 只拦截明确写入，不实现跨 PowerShell/cmd/POSIX 的完整 shell 解析器。
     const MUTATING_PATTERNS: &[&str] = &[
         " set-content ",
         " add-content ",
@@ -2192,6 +2311,53 @@ fn job_assess(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitC
         }
         Err(error) => {
             eprintln!("CAS2 assessment failed: {error}");
+            ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
+        }
+    }
+}
+
+fn job_plan(database_path: PathBuf, agent_key: &str, scope_key: &str) -> ExitCode {
+    let payload = match read_control_payload() {
+        Ok(payload) => payload,
+        Err(()) => {
+            eprintln!("Job plan draft missing or too large.");
+            return ExitCode::from(EXIT_INVALID_ARGUMENTS);
+        }
+    };
+    match native_control::plan_native_task(&database_path, agent_key, scope_key, &payload, || {
+        let parent_thread_id =
+            current_parent_thread_id().map_err(|_| native_control::NativeControlError {
+                code: "PARENT_THREAD_UNAVAILABLE".to_owned(),
+                message: "CODEX_THREAD_ID unavailable; Runtime First planning stopped.".to_owned(),
+            })?;
+        verify_native_capability(&database_path).map_err(|error| {
+            native_control::NativeControlError {
+                code: "NATIVE_RUNTIME_UNAVAILABLE".to_owned(),
+                message: error.diagnostic(),
+            }
+        })?;
+        Ok(parent_thread_id)
+    }) {
+        Ok(native_control::NativePlanResult::Assessment(result)) => {
+            println!(
+                "CAS2|ASSESS|{}|{}|{}|{}|{}",
+                result.action, result.score, result.threshold, result.reason_code, result.phase
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(native_control::NativePlanResult::Scheduled(result)) => {
+            println!(
+                "CAS2|{}|{}|{}|{}|{}",
+                result.action,
+                result.thread_id.as_deref().unwrap_or("-"),
+                result.reason_code,
+                result.job_id,
+                result.attempt_id.as_deref().unwrap_or("-")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("CAS2 planning failed: {error}");
             ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE)
         }
     }
@@ -3872,6 +4038,108 @@ mod tests {
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
     #[test]
+    fn primary_slim_context_is_injected_only_on_second_distinct_turn() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE primary_prompt_injections (
+                session_id TEXT PRIMARY KEY,
+                first_turn_id TEXT NOT NULL,
+                injected_turn_id TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );",
+            )
+            .unwrap();
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-1").unwrap());
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-1").unwrap());
+        assert!(primary_slim_context_due(&mut connection, "session-a", "turn-2").unwrap());
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-2").unwrap());
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-3").unwrap());
+        assert!(!primary_slim_context_due(&mut connection, "session-b", "turn-1").unwrap());
+        assert!(primary_slim_context_due(&mut connection, "session-b", "turn-2").unwrap());
+        let recorded: (String, String) = connection.query_row(
+            "SELECT first_turn_id, injected_turn_id FROM primary_prompt_injections WHERE session_id = 'session-a'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(recorded, ("turn-1".to_owned(), "turn-2".to_owned()));
+    }
+
+    #[test]
+    fn primary_slim_context_duplicate_and_completed_turns_do_not_take_writer_lock() {
+        let path = primary_prompt_test_database();
+        let mut connection = Connection::open(&path).unwrap();
+        connection.busy_timeout(Duration::ZERO).unwrap();
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-1").unwrap());
+
+        let mut writer = Connection::open(&path).unwrap();
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-1").unwrap());
+        drop(lock);
+
+        assert!(primary_slim_context_due(&mut connection, "session-a", "turn-2").unwrap());
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-2").unwrap());
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-3").unwrap());
+        drop(lock);
+        drop(writer);
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn primary_slim_context_concurrent_second_turn_is_injected_once() {
+        let path = primary_prompt_test_database();
+        let mut connection = Connection::open(&path).unwrap();
+        assert!(!primary_slim_context_due(&mut connection, "session-a", "turn-1").unwrap());
+        drop(connection);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = ["turn-2a", "turn-2b"]
+            .into_iter()
+            .map(|turn_id| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut connection = Connection::open(path).unwrap();
+                    connection.busy_timeout(Duration::from_secs(2)).unwrap();
+                    barrier.wait();
+                    primary_slim_context_due(&mut connection, "session-a", turn_id).unwrap()
+                })
+            })
+            .collect();
+        assert_eq!(
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .filter(|due| *due)
+                .count(),
+            1
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn primary_prompt_test_database() -> PathBuf {
+        let path = unique_temp_dir("cas-primary-hook").with_extension("db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE primary_prompt_injections (
+                    session_id TEXT PRIMARY KEY,
+                    first_turn_id TEXT NOT NULL,
+                    injected_turn_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                );",
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
     fn accepts_only_token_and_uuid() {
         let valid = [
             OsString::from("cas-helper"),
@@ -3979,6 +4247,16 @@ mod tests {
                 workspace.clone(),
             ]),
             Ok(Command::JobAssess { .. })
+        ));
+        assert!(matches!(
+            parse_args([
+                OsString::from("cas-helper"),
+                OsString::from("job-plan"),
+                database.clone(),
+                OsString::from("executor"),
+                workspace.clone(),
+            ]),
+            Ok(Command::JobPlan { .. })
         ));
 
         let Ok(Command::JobSchedule {
@@ -6179,6 +6457,104 @@ mod tests {
             Err(ScheduleError::NativeStateIncompatible)
         ));
         std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn spawn_admission_distinguishes_missing_lease_from_workspace_mismatch() {
+        let connection = scheduling_connection();
+        let payload = serde_json::json!({
+            "tool_use_id": "tool-spawn",
+            "tool_input": { "agent_type": "executor" }
+        });
+        let (_, decision) = admit_spawn_delegation(
+            &connection,
+            &payload,
+            "primary-thread",
+            Some("C:/workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(decision, Err(("DELEGATION_SCHEDULE_REQUIRED", _))));
+
+        connection
+            .execute(
+                "INSERT INTO runtime_delegation_leases (
+                    id, created_at, updated_at, agent_id, parent_thread_id,
+                    workspace_scope_key, schedule_decision_id, state, expires_at
+                 ) VALUES (
+                    'other-scope', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 'agent-1', 'primary-thread',
+                    'c:/other', 'decision-1', 'PENDING',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds')
+                 )",
+                [],
+            )
+            .unwrap();
+        let (_, decision) = admit_spawn_delegation(
+            &connection,
+            &payload,
+            "primary-thread",
+            Some("C:/workspace"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(decision, Err(("WORKSPACE_SCOPE_MISMATCH", _))));
+    }
+
+    #[test]
+    fn lease_expiry_skips_writer_lock_without_expired_candidates() {
+        let root = unique_temp_dir("lease-expiry-read");
+        std::fs::create_dir_all(&root).unwrap();
+        let database_path = root.join("cas.db");
+        let reader = Connection::open(&database_path).unwrap();
+        reader
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE runtime_delegation_leases (
+                    id TEXT PRIMARY KEY, state TEXT NOT NULL, expires_at TEXT NOT NULL,
+                    admission_tool_use_id TEXT, codex_agent_id TEXT,
+                    released_at TEXT, updated_at TEXT, release_reason TEXT
+                 );
+                 CREATE TABLE job_attempts (
+                    lease_id TEXT, state TEXT, dispatch_recorded_at TEXT
+                 );",
+            )
+            .unwrap();
+        reader
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let mut writer = Connection::open(&database_path).unwrap();
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(expire_runtime_leases(&reader).is_ok());
+        drop(lock);
+        drop(writer);
+
+        reader
+            .execute(
+                "INSERT INTO runtime_delegation_leases (
+                    id, state, expires_at, admission_tool_use_id, codex_agent_id
+                 ) VALUES (
+                    'expired', 'PENDING',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-120 seconds'), NULL, NULL
+                 )",
+                [],
+            )
+            .unwrap();
+        expire_runtime_leases(&reader).unwrap();
+        let state: String = reader
+            .query_row(
+                "SELECT state FROM runtime_delegation_leases WHERE id = 'expired'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "EXPIRED");
+        reader.execute("DROP TABLE job_attempts", []).unwrap();
+        assert!(expire_runtime_leases(&reader).is_err());
+        drop(reader);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn settings_connection() -> Connection {

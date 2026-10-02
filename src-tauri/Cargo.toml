@@ -20,12 +20,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde_json = "1"
 
 [dependencies]
 cas-scheduler = { path = "crates/cas-scheduler" }
 cas-native-lifecycle = { path = "crates/cas-native-lifecycle" }
 cas-secret-store = { path = "crates/cas-secret-store" }
-rusqlite = { version = "0.40.1", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 reqwest = { version = "=0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +36,7 @@ toml_edit = "0.23"
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["v4"] }
 tauri-plugin-opener = "2"
+tiny_http = "0.12"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [

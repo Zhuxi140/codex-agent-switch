@@ -22,6 +22,38 @@ pub(crate) struct ProviderService {
 }
 
 impl ProviderService {
+    /// 仅在首次建立固定数据目录时补回 Native，不重建用户删除的配置或 Agent。
+    pub(crate) fn initialize_native(database_path: &Path) -> Result<(), ProviderServiceError> {
+        let service = Self {
+            repository: Mutex::new(SqliteProviderRepository::open(database_path)?),
+        };
+        let exists: bool = service
+            .repository()?
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM providers WHERE preset_id = 'codex-native')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(RepositoryError::from)?;
+        if !exists {
+            service.create_with_secret_store(
+                ProviderCreateRequest {
+                    provider_key: "codex-native".to_owned(),
+                    name: "Codex Native (ChatGPT)".to_owned(),
+                    preset_id: Some("codex-native".to_owned()),
+                    base_url: "https://api.openai.com/v1/".to_owned(),
+                    protocol: ProviderProtocol::Responses,
+                    auth: ProviderAuthInput::None,
+                    enabled: true,
+                },
+                store_secret,
+                delete_secret,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn open(database_path: &Path) -> Result<Self, ProviderServiceError> {
         let service = Self {
             repository: Mutex::new(SqliteProviderRepository::open(database_path)?),
@@ -125,6 +157,7 @@ impl ProviderService {
             name: pending.name,
             provider_type: pending.provider_type,
             base_url: pending.base_url,
+            protocol: pending.protocol,
             enabled: pending.enabled,
             source: pending.source,
             preset_id: pending.preset_id,
@@ -273,13 +306,14 @@ impl SqliteProviderRepository {
                 "INSERT INTO providers (
                     id, provider_key, name, provider_type, base_url, protocol, auth_type,
                     enabled, source, preset_id, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 'RESPONSES', 'BEARER_TOKEN', ?6, ?7, ?8, ?9, ?9)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'BEARER_TOKEN', ?7, ?8, ?9, ?10, ?10)",
                 params![
                     provider.id,
                     provider.provider_key,
                     provider.name,
                     provider.provider_type,
                     provider.base_url,
+                    provider.protocol,
                     provider.enabled,
                     provider.source,
                     provider.preset_id,
@@ -488,6 +522,7 @@ struct PendingProvider {
     name: String,
     provider_type: &'static str,
     base_url: String,
+    protocol: &'static str,
     enabled: bool,
     source: &'static str,
     preset_id: Option<String>,
@@ -502,7 +537,13 @@ impl TryFrom<ProviderCreateRequest> for PendingProvider {
         validate_provider_key(&request.provider_key)?;
         validate_text(&request.name, "name", 120)?;
         validate_base_url(&request.base_url)?;
-        if request.protocol != ProviderProtocol::Responses {
+        if !matches!(
+            request.protocol,
+            ProviderProtocol::Responses | ProviderProtocol::ChatCompletions
+        ) {
+            return Err(ProviderServiceError::InvalidField("protocol"));
+        }
+        if request.preset_id.is_some() && request.protocol != ProviderProtocol::Responses {
             return Err(ProviderServiceError::InvalidField("protocol"));
         }
         let initial_models = match request.preset_id.as_deref() {
@@ -532,6 +573,7 @@ impl TryFrom<ProviderCreateRequest> for PendingProvider {
             name: request.name.trim().to_owned(),
             provider_type: if is_preset { "PRESET" } else { "CUSTOM" },
             base_url: request.base_url,
+            protocol: request.protocol.as_str(),
             enabled: request.enabled,
             source: if is_preset { "BUILT_IN" } else { "USER" },
             preset_id: request.preset_id,
@@ -694,6 +736,7 @@ struct NewProviderAggregate {
     name: String,
     provider_type: &'static str,
     base_url: String,
+    protocol: &'static str,
     enabled: bool,
     source: &'static str,
     preset_id: Option<String>,
@@ -815,6 +858,18 @@ enum ProviderProtocol {
     AnthropicMessages,
     Gemini,
     Custom,
+}
+
+impl ProviderProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "RESPONSES",
+            Self::ChatCompletions => "CHAT_COMPLETIONS",
+            Self::AnthropicMessages => "ANTHROPIC_MESSAGES",
+            Self::Gemini => "GEMINI",
+            Self::Custom => "CUSTOM",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1235,6 +1290,17 @@ mod tests {
     }
 
     #[test]
+    fn custom_chat_provider_persists_protocol() {
+        let service = ProviderService::in_memory();
+        let mut chat = request("chat-provider");
+        chat.protocol = ProviderProtocol::ChatCompletions;
+        let saved = service
+            .create_with_secret_store(chat, |_, _| Ok(()), |_| Ok(true))
+            .unwrap();
+        assert_eq!(saved.protocol, "CHAT_COMPLETIONS");
+    }
+
+    #[test]
     fn provider_create_is_atomic_and_compensates_on_database_failure() {
         let service = ProviderService::in_memory();
         let deleted = Cell::new(false);
@@ -1388,7 +1454,7 @@ mod tests {
 
         assert!(provider.native_auth);
         assert!(!provider.credential_configured);
-        assert_eq!(provider.model_count, 3);
+        assert_eq!(provider.model_count, 6);
         let detail = service
             .get(ProviderGetRequest {
                 provider_id: provider.id,

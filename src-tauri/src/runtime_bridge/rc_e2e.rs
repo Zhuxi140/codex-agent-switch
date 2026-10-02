@@ -1,5 +1,6 @@
 use super::*;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ use cas_native_lifecycle::rollout_state;
 use cas_scheduler::normalize_workspace_scope_key;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde_json::{Value, json};
+use toml_edit::{DocumentMut, value};
 
 const TASK_SCOPE_KEY: &str = "cas-rc1-proof";
 const CONCURRENT_TASK_SCOPE_KEY: &str = "cas-rc2-concurrent";
@@ -29,7 +31,16 @@ struct TempRoot(PathBuf);
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let (Ok(root), Ok(temp)) = (self.0.canonicalize(), env::temp_dir().canonicalize()) else {
+            return;
+        };
+        if root.parent() == Some(temp.as_path())
+            && root
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("cas-"))
+        {
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
 
@@ -131,6 +142,8 @@ struct ActiveAgent {
     name: String,
     model: String,
     provider: String,
+    reasoning_policy: String,
+    model_default_reasoning: Option<String>,
 }
 
 fn active_agent(connection: &Connection) -> Result<ActiveAgent, Rc1Failure> {
@@ -140,7 +153,8 @@ fn active_agent(connection: &Connection) -> Result<ActiveAgent, Rc1Failure> {
     let agent = stage(
         connection
             .query_row(
-                "SELECT a.id, a.agent_key, a.name, m.model_id, p.provider_key
+                "SELECT a.id, a.agent_key, a.name, m.model_id, p.provider_key,
+                        a.reasoning_policy, m.default_reasoning
                  FROM agents a
                  LEFT JOIN active_agent_bindings active ON active.agent_id = a.id
                  JOIN agent_model_bindings binding
@@ -161,6 +175,8 @@ fn active_agent(connection: &Connection) -> Result<ActiveAgent, Rc1Failure> {
                         name: row.get(2)?,
                         model: row.get(3)?,
                         provider: row.get(4)?,
+                        reasoning_policy: row.get(5)?,
+                        model_default_reasoning: row.get(6)?,
                     })
                 },
             )
@@ -198,6 +214,1138 @@ fn copy_runtime_identity(source: &Path, target: &Path) -> Result<(), Rc1Failure>
         }
     }
     Ok(())
+}
+
+fn isolated_primary_config(
+    source_codex_home: &Path,
+) -> Result<(String, Option<String>, Option<String>), Rc1Failure> {
+    let source = stage(
+        fs::read_to_string(source_codex_home.join("config.toml")),
+        "PRIMARY_CONFIG_READ_FAILED",
+    )?;
+    let source = stage(source.parse::<DocumentMut>(), "PRIMARY_CONFIG_PARSE_FAILED")?;
+    let model = source
+        .get("model")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    let reasoning = source
+        .get("model_reasoning_effort")
+        .and_then(|item| item.as_str())
+        .map(str::to_owned);
+    let mut isolated = DocumentMut::new();
+    if let Some(model) = model.as_deref() {
+        isolated["model"] = value(model);
+    }
+    if let Some(reasoning) = reasoning.as_deref() {
+        isolated["model_reasoning_effort"] = value(reasoning);
+    }
+    isolated["approval_policy"] = value("on-request");
+    isolated["sandbox_mode"] = value("workspace-write");
+    Ok((isolated.to_string(), model, reasoning))
+}
+
+fn copy_directory(source: &Path, target: &Path) -> Result<(), Rc1Failure> {
+    stage(fs::create_dir_all(target), "BENCHMARK_DIRECTORY_FAILED")?;
+    for entry in stage(fs::read_dir(source), "BENCHMARK_FIXTURE_READ_FAILED")? {
+        let entry = stage(entry, "BENCHMARK_FIXTURE_READ_FAILED")?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = stage(entry.file_type(), "BENCHMARK_FIXTURE_READ_FAILED")?;
+        if file_type.is_dir() {
+            copy_directory(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            stage(
+                fs::copy(&source_path, &target_path),
+                "BENCHMARK_FIXTURE_COPY_FAILED",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, Rc1Failure> {
+    fn collect(
+        root: &Path,
+        current: &Path,
+        files: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), Rc1Failure> {
+        for entry in stage(fs::read_dir(current), "BENCHMARK_SCOPE_READ_FAILED")? {
+            let entry = stage(entry, "BENCHMARK_SCOPE_READ_FAILED")?;
+            let path = entry.path();
+            let file_type = stage(entry.file_type(), "BENCHMARK_SCOPE_READ_FAILED")?;
+            if file_type.is_dir() {
+                collect(root, &path, files)?;
+            } else if file_type.is_file() {
+                let relative = stage(path.strip_prefix(root), "BENCHMARK_SCOPE_READ_FAILED")?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.insert(
+                    relative,
+                    stage(fs::read(path), "BENCHMARK_SCOPE_READ_FAILED")?,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = BTreeMap::new();
+    collect(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn scope_violations(
+    before: &BTreeMap<String, Vec<u8>>,
+    after: &BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let mut paths = before
+        .keys()
+        .chain(after.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths
+        .into_iter()
+        .filter(|path| path != "src/ranges.mjs" && before.get(path) != after.get(path))
+        .collect()
+}
+
+#[derive(Clone, Debug)]
+struct TokenSnapshot {
+    input_tokens: i64,
+    cached_input_tokens: i64,
+    cache_write_input_tokens: i64,
+    output_tokens: i64,
+    reasoning_output_tokens: i64,
+    total_tokens: i64,
+    current_context_tokens: Option<i64>,
+    model_context_window: Option<i64>,
+    cached_input_provided: Option<bool>,
+    usage_status: String,
+    source: String,
+}
+
+impl TokenSnapshot {
+    fn to_json(&self) -> Value {
+        json!({
+            "inputTokens": self.input_tokens,
+            "cachedInputTokens": self.cached_input_tokens,
+            "cacheWriteInputTokens": self.cache_write_input_tokens,
+            "outputTokens": self.output_tokens,
+            "reasoningOutputTokens": self.reasoning_output_tokens,
+            "totalTokens": self.total_tokens,
+            "currentContextTokens": self.current_context_tokens,
+            "modelContextWindow": self.model_context_window,
+            "cachedInputProvided": self.cached_input_provided,
+            "usageStatus": self.usage_status,
+            "source": self.source,
+        })
+    }
+
+    fn delta_json(&self, previous: &Self) -> Value {
+        json!({
+            "inputTokens": self.input_tokens - previous.input_tokens,
+            "cachedInputTokens": self.cached_input_tokens - previous.cached_input_tokens,
+            "cacheWriteInputTokens": self.cache_write_input_tokens - previous.cache_write_input_tokens,
+            "outputTokens": self.output_tokens - previous.output_tokens,
+            "reasoningOutputTokens": self.reasoning_output_tokens - previous.reasoning_output_tokens,
+            "totalTokens": self.total_tokens - previous.total_tokens,
+        })
+    }
+}
+
+fn token_snapshot(
+    database_path: &Path,
+    thread_id: &str,
+) -> Result<Option<TokenSnapshot>, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    stage(
+        connection
+            .query_row(
+                "SELECT input_tokens, cached_input_tokens, cache_write_input_tokens,
+                        output_tokens, reasoning_output_tokens, total_tokens,
+                        model_context_window, cached_input_provided,
+                        usage_status, source
+                 FROM token_usage_records WHERE codex_thread_id=?1",
+                [thread_id],
+                |row| {
+                    Ok(TokenSnapshot {
+                        input_tokens: row.get(0)?,
+                        cached_input_tokens: row.get(1)?,
+                        cache_write_input_tokens: row.get(2)?,
+                        output_tokens: row.get(3)?,
+                        reasoning_output_tokens: row.get(4)?,
+                        total_tokens: row.get(5)?,
+                        current_context_tokens: None,
+                        model_context_window: row.get(6)?,
+                        cached_input_provided: row
+                            .get::<_, Option<i64>>(7)?
+                            .map(|value| value != 0),
+                        usage_status: row.get(8)?,
+                        source: row.get(9)?,
+                    })
+                },
+            )
+            .optional(),
+        "TOKEN_EVIDENCE_QUERY_FAILED",
+    )
+}
+
+fn child_thread_id(
+    database_path: &Path,
+    parent_thread_id: &str,
+    agent_id: &str,
+) -> Result<Option<String>, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    stage(
+        connection
+            .query_row(
+                "SELECT codex_thread_id FROM agent_thread_instances
+                 WHERE parent_thread_id=?1 AND agent_id=?2
+                 ORDER BY last_used_at DESC LIMIT 1",
+                params![parent_thread_id, agent_id],
+                |row| row.get(0),
+            )
+            .optional(),
+        "CHILD_EVIDENCE_QUERY_FAILED",
+    )
+}
+
+fn child_token_snapshots(
+    database_path: &Path,
+    parent_thread_id: &str,
+    agent_id: &str,
+) -> Result<BTreeMap<String, TokenSnapshot>, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    let mut statement = stage(
+        connection.prepare(
+            "SELECT codex_thread_id FROM agent_thread_instances
+             WHERE parent_thread_id=?1 AND agent_id=?2",
+        ),
+        "CHILD_EVIDENCE_QUERY_FAILED",
+    )?;
+    let thread_ids = stage(
+        statement.query_map(params![parent_thread_id, agent_id], |row| {
+            row.get::<_, String>(0)
+        }),
+        "CHILD_EVIDENCE_QUERY_FAILED",
+    )?;
+    let thread_ids = stage(
+        thread_ids.collect::<Result<Vec<_>, _>>(),
+        "CHILD_EVIDENCE_QUERY_FAILED",
+    )?;
+    let mut snapshots = BTreeMap::new();
+    for thread_id in thread_ids {
+        let snapshot = token_snapshot(database_path, &thread_id)?.ok_or_else(|| {
+            Rc1Failure::new(
+                "CHILD_TOKEN_EVIDENCE_MISSING",
+                format!("Child Thread {thread_id} 缺少 Token 记录"),
+            )
+        })?;
+        snapshots.insert(thread_id, snapshot);
+    }
+    Ok(snapshots)
+}
+
+fn benchmark_runtime_evidence(
+    database_path: &Path,
+    parent_thread_id: &str,
+    agent_id: &str,
+) -> Result<Value, Rc1Failure> {
+    let connection = stage(Connection::open(database_path), "EVIDENCE_DATABASE_FAILED")?;
+    let child_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM agent_thread_instances
+             WHERE parent_thread_id=?1 AND agent_id=?2",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let job_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM orchestration_jobs
+             WHERE parent_thread_id=?1 AND agent_id=?2",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let completed_job_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM orchestration_jobs
+             WHERE parent_thread_id=?1 AND agent_id=?2 AND state='COMPLETED'",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let attempt_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM job_attempts attempt
+             JOIN orchestration_jobs job ON job.job_id=attempt.job_id
+             WHERE job.parent_thread_id=?1 AND job.agent_id=?2",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let receipt_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM delivery_receipts receipt
+             JOIN job_attempts attempt ON attempt.attempt_id=receipt.attempt_id
+             JOIN orchestration_jobs job ON job.job_id=attempt.job_id
+             WHERE job.parent_thread_id=?1 AND job.agent_id=?2",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let review_count: i64 = stage(
+        connection.query_row(
+            "SELECT COUNT(*) FROM review_decisions review
+             JOIN job_attempts attempt ON attempt.attempt_id=review.attempt_id
+             JOIN orchestration_jobs job ON job.job_id=attempt.job_id
+             WHERE job.parent_thread_id=?1 AND job.agent_id=?2",
+            params![parent_thread_id, agent_id],
+            |row| row.get(0),
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let mut statement = stage(
+        connection.prepare(
+            "SELECT attempt.route_action, decision.reason_code, decision.candidate_thread_id,
+                    job.job_id, job.task_scope_key, job.state
+             FROM job_attempts attempt
+             JOIN orchestration_jobs job ON job.job_id=attempt.job_id
+             JOIN agent_schedule_decisions decision ON decision.id=attempt.schedule_decision_id
+             WHERE job.parent_thread_id=?1 AND job.agent_id=?2
+             ORDER BY attempt.created_at, attempt.attempt_id",
+        ),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let routes = stage(
+        statement.query_map(params![parent_thread_id, agent_id], |row| {
+            Ok(json!({
+                "action": row.get::<_, String>(0)?,
+                "reasonCode": row.get::<_, String>(1)?,
+                "candidateThreadId": row.get::<_, Option<String>>(2)?,
+                "jobId": row.get::<_, String>(3)?,
+                "taskScopeKey": row.get::<_, String>(4)?,
+                "jobState": row.get::<_, String>(5)?,
+            }))
+        }),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    let routes = stage(
+        routes.collect::<Result<Vec<_>, _>>(),
+        "BENCHMARK_EVIDENCE_QUERY_FAILED",
+    )?;
+    Ok(json!({
+        "childCount": child_count,
+        "jobCount": job_count,
+        "completedJobCount": completed_job_count,
+        "attemptCount": attempt_count,
+        "receiptCount": receipt_count,
+        "reviewCount": review_count,
+        "routes": routes,
+    }))
+}
+
+fn wait_for_primary_idle(
+    bridge: &RuntimeBridgeService,
+    thread_id: &str,
+    timeout: Duration,
+) -> Result<(), Rc1Failure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let status = stage(bridge.status_inner(), "BRIDGE_STATUS_FAILED")?;
+        let session = status
+            .managed_sessions
+            .iter()
+            .find(|session| session.thread_id == thread_id)
+            .ok_or_else(|| Rc1Failure::new("MANAGED_SESSION_MISSING", "托管 Primary 不存在"))?;
+        match session.status {
+            ManagedSessionStatus::Idle => return Ok(()),
+            ManagedSessionStatus::Running if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            ManagedSessionStatus::Running => {
+                return Err(Rc1Failure::new(
+                    "BENCHMARK_TURN_TIMEOUT",
+                    format!(
+                        "Primary Turn 在 {} 秒内未完成；{}",
+                        timeout.as_secs(),
+                        primary_summary(bridge, thread_id)
+                    ),
+                ));
+            }
+            other => {
+                return Err(Rc1Failure::new(
+                    "BENCHMARK_TURN_FAILED",
+                    format!(
+                        "Primary Turn 结束状态为 {other:?}；{}",
+                        primary_summary(bridge, thread_id)
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn run_acceptance(workspace: &Path, task: &str) -> Result<Value, Rc1Failure> {
+    let mut command = Command::new("node");
+    command.arg("--test");
+    command.arg("acceptance/task-1a.test.mjs");
+    if task == "1B" {
+        command.arg("acceptance/task-1b.test.mjs");
+    }
+    let started = Instant::now();
+    let output = stage(
+        command.current_dir(workspace).output(),
+        "BENCHMARK_ACCEPTANCE_START_FAILED",
+    )?;
+    Ok(json!({
+        "passed": output.status.success(),
+        "exitCode": output.status.code(),
+        "durationMs": started.elapsed().as_millis(),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr),
+    }))
+}
+
+fn optional_token_json(snapshot: Option<&TokenSnapshot>) -> Value {
+    snapshot.map(TokenSnapshot::to_json).unwrap_or(Value::Null)
+}
+
+fn token_delta_json(current: Option<&TokenSnapshot>, previous: Option<&TokenSnapshot>) -> Value {
+    match (current, previous) {
+        (Some(current), Some(previous)) => current.delta_json(previous),
+        _ => Value::Null,
+    }
+}
+
+fn child_tokens_json(snapshots: &BTreeMap<String, TokenSnapshot>) -> Value {
+    json!(
+        snapshots
+            .iter()
+            .map(|(thread_id, snapshot)| json!({
+                "threadId": thread_id,
+                "tokens": snapshot.to_json(),
+            }))
+            .collect::<Vec<_>>()
+    )
+}
+
+fn sum_child_field(
+    snapshots: &BTreeMap<String, TokenSnapshot>,
+    field: impl Fn(&TokenSnapshot) -> i64,
+) -> i64 {
+    snapshots.values().map(field).sum()
+}
+
+fn child_token_delta_json(
+    current: &BTreeMap<String, TokenSnapshot>,
+    previous: &BTreeMap<String, TokenSnapshot>,
+) -> Value {
+    json!({
+        "inputTokens": sum_child_field(current, |s| s.input_tokens) - sum_child_field(previous, |s| s.input_tokens),
+        "cachedInputTokens": sum_child_field(current, |s| s.cached_input_tokens) - sum_child_field(previous, |s| s.cached_input_tokens),
+        "cacheWriteInputTokens": sum_child_field(current, |s| s.cache_write_input_tokens) - sum_child_field(previous, |s| s.cache_write_input_tokens),
+        "outputTokens": sum_child_field(current, |s| s.output_tokens) - sum_child_field(previous, |s| s.output_tokens),
+        "reasoningOutputTokens": sum_child_field(current, |s| s.reasoning_output_tokens) - sum_child_field(previous, |s| s.reasoning_output_tokens),
+        "totalTokens": sum_child_field(current, |s| s.total_tokens) - sum_child_field(previous, |s| s.total_tokens),
+    })
+}
+
+fn combined_total(
+    primary: Option<&TokenSnapshot>,
+    children: &BTreeMap<String, TokenSnapshot>,
+) -> Option<i64> {
+    primary.map(|snapshot| snapshot.total_tokens + sum_child_field(children, |s| s.total_tokens))
+}
+
+fn combined_delta(
+    primary: Option<&TokenSnapshot>,
+    previous_primary: Option<&TokenSnapshot>,
+    children: &BTreeMap<String, TokenSnapshot>,
+    previous_children: &BTreeMap<String, TokenSnapshot>,
+) -> Option<i64> {
+    let primary_delta = primary?.total_tokens - previous_primary?.total_tokens;
+    let child_delta = sum_child_field(children, |s| s.total_tokens)
+        - sum_child_field(previous_children, |s| s.total_tokens);
+    Some(primary_delta + child_delta)
+}
+
+#[test]
+fn benchmark_token_delta_includes_new_child_thread() {
+    let snapshot = |total_tokens| TokenSnapshot {
+        input_tokens: total_tokens,
+        cached_input_tokens: 0,
+        cache_write_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens,
+        current_context_tokens: None,
+        model_context_window: None,
+        cached_input_provided: Some(true),
+        usage_status: "FINAL".to_owned(),
+        source: "CODEX_APP_SERVER".to_owned(),
+    };
+    let first = BTreeMap::from([("child-a".to_owned(), snapshot(100))]);
+    let second = BTreeMap::from([
+        ("child-a".to_owned(), snapshot(100)),
+        ("child-b".to_owned(), snapshot(200)),
+    ]);
+    assert_eq!(combined_total(Some(&snapshot(500)), &first), Some(600));
+    assert_eq!(
+        combined_delta(Some(&snapshot(600)), Some(&snapshot(500)), &second, &first),
+        Some(300)
+    );
+    assert_eq!(child_token_delta_json(&second, &first)["totalTokens"], 200);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_benchmark_mode(
+    run_id: &str,
+    workspace: &Path,
+    database_path: &Path,
+    data_home: &Path,
+    helper_path: &Path,
+    codex_home: &Path,
+    executable: &Path,
+    agent: &ActiveAgent,
+    primary_model: Option<&str>,
+    primary_reasoning: Option<&str>,
+    prompt_1a: &str,
+    prompt_1b: &str,
+    timeout: Duration,
+) -> Result<Value, Rc1Failure> {
+    let before = snapshot_files(workspace)?;
+    let bridge = stage(
+        RuntimeBridgeService::open(database_path, data_home, helper_path),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    let outcome = (|| {
+        stage(
+            bridge.start_inner_for_e2e(executable, codex_home, None),
+            "BRIDGE_START_FAILED",
+        )?;
+        let session = stage(
+            bridge.managed_session_start_inner(ManagedSessionStartRequest {
+                cwd: workspace.to_string_lossy().into_owned(),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox: Some("workspace-write".to_owned()),
+            }),
+            "PRIMARY_START_FAILED",
+        )?;
+        let primary_thread_id = session.thread_id;
+        let sandbox_policy = json!({
+            "type": "workspaceWrite",
+            "writableRoots": [
+                workspace.to_string_lossy(),
+                data_home.to_string_lossy()
+            ]
+        });
+
+        let task_1a_started = Instant::now();
+        stage(
+            bridge.managed_turn_start_inner(ManagedTurnStartRequest {
+                thread_id: primary_thread_id.clone(),
+                input: prompt_1a.to_owned(),
+                effort: primary_reasoning.map(str::to_owned),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox_policy: Some(sandbox_policy.clone()),
+            }),
+            "BENCHMARK_TASK_1A_START_FAILED",
+        )?;
+        wait_for_primary_idle(&bridge, &primary_thread_id, timeout)?;
+        let task_1a_duration_ms = task_1a_started.elapsed().as_millis();
+        thread::sleep(Duration::from_millis(250));
+        let task_1a_acceptance = run_acceptance(workspace, "1A")?;
+        let primary_1a = token_snapshot(database_path, &primary_thread_id)?;
+        let child_1a_id = child_thread_id(database_path, &primary_thread_id, &agent.id)?;
+        let child_1a = match child_1a_id.as_deref() {
+            Some(thread_id) => token_snapshot(database_path, thread_id)?,
+            None => None,
+        };
+        let children_1a = child_token_snapshots(database_path, &primary_thread_id, &agent.id)?;
+        if task_1a_acceptance.get("passed").and_then(Value::as_bool) != Some(true) {
+            return Err(Rc1Failure::new(
+                "BENCHMARK_TASK_1A_FAILED",
+                format!(
+                    "{run_id} Task 1A 首次验收失败；{}",
+                    primary_summary(&bridge, &primary_thread_id)
+                ),
+            ));
+        }
+        let task_1b_started = Instant::now();
+        stage(
+            bridge.managed_turn_start_inner(ManagedTurnStartRequest {
+                thread_id: primary_thread_id.clone(),
+                input: prompt_1b.to_owned(),
+                effort: primary_reasoning.map(str::to_owned),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox_policy: Some(sandbox_policy),
+            }),
+            "BENCHMARK_TASK_1B_START_FAILED",
+        )?;
+        wait_for_primary_idle(&bridge, &primary_thread_id, timeout)?;
+        let task_1b_duration_ms = task_1b_started.elapsed().as_millis();
+        thread::sleep(Duration::from_millis(250));
+        let task_1b_acceptance = run_acceptance(workspace, "1B")?;
+        let primary_1b = token_snapshot(database_path, &primary_thread_id)?;
+        let child_1b_id = child_thread_id(database_path, &primary_thread_id, &agent.id)?;
+        let child_1b = match child_1b_id.as_deref() {
+            Some(thread_id) => token_snapshot(database_path, thread_id)?,
+            None => None,
+        };
+        let children_1b = child_token_snapshots(database_path, &primary_thread_id, &agent.id)?;
+        let summary = primary_summary(&bridge, &primary_thread_id);
+        let runtime = benchmark_runtime_evidence(database_path, &primary_thread_id, &agent.id)?;
+        let after = snapshot_files(workspace)?;
+        let violations = scope_violations(&before, &after);
+        let range_changed = before.get("src/ranges.mjs") != after.get("src/ranges.mjs");
+        let same_child = child_1a_id.is_some() && child_1a_id == child_1b_id;
+        let task_1a_total = combined_total(primary_1a.as_ref(), &children_1a);
+        let task_1b_total = combined_delta(
+            primary_1b.as_ref(),
+            primary_1a.as_ref(),
+            &children_1b,
+            &children_1a,
+        );
+        Ok(json!({
+            "runId": run_id,
+            "workspace": workspace,
+            "primaryModel": primary_model,
+            "primaryReasoning": primary_reasoning,
+            "primaryThreadId": primary_thread_id,
+            "childThreadIdAfterTask1A": child_1a_id,
+            "childThreadIdAfterTask1B": child_1b_id,
+            "sameChildThread": same_child,
+            "task1A": {
+                "durationMs": task_1a_duration_ms,
+                "acceptance": task_1a_acceptance,
+                "primaryTokens": optional_token_json(primary_1a.as_ref()),
+                "childTokens": optional_token_json(child_1a.as_ref()),
+                "allChildThreadTokens": child_tokens_json(&children_1a),
+                "combinedTotalTokens": task_1a_total,
+            },
+            "task1B": {
+                "durationMs": task_1b_duration_ms,
+                "acceptance": task_1b_acceptance,
+                "primaryTokensFinal": optional_token_json(primary_1b.as_ref()),
+                "primaryTokenDelta": token_delta_json(primary_1b.as_ref(), primary_1a.as_ref()),
+                "childTokensFinal": optional_token_json(child_1b.as_ref()),
+                "allChildThreadTokensFinal": child_tokens_json(&children_1b),
+                "childTokenDelta": child_token_delta_json(&children_1b, &children_1a),
+                "combinedDeltaTokens": task_1b_total,
+                "combinedTotalTokensFinal": combined_total(primary_1b.as_ref(), &children_1b),
+            },
+            "runtime": runtime,
+            "scopeIntegrity": {
+                "onlyRangesFileChanged": violations.is_empty() && range_changed,
+                "rangesFileChanged": range_changed,
+                "violations": violations,
+            },
+            "primarySummary": summary,
+        }))
+    })();
+    let _ = bridge.stop_inner();
+    outcome
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_qualified_benchmark_mode(
+    run_id: &str,
+    workspace: &Path,
+    database_path: &Path,
+    data_home: &Path,
+    helper_path: &Path,
+    codex_home: &Path,
+    executable: &Path,
+    agent: &ActiveAgent,
+    primary_model: Option<&str>,
+    primary_reasoning: Option<&str>,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<Value, Rc1Failure> {
+    let before = snapshot_files(workspace)?;
+    let bridge = stage(
+        RuntimeBridgeService::open(database_path, data_home, helper_path),
+        "BRIDGE_OPEN_FAILED",
+    )?;
+    let outcome = (|| {
+        stage(
+            bridge.start_inner_for_e2e(executable, codex_home, None),
+            "BRIDGE_START_FAILED",
+        )?;
+        let session = stage(
+            bridge.managed_session_start_inner(ManagedSessionStartRequest {
+                cwd: workspace.to_string_lossy().into_owned(),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox: Some("workspace-write".to_owned()),
+            }),
+            "PRIMARY_START_FAILED",
+        )?;
+        let primary_thread_id = session.thread_id;
+        let sandbox_policy = json!({
+            "type": "workspaceWrite",
+            "writableRoots": [workspace.to_string_lossy(), data_home.to_string_lossy()]
+        });
+        let started = Instant::now();
+        stage(
+            bridge.managed_turn_start_inner(ManagedTurnStartRequest {
+                thread_id: primary_thread_id.clone(),
+                input: prompt.to_owned(),
+                effort: primary_reasoning.map(str::to_owned),
+                approval_policy: Some("on-request".to_owned()),
+                sandbox_policy: Some(sandbox_policy),
+            }),
+            "BENCHMARK_QUALIFIED_START_FAILED",
+        )?;
+        wait_for_primary_idle(&bridge, &primary_thread_id, timeout)?;
+        let duration_ms = started.elapsed().as_millis();
+        thread::sleep(Duration::from_millis(250));
+        let acceptance = run_acceptance(workspace, "1B")?;
+        let primary_tokens = token_snapshot(database_path, &primary_thread_id)?;
+        let child_thread_id = child_thread_id(database_path, &primary_thread_id, &agent.id)?;
+        let child_tokens = child_token_snapshots(database_path, &primary_thread_id, &agent.id)?;
+        let runtime = benchmark_runtime_evidence(database_path, &primary_thread_id, &agent.id)?;
+        let after = snapshot_files(workspace)?;
+        let violations = scope_violations(&before, &after);
+        let range_changed = before.get("src/ranges.mjs") != after.get("src/ranges.mjs");
+        Ok(json!({
+            "runId": run_id,
+            "workspace": workspace,
+            "primaryModel": primary_model,
+            "primaryReasoning": primary_reasoning,
+            "primaryThreadId": primary_thread_id,
+            "childThreadId": child_thread_id,
+            "taskQualified": {
+                "durationMs": duration_ms,
+                "acceptance": acceptance,
+                "primaryTokens": optional_token_json(primary_tokens.as_ref()),
+                "allChildThreadTokens": child_tokens_json(&child_tokens),
+                "combinedTotalTokens": combined_total(primary_tokens.as_ref(), &child_tokens),
+            },
+            "runtime": runtime,
+            "scopeIntegrity": {
+                "onlyRangesFileChanged": violations.is_empty() && range_changed,
+                "rangesFileChanged": range_changed,
+                "violations": violations,
+            },
+            "primarySummary": primary_summary(&bridge, &primary_thread_id),
+        }))
+    })();
+    let _ = bridge.stop_inner();
+    outcome
+}
+
+fn enforce_one_child_limit(connection: &Connection) -> Result<(), Rc1Failure> {
+    stage(
+        connection.execute_batch(
+            "CREATE TABLE cas_e2e_child_admissions (id INTEGER PRIMARY KEY CHECK (id = 1));
+             CREATE TRIGGER cas_e2e_one_child_limit
+             BEFORE UPDATE OF admission_tool_use_id ON runtime_delegation_leases
+             WHEN NEW.admission_tool_use_id IS NOT NULL
+               AND OLD.admission_tool_use_id IS NULL
+             BEGIN INSERT INTO cas_e2e_child_admissions (id) VALUES (1); END;",
+        ),
+        "ONE_CHILD_LIMIT_INSTALL_FAILED",
+    )
+}
+
+#[test]
+fn e2e_one_child_limit_rejects_second_admission() {
+    let connection = Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runtime_delegation_leases (
+                id INTEGER PRIMARY KEY,
+                admission_tool_use_id TEXT
+            );
+            INSERT INTO runtime_delegation_leases (id) VALUES (1), (2);",
+        )
+        .unwrap();
+    enforce_one_child_limit(&connection).unwrap();
+    connection
+        .execute(
+            "UPDATE runtime_delegation_leases SET admission_tool_use_id='first' WHERE id=1",
+            [],
+        )
+        .unwrap();
+    assert!(
+        connection
+            .execute(
+                "UPDATE runtime_delegation_leases SET admission_tool_use_id='second' WHERE id=2",
+                [],
+            )
+            .is_err()
+    );
+}
+
+fn run_efficiency_pair() -> Result<Value, Rc1Failure> {
+    let root = required_path("CAS_E2E_ROOT")?;
+    let cleanup = TempRoot(root.clone());
+    let variant = env::var("CAS_E2E_PILOT_VARIANT").unwrap_or_else(|_| "SMALL".to_owned());
+    let qualified = match variant.as_str() {
+        "SMALL" => false,
+        "QUALIFIED" => true,
+        _ => {
+            return Err(Rc1Failure::new(
+                "E2E_CONFIGURATION_INVALID",
+                format!("CAS_E2E_PILOT_VARIANT 仅支持 SMALL/QUALIFIED，实际为 {variant}"),
+            ));
+        }
+    };
+    let source_database = required_path("CAS_E2E_SOURCE_DATABASE_PATH")?;
+    let source_codex_home = required_path("CAS_E2E_SOURCE_CODEX_HOME")?;
+    let helper_source = required_path("CAS_E2E_HELPER_PATH")?;
+    let database_path = required_path("CAS_DATABASE_PATH")?;
+    let benchmark_template = required_path("CAS_E2E_BENCHMARK_TEMPLATE")?;
+    let benchmark_root = required_path("CAS_E2E_BENCHMARK_ROOT")?;
+    let codex_home = root.join("codex-home");
+    let data_home = root.join("cas-data");
+    let helper_home = root.join("cas-runtime");
+    stage(fs::create_dir_all(&codex_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&data_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(fs::create_dir_all(&helper_home), "TEMP_DIRECTORY_FAILED")?;
+    stage(
+        fs::create_dir_all(&benchmark_root),
+        "BENCHMARK_DIRECTORY_FAILED",
+    )?;
+    let helper_path = helper_home.join("cas-helper.exe");
+    stage(fs::copy(&helper_source, &helper_path), "HELPER_COPY_FAILED")?;
+    clone_database(&source_database, &database_path)?;
+    let connection = stage(Connection::open(&database_path), "E2E_DATABASE_FAILED")?;
+    reset_e2e_database(&connection, &codex_home)?;
+    if qualified {
+        enforce_one_child_limit(&connection)?;
+    }
+    let agent = active_agent(&connection)?;
+    drop(connection);
+    copy_runtime_identity(&source_codex_home, &codex_home)?;
+    let (primary_config, primary_model, primary_reasoning) =
+        isolated_primary_config(&source_codex_home)?;
+    stage(
+        fs::write(codex_home.join("config.toml"), primary_config),
+        "NON_INTERACTIVE_CONFIG_FAILED",
+    )?;
+    let prompt_1a = stage(
+        fs::read_to_string(benchmark_template.join(if qualified {
+            "prompts/task-qualified.txt"
+        } else {
+            "prompts/task-1a.txt"
+        })),
+        "BENCHMARK_PROMPT_READ_FAILED",
+    )?;
+    let prompt_1b = if qualified {
+        String::new()
+    } else {
+        stage(
+            fs::read_to_string(benchmark_template.join("prompts/task-1b.txt")),
+            "BENCHMARK_PROMPT_READ_FAILED",
+        )?
+    };
+    let selected_runs = env::var("CAS_E2E_PILOT_RUNS").unwrap_or_else(|_| "PAIR".to_owned());
+    let (run_off, run_on) = match selected_runs.as_str() {
+        "PAIR" => (true, true),
+        "OFF" => (true, false),
+        "ON" => (false, true),
+        _ => {
+            return Err(Rc1Failure::new(
+                "E2E_CONFIGURATION_INVALID",
+                format!("CAS_E2E_PILOT_RUNS 仅支持 PAIR/OFF/ON，实际为 {selected_runs}"),
+            ));
+        }
+    };
+    let off_workspace = benchmark_root.join("OFF-01");
+    let on_workspace = benchmark_root.join("ON-01");
+    if (run_off && off_workspace.exists()) || (run_on && on_workspace.exists()) {
+        return Err(Rc1Failure::new(
+            "BENCHMARK_RUN_EXISTS",
+            format!("基准目录禁止覆盖：{}", benchmark_root.display()),
+        ));
+    }
+    if run_off {
+        copy_directory(&benchmark_template, &off_workspace)?;
+    }
+    if run_on {
+        copy_directory(&benchmark_template, &on_workspace)?;
+    }
+    let configuration = ConfigurationService::for_e2e(
+        database_path.clone(),
+        data_home.clone(),
+        codex_home.clone(),
+        helper_path.clone(),
+    );
+    let timeout_seconds = env::var("CAS_E2E_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 30)
+        .unwrap_or(300);
+    let timeout = Duration::from_secs(timeout_seconds);
+    let executable =
+        PathBuf::from(env::var("CAS_E2E_CODEX_EXECUTABLE").unwrap_or_else(|_| "codex".to_owned()));
+
+    let outcome = (|| {
+        let off = if run_off {
+            let default_request: RuntimeModeSwitchRequest = stage(
+                serde_json::from_value(json!({ "activeAgentIds": [] })),
+                "CONFIGURATION_REQUEST_FAILED",
+            )?;
+            stage(
+                configuration.switch_runtime_mode(default_request),
+                "DEFAULT_MODE_APPLY_FAILED",
+            )?;
+            if qualified {
+                run_qualified_benchmark_mode(
+                    "OFF-01",
+                    &off_workspace,
+                    &database_path,
+                    &data_home,
+                    &helper_path,
+                    &codex_home,
+                    &executable,
+                    &agent,
+                    primary_model.as_deref(),
+                    primary_reasoning.as_deref(),
+                    &prompt_1a,
+                    timeout,
+                )?
+            } else {
+                run_benchmark_mode(
+                    "OFF-01",
+                    &off_workspace,
+                    &database_path,
+                    &data_home,
+                    &helper_path,
+                    &codex_home,
+                    &executable,
+                    &agent,
+                    primary_model.as_deref(),
+                    primary_reasoning.as_deref(),
+                    &prompt_1a,
+                    &prompt_1b,
+                    timeout,
+                )?
+            }
+        } else {
+            Value::Null
+        };
+
+        let (on, thin_entry_verified, thin_entry) = if run_on {
+            let agent_request: RuntimeModeSwitchRequest = stage(
+                serde_json::from_value(json!({ "activeAgentIds": [agent.id.clone()] })),
+                "CONFIGURATION_REQUEST_FAILED",
+            )?;
+            stage(
+                configuration.switch_runtime_mode(agent_request),
+                "AGENT_MODE_APPLY_FAILED",
+            )?;
+            let rules_path = codex_home.join("cas/CAS_ORCHESTRATION.md");
+            let rules = stage(
+                fs::read_to_string(&rules_path),
+                "ORCHESTRATION_RULES_READ_FAILED",
+            )?;
+            let config = stage(
+                fs::read_to_string(codex_home.join("config.toml")),
+                "AGENT_MODE_CONFIG_READ_FAILED",
+            )?;
+            let global_path = ["AGENTS.override.md", "AGENTS.md"]
+                .into_iter()
+                .map(|name| codex_home.join(name))
+                .find(|path| path.is_file())
+                .ok_or_else(|| {
+                    Rc1Failure::new(
+                        "GLOBAL_INSTRUCTIONS_MISSING",
+                        "Agent Apply 后没有找到全局兼容入口",
+                    )
+                })?;
+            stage(
+                fs::remove_file(&global_path),
+                "GLOBAL_INSTRUCTIONS_REMOVE_FAILED",
+            )?;
+            let verified = config.contains(ORCHESTRATION_RUNTIME_CONTRACT)
+                && config.contains("CAS_ORCHESTRATION.md")
+                && !config.contains("H job-plan")
+                && rules.contains("H job-plan")
+                && !global_path.exists();
+            let evidence = json!({
+                "verified": verified,
+                "configContainsShortBootstrap": config.contains(ORCHESTRATION_RUNTIME_CONTRACT)
+                    && config.contains("CAS_ORCHESTRATION.md") && !config.contains("H job-schedule"),
+                "standaloneRulesContainProtocol": rules.contains("H job-schedule"),
+                "globalAgentsFallbackRemoved": !global_path.exists(),
+                "rulesPath": rules_path,
+                "removedGlobalPath": global_path,
+            });
+            let run = if qualified {
+                run_qualified_benchmark_mode(
+                    "ON-01",
+                    &on_workspace,
+                    &database_path,
+                    &data_home,
+                    &helper_path,
+                    &codex_home,
+                    &executable,
+                    &agent,
+                    primary_model.as_deref(),
+                    primary_reasoning.as_deref(),
+                    &prompt_1a,
+                    timeout,
+                )?
+            } else {
+                run_benchmark_mode(
+                    "ON-01",
+                    &on_workspace,
+                    &database_path,
+                    &data_home,
+                    &helper_path,
+                    &codex_home,
+                    &executable,
+                    &agent,
+                    primary_model.as_deref(),
+                    primary_reasoning.as_deref(),
+                    &prompt_1a,
+                    &prompt_1b,
+                    timeout,
+                )?
+            };
+            (run, verified, evidence)
+        } else {
+            (Value::Null, true, json!({ "skipped": true }))
+        };
+
+        let off_success = !run_off
+            || (qualified
+                && off
+                    .pointer("/taskQualified/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && off
+                    .pointer("/scopeIntegrity/onlyRangesFileChanged")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && off.pointer("/runtime/childCount").and_then(Value::as_i64) == Some(0))
+            || (!qualified
+                && off
+                    .pointer("/task1A/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && off
+                    .pointer("/task1B/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && off
+                    .pointer("/scopeIntegrity/onlyRangesFileChanged")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && off.pointer("/runtime/childCount").and_then(Value::as_i64) == Some(0));
+        let on_success = !run_on
+            || (qualified
+                && on
+                    .pointer("/taskQualified/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && on
+                    .pointer("/scopeIntegrity/onlyRangesFileChanged")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && on.pointer("/runtime/childCount").and_then(Value::as_i64) == Some(1)
+                && on
+                    .pointer("/runtime/completedJobCount")
+                    .and_then(Value::as_i64)
+                    == Some(1)
+                && on
+                    .pointer("/runtime/reviewCount")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|count| count >= 1)
+                && on
+                    .pointer("/childThreadId")
+                    .and_then(Value::as_str)
+                    .is_some())
+            || (!qualified
+                && on
+                    .pointer("/task1A/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && on
+                    .pointer("/task1B/acceptance/passed")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && on
+                    .pointer("/scopeIntegrity/onlyRangesFileChanged")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+                && on.pointer("/runtime/childCount").and_then(Value::as_i64) == Some(0)
+                && on.pointer("/runtime/jobCount").and_then(Value::as_i64) == Some(0));
+        let off_evidence_complete = !run_off
+            || off
+                .pointer(if qualified {
+                    "/taskQualified/primaryTokens"
+                } else {
+                    "/task1B/primaryTokensFinal"
+                })
+                .is_some_and(|value| !value.is_null());
+        let on_evidence_complete = !run_on
+            || on
+                .pointer(if qualified {
+                    "/taskQualified/primaryTokens"
+                } else {
+                    "/task1B/primaryTokensFinal"
+                })
+                .is_some_and(|value| !value.is_null());
+        let evidence_complete = off_evidence_complete && on_evidence_complete;
+        let status = if off_success && on_success && evidence_complete && thin_entry_verified {
+            "PASS"
+        } else {
+            "FAIL"
+        };
+        Ok(json!({
+            "status": status,
+            "scope": format!("EFFICIENCY_{variant}_PILOT_{selected_runs}"),
+            "conclusionLimit": if qualified {
+                "单个配对样本仅验证本夹具的委派行为与成本，不能外推到全部任务。"
+            } else {
+                "此夹具用于验证小任务不委派；单个配对样本不能证明大任务的委派收益。"
+            },
+            "primaryModel": primary_model,
+            "primaryReasoning": primary_reasoning,
+            "childAgent": {
+                "key": agent.key,
+                "name": agent.name,
+                "model": agent.model,
+                "provider": agent.provider,
+                "reasoningPolicy": agent.reasoning_policy,
+                "modelDefaultReasoning": agent.model_default_reasoning,
+            },
+            "thinEntry": thin_entry,
+            "off": off,
+            "on": on,
+            "checks": {
+                "offSuccessful": off_success,
+                "onSuccessful": on_success,
+                "evidenceComplete": evidence_complete,
+            },
+            "benchmarkRoot": benchmark_root,
+            "isolatedRoot": root,
+            "oneChildLimitInstalled": qualified,
+        }))
+    })();
+    let passed = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("PASS");
+    if passed && !qualified {
+        drop(cleanup);
+    } else {
+        std::mem::forget(cleanup);
+    }
+    outcome
 }
 
 fn timeout_evidence(database_path: &Path, parent_thread_id: &str) -> String {
@@ -1635,6 +2783,20 @@ fn managed_session_rc1_spawn_bind_idle_reuse() {
 #[ignore = "requires a configured CAS database, Codex login and a real provider"]
 fn managed_session_rc2_scheduling_matrix() {
     run_e2e_test(true, "CAS_RC2_RESULT");
+}
+
+#[test]
+#[ignore = "requires Codex login and runs the real OFF-01/ON-01 efficiency pair"]
+fn managed_session_efficiency_pair_off01_on01() {
+    let outcome = run_efficiency_pair();
+    let passed = outcome
+        .as_ref()
+        .ok()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        == Some("PASS");
+    write_e2e_result(outcome, "CAS_EFFICIENCY_PAIR_RESULT");
+    assert!(passed, "效率配对 Pilot 未通过；请检查结构化证据 JSON");
 }
 
 fn managed_task_packet(

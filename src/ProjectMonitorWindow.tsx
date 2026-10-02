@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   focusMainWindow,
@@ -361,9 +362,29 @@ export function ProjectMonitorWindow() {
   }, [pinned]);
 
   useEffect(() => {
-    void load();
-    const timer = window.setInterval(() => void load(true), 3_000);
-    return () => window.clearInterval(timer);
+    const monitorWindow = getCurrentWindow();
+    let inFlight = true;
+    void load().finally(() => {
+      inFlight = false;
+    });
+    const refreshVisible = async () => {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        if (await monitorWindow.isVisible()) await load(true);
+      } catch {
+        // 关闭中的窗口可能无法查询可见性；下一轮重试。
+      } finally {
+        inFlight = false;
+      }
+    };
+    const timer = window.setInterval(() => void refreshVisible(), 3_000);
+    const refreshOnFocus = () => void refreshVisible();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshOnFocus);
+    };
   }, [load]);
 
   const selectedProject = snapshot?.projects.find((project) => projectKey(project) === selectedKey) ?? null;

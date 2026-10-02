@@ -1,4 +1,6 @@
 mod agent;
+pub mod chat_compat;
+mod chat_gateway;
 mod codex_config;
 mod codex_environment;
 mod codex_hooks;
@@ -17,9 +19,11 @@ mod provider;
 mod runtime_adapter;
 mod runtime_bridge;
 mod settings;
+pub mod storage;
 mod usage;
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -35,11 +39,11 @@ use codex_hooks::RuntimeHookStatusResponse;
 use configuration::{
     CodexMcpServerResponse, ConfigurationApplyPreview, ConfigurationApplyRequest,
     ConfigurationApplyResponse, ConfigurationService, ConfigurationStatus,
-    ConfigurationStatusResponse, DiagnosticsResponse, DiagnosticsRunRequest,
-    ProjectExclusionAddRequest, ProjectExclusionDeleteRequest, ProjectExclusionResponse,
-    RuntimeModeConflictResolveRequest, RuntimeModeResponse, RuntimeModeSwitchRequest,
-    SnapshotDetailResponse, SnapshotGetRequest, SnapshotListRequest, SnapshotListResponse,
-    SnapshotRestoreRequest, SnapshotRestoreResponse,
+    ConfigurationStatusResponse, DiagnosticsResponse, DiagnosticsRunRequest, OrphanCleanupPreview,
+    OrphanCleanupRequest, OrphanCleanupResponse, ProjectExclusionAddRequest,
+    ProjectExclusionDeleteRequest, ProjectExclusionResponse, RuntimeModeConflictResolveRequest,
+    RuntimeModeResponse, RuntimeModeSwitchRequest, SnapshotDetailResponse, SnapshotGetRequest,
+    SnapshotListRequest, SnapshotListResponse, SnapshotRestoreRequest, SnapshotRestoreResponse,
 };
 use delivery_receipt::DeliveryReceiptRepository;
 use model::{
@@ -88,6 +92,9 @@ struct NativeObserverService {
 struct NativeObserverState {
     source_path: Option<String>,
     last_success_at: Option<String>,
+    codex_home: Option<String>,
+    last_completed_at: Option<Instant>,
+    last_response: Option<NativeSubagentSyncResponse>,
 }
 
 impl NativeObserverService {
@@ -96,12 +103,52 @@ impl NativeObserverService {
         usage: &UsageService,
         configuration: &ConfigurationService,
     ) -> Result<NativeSubagentSyncResponse, ApiError> {
+        let requested_at = Instant::now();
         let attempted_at = usage.current_timestamp().map_err(ApiError::from)?;
-        let response = sync_native_subagents_once(usage, configuration)?;
+        let environment = configuration.environment();
+        let codex_home = environment
+            .as_ref()
+            .ok()
+            .and_then(|environment| environment.codex_home.clone());
+        self.sync_requested(requested_at, attempted_at, codex_home.clone(), || {
+            Ok(match environment {
+                Ok(environment) => match environment.codex_home {
+                    Some(codex_home) => {
+                        usage.sync_native_subagents(std::path::Path::new(&codex_home))?
+                    }
+                    None => NativeSubagentSyncResponse::unavailable(
+                        "无法定位 CODEX_HOME；尚不能同步 Primary 原生子 Agent。",
+                    ),
+                },
+                Err(_) => NativeSubagentSyncResponse::unavailable(
+                    "读取 Codex 环境失败；尚不能同步 Primary 原生子 Agent。",
+                ),
+            })
+        })
+    }
+
+    fn sync_requested(
+        &self,
+        requested_at: Instant,
+        attempted_at: String,
+        codex_home: Option<String>,
+        run: impl FnOnce() -> Result<NativeSubagentSyncResponse, ApiError>,
+    ) -> Result<NativeSubagentSyncResponse, ApiError> {
         let mut observer = self
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if codex_home.is_some()
+            && observer.codex_home == codex_home
+            && observer
+                .last_completed_at
+                .is_some_and(|completed_at| requested_at <= completed_at)
+        {
+            if let Some(response) = &observer.last_response {
+                return Ok(response.clone());
+            }
+        }
+        let response = run()?;
         let source_path = response.source_path().map(str::to_owned);
         if observer.source_path != source_path {
             observer.source_path = source_path;
@@ -110,7 +157,12 @@ impl NativeObserverService {
         if response.is_supported() {
             observer.last_success_at = Some(attempted_at.clone());
         }
-        Ok(response.with_observer_timestamps(attempted_at, observer.last_success_at.clone()))
+        let response =
+            response.with_observer_timestamps(attempted_at, observer.last_success_at.clone());
+        observer.codex_home = codex_home;
+        observer.last_completed_at = Some(Instant::now());
+        observer.last_response = Some(response.clone());
+        Ok(response)
     }
 }
 
@@ -408,6 +460,21 @@ fn configuration_apply(
 }
 
 #[tauri::command]
+fn configuration_orphan_cleanup_preview(
+    state: tauri::State<'_, ConfigurationService>,
+) -> Result<OrphanCleanupPreview, ApiError> {
+    state.preview_orphan_cleanup().map_err(ApiError::from)
+}
+
+#[tauri::command]
+fn configuration_orphan_cleanup_apply(
+    state: tauri::State<'_, ConfigurationService>,
+    request: OrphanCleanupRequest,
+) -> Result<OrphanCleanupResponse, ApiError> {
+    state.apply_orphan_cleanup(request).map_err(ApiError::from)
+}
+
+#[tauri::command]
 fn runtime_mode_get(
     state: tauri::State<'_, ConfigurationService>,
 ) -> Result<RuntimeModeResponse, ApiError> {
@@ -643,23 +710,6 @@ fn project_monitor_window_error() -> ApiError {
     )
 }
 
-fn sync_native_subagents_once(
-    state: &UsageService,
-    configuration: &ConfigurationService,
-) -> Result<NativeSubagentSyncResponse, ApiError> {
-    Ok(match configuration.environment() {
-        Ok(environment) => match environment.codex_home {
-            Some(codex_home) => state.sync_native_subagents(std::path::Path::new(&codex_home))?,
-            None => NativeSubagentSyncResponse::unavailable(
-                "无法定位 CODEX_HOME；尚不能同步 Primary 原生子 Agent。",
-            ),
-        },
-        Err(_) => NativeSubagentSyncResponse::unavailable(
-            "读取 Codex 环境失败；尚不能同步 Primary 原生子 Agent。",
-        ),
-    })
-}
-
 #[tauri::command]
 fn agent_thread_instance_set_workspace_scope(
     state: tauri::State<'_, UsageService>,
@@ -869,9 +919,15 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let data_home = app.path().app_local_data_dir()?;
+            let data_home = storage::prepare_data_home(
+                &app.path().home_dir()?,
+                &app.config().identifier,
+                &[app.path().app_local_data_dir()?, app.path().app_data_dir()?],
+            )?;
             let database_path = data_home.join("cas.db");
+            eprintln!("CAS 数据文件：{}", database_path.display());
             app.manage(ProviderService::open(&database_path)?);
+            chat_gateway::start(database_path.clone())?;
             app.manage(ModelService::open(&database_path)?);
             app.manage(AgentService::open(&database_path)?);
             app.manage(UsageService::open(&database_path)?);
@@ -921,6 +977,8 @@ pub fn run() {
             configuration_get_status,
             configuration_preview_apply,
             configuration_apply,
+            configuration_orphan_cleanup_preview,
+            configuration_orphan_cleanup_apply,
             runtime_mode_get,
             runtime_mode_switch,
             runtime_mode_resolve_conflict,
@@ -966,4 +1024,54 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Agent Switch");
+}
+
+#[cfg(test)]
+mod native_observer_tests {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn overlapping_native_sync_reuses_result_only_for_same_codex_home() {
+        let observer = NativeObserverService::default();
+        let runs = Cell::new(0);
+        let requested_at = Instant::now();
+        let run = |message| {
+            runs.set(runs.get() + 1);
+            Ok(NativeSubagentSyncResponse::unavailable(message))
+        };
+
+        let first = observer
+            .sync_requested(requested_at, "first".into(), Some("home-a".into()), || {
+                run("first")
+            })
+            .unwrap();
+        let overlapping = observer
+            .sync_requested(requested_at, "second".into(), Some("home-a".into()), || {
+                run("must not run")
+            })
+            .unwrap();
+        assert_eq!(overlapping, first);
+        assert_eq!(runs.get(), 1);
+
+        let later = observer
+            .sync_requested(
+                requested_at + Duration::from_secs(1),
+                "third".into(),
+                Some("home-a".into()),
+                || run("later"),
+            )
+            .unwrap();
+        assert_ne!(later, first);
+        assert_eq!(runs.get(), 2);
+
+        observer
+            .sync_requested(requested_at, "fourth".into(), Some("home-b".into()), || {
+                run("different home")
+            })
+            .unwrap();
+        assert_eq!(runs.get(), 3);
+    }
 }

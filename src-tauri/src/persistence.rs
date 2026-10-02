@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, TransactionBehavior, params};
 
-const LATEST_SCHEMA_VERSION: i64 = 40;
+const LATEST_SCHEMA_VERSION: i64 = 43;
 const MIGRATIONS: &[(i64, &str, &str)] = &[
     (
         1,
@@ -199,6 +199,21 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "cached_input_provenance",
         include_str!("../migrations/0040_cached_input_provenance.sql"),
     ),
+    (
+        41,
+        "cas_slim_prompt",
+        include_str!("../migrations/0041_cas_slim_prompt.sql"),
+    ),
+    (
+        42,
+        "chat_completions_provider",
+        include_str!("../migrations/0042_chat_completions_provider.sql"),
+    ),
+    (
+        43,
+        "gpt6_native_models",
+        include_str!("../migrations/0043_gpt6_native_models.sql"),
+    ),
 ];
 
 pub(crate) fn open_database(path: &Path) -> Result<Connection, PersistenceError> {
@@ -215,8 +230,26 @@ pub(crate) fn open_in_memory() -> Result<Connection, PersistenceError> {
 
 fn initialize(mut connection: Connection) -> Result<Connection, PersistenceError> {
     connection.pragma_update(None, "foreign_keys", true)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.busy_timeout(Duration::from_secs(5))?;
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    let has_migrations: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_migrations {
+        let current: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if current > LATEST_SCHEMA_VERSION {
+            return Err(PersistenceError::SchemaTooNew);
+        }
+        if current == LATEST_SCHEMA_VERSION {
+            return Ok(connection);
+        }
+    }
     apply_migrations(&mut connection, MIGRATIONS)?;
     Ok(connection)
 }
@@ -224,6 +257,22 @@ fn initialize(mut connection: Connection) -> Result<Connection, PersistenceError
 fn apply_migrations(
     connection: &mut Connection,
     migrations: &[(i64, &str, &str)],
+) -> Result<(), PersistenceError> {
+    let rebuilds_providers = migrations.iter().any(|(version, _, _)| *version == 42);
+    if rebuilds_providers {
+        connection.pragma_update(None, "foreign_keys", false)?;
+    }
+    let result = apply_migrations_transaction(connection, migrations, rebuilds_providers);
+    if rebuilds_providers {
+        connection.pragma_update(None, "foreign_keys", true)?;
+    }
+    result
+}
+
+fn apply_migrations_transaction(
+    connection: &mut Connection,
+    migrations: &[(i64, &str, &str)],
+    check_foreign_keys: bool,
 ) -> Result<(), PersistenceError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -248,6 +297,9 @@ fn apply_migrations(
         .filter(|(version, _, _)| *version > current)
     {
         transaction.execute_batch(sql)?;
+        if *version == 43 {
+            crate::model::backfill_native_gpt6_models(&transaction)?;
+        }
         transaction.execute(
             "INSERT INTO schema_migrations (version, name, applied_at)
              VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
@@ -255,6 +307,15 @@ fn apply_migrations(
         )?;
     }
 
+    if check_foreign_keys {
+        let violations: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            return Err(PersistenceError::ForeignKeyViolation);
+        }
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -262,6 +323,7 @@ fn apply_migrations(
 #[derive(Debug)]
 pub(crate) enum PersistenceError {
     SchemaTooNew,
+    ForeignKeyViolation,
     Unavailable,
     Sqlite(rusqlite::Error),
 }
@@ -270,6 +332,7 @@ impl fmt::Display for PersistenceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SchemaTooNew => formatter.write_str("database schema is too new"),
+            Self::ForeignKeyViolation => formatter.write_str("migration violates foreign keys"),
             Self::Unavailable => formatter.write_str("database unavailable"),
             Self::Sqlite(_) => formatter.write_str("sqlite operation failed"),
         }
@@ -296,6 +359,277 @@ mod tests {
     use rusqlite::{OptionalExtension, params};
 
     use super::*;
+
+    #[test]
+    fn provider_models_and_agent_binding_survive_disk_reopen() {
+        use crate::agent::{AgentListRequest, AgentService};
+        use crate::model::{ModelListRequest, ModelService};
+        use crate::provider::{ProviderListRequest, ProviderService};
+        use serde_json::{json, to_value};
+
+        let path = std::env::temp_dir().join(format!("cas-restart-{}.db", uuid::Uuid::new_v4()));
+        let expected = {
+            let providers = ProviderService::open(&path).unwrap();
+            let models = ModelService::open(&path).unwrap();
+            let agents = AgentService::open(&path).unwrap();
+            providers
+                .create(
+                    serde_json::from_value(json!({
+                        "providerKey": "restart-native",
+                        "name": "重启测试供应商",
+                        "presetId": "codex-native",
+                        "baseUrl": "https://api.openai.com/v1/",
+                        "protocol": "RESPONSES",
+                        "auth": { "strategy": "NONE" },
+                        "enabled": true
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let catalog = to_value(models.list(ModelListRequest::default()).unwrap()).unwrap();
+            assert_eq!(catalog.as_array().unwrap().len(), 6);
+            let model = catalog
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["modelId"] == "gpt-6-luna")
+                .unwrap();
+            let agent = to_value(
+                agents
+                    .create(
+                        serde_json::from_value(json!({
+                            "agentKey": "restart-worker",
+                            "name": "重启测试 Agent",
+                            "description": "验证落盘和绑定",
+                            "instruction": "仅执行指定任务",
+                            "enabled": true,
+                            "sandboxPolicy": "WORKSPACE_WRITE",
+                            "reasoningPolicy": "MEDIUM",
+                            "modelId": model["id"],
+                            "roleKey": "restart-worker",
+                            "orchestrationPhase": "EXECUTION"
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(agent["modelBinding"]["modelId"], "gpt-6-luna");
+            (
+                to_value(providers.list(ProviderListRequest::default()).unwrap()).unwrap(),
+                catalog,
+                to_value(agents.list(AgentListRequest::default()).unwrap()).unwrap(),
+            )
+        };
+        // 关闭全部服务连接后再打开，不能用同一连接的缓存证明持久化。
+        for _ in 0..2 {
+            let providers = ProviderService::open(&path).unwrap();
+            let models = ModelService::open(&path).unwrap();
+            let agents = AgentService::open(&path).unwrap();
+            assert_eq!(
+                (
+                    to_value(providers.list(ProviderListRequest::default()).unwrap()).unwrap(),
+                    to_value(models.list(ModelListRequest::default()).unwrap()).unwrap(),
+                    to_value(agents.list(AgentListRequest::default()).unwrap()).unwrap(),
+                ),
+                expected
+            );
+        }
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn gpt6_catalog_upgrade_preserves_existing_models_and_bindings() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        let legacy_migrations = MIGRATIONS
+            .iter()
+            .copied()
+            .filter(|(version, _, _)| *version < 42)
+            .collect::<Vec<_>>();
+        apply_migrations(&mut connection, &legacy_migrations).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO providers (
+                id, provider_key, name, provider_type, base_url, protocol, auth_type,
+                enabled, source, preset_id, created_at, updated_at
+             ) VALUES
+                ('native-one', 'native-one', 'Native One', 'PRESET',
+                 'https://api.openai.com/v1', 'RESPONSES', 'BEARER_TOKEN', 1,
+                 'BUILT_IN', 'codex-native', 'before-upgrade', 'before-upgrade'),
+                ('native-two', 'native-two', 'Native Two', 'PRESET',
+                 'https://api.openai.com/v1', 'RESPONSES', 'BEARER_TOKEN', 1,
+                 'BUILT_IN', 'codex-native', 'before-upgrade', 'before-upgrade'),
+                ('custom', 'custom', 'Custom', 'CUSTOM',
+                 'https://custom.example/v1', 'RESPONSES', 'BEARER_TOKEN', 1,
+                 'USER', NULL, 'before-upgrade', 'before-upgrade');
+             INSERT INTO models (
+                id, provider_id, model_id, display_name, enabled, source, created_at, updated_at
+             ) VALUES
+                ('legacy-model', 'native-one', 'gpt-5.6-luna', '旧模型别名', 0, 'PRESET',
+                 'before-upgrade', 'before-upgrade'),
+                ('existing-sol', 'native-one', 'gpt-6-sol', '自定义 Sol 别名', 0, 'USER',
+                 'before-upgrade', 'before-upgrade');
+             INSERT INTO agents (
+                id, agent_key, name, description, instruction, agent_type, enabled,
+                sandbox_policy, reasoning_policy, source, managed, created_at, updated_at
+             ) VALUES (
+                'agent-legacy', 'legacy', 'Legacy', 'test', 'test', 'CUSTOM', 1,
+                'WORKSPACE_WRITE', 'MEDIUM', 'USER', 1, 'before-upgrade', 'before-upgrade'
+             );
+             INSERT INTO agent_model_bindings (
+                id, agent_id, model_id, enabled, source, created_at, updated_at
+             ) VALUES (
+                'legacy-binding', 'agent-legacy', 'legacy-model', 1, 'USER',
+                'before-upgrade', 'before-upgrade'
+             );",
+            )
+            .unwrap();
+        let existing = |connection: &Connection| {
+            let mut statement = connection
+                .prepare(
+                    "SELECT id, display_name, enabled, updated_at FROM models
+                     WHERE id IN ('legacy-model', 'existing-sol') ORDER BY id",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = existing(&connection);
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        assert_eq!(existing(&connection), before);
+        for provider_id in ["native-one", "native-two"] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM models WHERE provider_id = ?1 AND model_id IN
+                     ('gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra')",
+                    [provider_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 3);
+        }
+        let custom_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM models WHERE provider_id = 'custom'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(custom_count, 0);
+        let bound_model: String = connection
+            .query_row(
+                "SELECT model_id FROM agent_model_bindings WHERE id = 'legacy-binding'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bound_model, "legacy-model");
+        let efforts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM model_reasoning_efforts r JOIN models m ON m.id = r.model_id
+                 WHERE m.provider_id = 'native-two' AND m.model_id = 'gpt-6-astra'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(efforts, 6);
+        let capability: String = connection
+            .query_row(
+                "SELECT c.status FROM model_capabilities c JOIN models m ON m.id = c.model_id
+                 WHERE m.provider_id = 'native-two' AND m.model_id = 'gpt-6-luna'
+                   AND c.capability = 'TOOL_CALLING'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capability, "SUPPORTED");
+
+        // 目录只在升级时补齐，之后用户删除的内置项不能在每次启动时被重新创建。
+        connection
+            .execute(
+                "DELETE FROM models WHERE provider_id = 'native-two' AND model_id = 'gpt-6-luna'",
+                [],
+            )
+            .unwrap();
+        let connection = initialize(connection).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM models WHERE provider_id = 'native-two' AND model_id = 'gpt-6-luna'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn opening_current_schema_does_not_require_writer_lock() {
+        let path =
+            std::env::temp_dir().join(format!("cas-persistence-{}.db", uuid::Uuid::new_v4()));
+        drop(open_database(&path).unwrap());
+
+        let mut writer = Connection::open(&path).unwrap();
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let opened = open_database(&path);
+        drop(lock);
+        drop(writer);
+
+        let success = opened.is_ok();
+        drop(opened);
+        std::fs::remove_file(path).unwrap();
+        assert!(success, "已是最新 Schema 的连接不应等待写锁");
+    }
+
+    #[test]
+    fn opening_old_schema_still_applies_pending_migrations() {
+        let path =
+            std::env::temp_dir().join(format!("cas-persistence-{}.db", uuid::Uuid::new_v4()));
+        let mut connection = Connection::open(&path).unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..40]).unwrap();
+        drop(connection);
+
+        let connection = open_database(&path).unwrap();
+        let version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        drop(connection);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_newer_schema_still_rejects_it() {
+        let path =
+            std::env::temp_dir().join(format!("cas-persistence-{}.db", uuid::Uuid::new_v4()));
+        let connection = open_database(&path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES (?1, 'future', '2026-01-01T00:00:00Z')",
+                [LATEST_SCHEMA_VERSION + 1],
+            )
+            .unwrap();
+        drop(connection);
+
+        let rejected = matches!(open_database(&path), Err(PersistenceError::SchemaTooNew));
+        std::fs::remove_file(path).unwrap();
+        assert!(rejected);
+    }
 
     #[test]
     fn migration_is_transactional_and_rejects_newer_schema() {
@@ -329,6 +663,72 @@ mod tests {
     }
 
     #[test]
+    fn cas_slim_migration_retires_ponytail_and_merges_old_bindings() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        apply_migrations(&mut connection, &MIGRATIONS[..40]).unwrap();
+        for id in ["agent-1", "agent-2", "agent-3"] {
+            connection
+                .execute(
+                    "INSERT INTO agents (
+                    id, agent_key, name, description, instruction, agent_type,
+                    sandbox_policy, reasoning_policy, source, created_at, updated_at
+                 ) VALUES (?1, ?1, ?1, '', '', 'CUSTOM', 'READ_ONLY', 'MEDIUM', 'CAS',
+                    '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+                    [id],
+                )
+                .unwrap();
+        }
+        for (agent_id, skill_key) in [
+            ("agent-1", "caveman-slim"),
+            ("agent-1", "ponytail-slim"),
+            ("agent-1", "ponytail"),
+            ("agent-2", "caveman"),
+            ("agent-2", "ponytail"),
+            ("agent-3", "caveman"),
+            ("agent-3", "ponytail-slim"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO agent_skill_bindings (agent_id, skill_key) VALUES (?1, ?2)",
+                    params![agent_id, skill_key],
+                )
+                .unwrap();
+        }
+
+        apply_migrations(&mut connection, MIGRATIONS).unwrap();
+        let bindings = connection
+            .prepare(
+                "SELECT agent_id, skill_key FROM agent_skill_bindings ORDER BY agent_id, skill_key",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            bindings,
+            vec![
+                ("agent-1".to_owned(), "cas-slim".to_owned()),
+                ("agent-2".to_owned(), "caveman".to_owned()),
+                ("agent-3".to_owned(), "caveman".to_owned()),
+            ]
+        );
+        assert!(
+            connection
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'primary_prompt_injections'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn execution_kind_migration_supports_fresh_and_0033_upgrade() {
         let mut fresh = Connection::open_in_memory().unwrap();
         apply_migrations(&mut fresh, MIGRATIONS).unwrap();
@@ -340,7 +740,7 @@ mod tests {
                     |row| { row.get::<_, i64>(0) }
                 )
                 .unwrap(),
-            40
+            LATEST_SCHEMA_VERSION
         );
         assert!(
             fresh
@@ -389,7 +789,7 @@ mod tests {
                     |row| { row.get::<_, i64>(0) }
                 )
                 .unwrap(),
-            40
+            LATEST_SCHEMA_VERSION
         );
         assert_eq!(
             upgraded
@@ -423,7 +823,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            40
+            LATEST_SCHEMA_VERSION
         );
         assert!(
             fresh
@@ -449,7 +849,7 @@ mod tests {
                     |row| row.get::<_, i64>(0),
                 )
                 .unwrap(),
-            40
+            LATEST_SCHEMA_VERSION
         );
         assert!(
             upgraded

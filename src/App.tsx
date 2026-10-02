@@ -12,6 +12,7 @@ import { createPortal } from "react-dom";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
+  applyOrphanCleanup,
   addProjectExclusion,
   addModel,
   cleanupAgentThreadInstances,
@@ -46,6 +47,7 @@ import {
   listUsageRecords,
   orchestrationDiagnosticsExport,
   openProjectMonitor,
+  previewOrphanCleanup,
   recommendAgentThreadInstance,
   redetectCodex,
   recoverUsageMonitor,
@@ -67,6 +69,7 @@ import {
   updateProvider,
   type Appearance,
   type AgentDetailResponse,
+  type AgentModelReference,
   type AgentMcpToolPolicy,
   type AgentMcpToolPolicyMode,
   type AgentPresetResponse,
@@ -84,10 +87,12 @@ import {
   type ConfigurationStatusResponse,
   type ConfigurationConflictResponse,
   type DiagnosticsResponse,
+  type OrphanCleanupPreview,
   type ModelSummary,
   type NativeSubagentSyncResponse,
   type OrchestrationPhase,
   type ProviderCreateRequest,
+  type ProviderProtocol,
   type ProviderCacheRetentionType,
   type ProviderCacheSupport,
   type ProviderDetailResponse,
@@ -491,7 +496,7 @@ export function App() {
       .catch((reason: unknown) => setError(errorMessage(reason)));
   }, []);
 
-  useVisiblePolling(refreshNativeObserver, 5_000);
+  useVisiblePolling(refreshNativeObserver, 30_000);
   useVisiblePolling(refreshRuntimeBridge, 5_000);
 
   useEffect(() => {
@@ -968,7 +973,7 @@ function OverviewPage({
     || (selectedAgents.length > 0 && selectedAgents.every((agent) => agent.availability === "READY"));
   const alreadySynchronized = sameMode && configuration?.status === "APPLIED";
   const runtimeUsesSubagents = currentAgentIds.length > 0 || Boolean(runtimeMode?.legacyActiveAgentId);
-  const runtimeHooksNeedResync = runtimeUsesSubagents
+  const runtimeHooksNeedResync = selectedMode === "SUBAGENT" && sameMode && runtimeUsesSubagents
     && ["NOT_INSTALLED", "INCOMPLETE"].includes(runtimeHookStatus?.status ?? "");
   const restartPending = runtimeUsesSubagents && Boolean(configuration?.restartRecommended);
   const hasExecutionAgent = selectedAgents.some((agent) => agent.orchestrationPhase === "EXECUTION");
@@ -1565,13 +1570,16 @@ function RuntimeHookReviewDialog({
 
         {canReviewInCodex ? (
           <ol className="runtime-hook-review-steps">
-            <li>完全退出所有 Codex 窗口和 CLI 会话，再重新启动 Codex。</li>
+            <li>完全退出并重新启动 Codex Desktop，让新写入的 Hook 配置被加载。</li>
             <li>
-              在新任务中输入 <code>/hooks</code>，找到命令包含{" "}
+              打开 Codex Desktop 的“设置 → Hooks”，找到命令包含{" "}
               <code>cas-runtime-enforcement-v1</code> 的 CAS Hook。
             </li>
-            <li>核对命令指向当前 CAS 安装的 cas-helper 后，只信任这些 CAS Hook。</li>
-            <li>回到这里点击“重新核验”；全部项目显示已启用且受信任后，再新建正式任务。</li>
+            <li>
+              核对命令指向当前 CAS 安装的 cas-helper 后，只信任这些 CAS Hook。若没有桌面审核入口，
+              可在 Codex CLI 使用 <code>/hooks</code>；不要在 Desktop 聊天框输入该命令。
+            </li>
+            <li>回到 CAS 点击“重新核验”；全部项目显示已启用且受信任后，再新建正式任务。</li>
           </ol>
         ) : (
           <div className="orchestration-warning" role="note">
@@ -1706,18 +1714,45 @@ function AgentConfigurationDialog({
 
 function DiagnosticsPage() {
   const [result, setResult] = useState<DiagnosticsResponse | null>(null);
+  const [orphanPreview, setOrphanPreview] = useState<OrphanCleanupPreview | null>(null);
   const [running, setRunning] = useState(false);
+  const [cleaning, setCleaning] = useState(false);
+  const [cleanupConfirmed, setCleanupConfirmed] = useState(false);
+  const [cleanupSuccess, setCleanupSuccess] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   async function run() {
     setRunning(true);
     setError(null);
+    setCleanupConfirmed(false);
     try {
       setResult(await runDiagnostics(false));
+      try {
+        setOrphanPreview(await previewOrphanCleanup());
+      } catch {
+        setOrphanPreview(null);
+      }
     } catch (reason: unknown) {
+      setResult(null);
+      setOrphanPreview(null);
       setError(errorMessage(reason));
     } finally {
       setRunning(false);
+    }
+  }
+
+  async function cleanOrphans() {
+    if (!orphanPreview || !cleanupConfirmed) return;
+    setCleaning(true);
+    setError(null);
+    try {
+      const response = await applyOrphanCleanup(orphanPreview.fingerprint);
+      setCleanupSuccess(`已清理 ${response.cleanedCount} 项，恢复 Snapshot：${response.snapshotId ?? "无"}。请重启 Codex 或新建任务核对生效状态。`);
+      await run();
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setCleaning(false);
     }
   }
 
@@ -1735,6 +1770,7 @@ function DiagnosticsPage() {
       </header>
 
       {error && <div className="inline-error">{error}</div>}
+      {cleanupSuccess && <div className="success-banner">{cleanupSuccess}</div>}
 
       {!result && !error && <section className="notice">诊断不会修改数据库或 Codex 文件。</section>}
 
@@ -1754,6 +1790,47 @@ function DiagnosticsPage() {
             />
             <small>{result.checkedAt}</small>
           </div>
+          {orphanPreview && (orphanPreview.items.length > 0 || orphanPreview.warnings.length > 0) && (
+            <article className="diagnostic-section">
+              <h2>CAS 残留清理预览</h2>
+              <p>仅清理识别出 CAS 所有权标记的内容；不回滚缺失基线的权限或多 Agent 设置。执行前会创建恢复 Snapshot。</p>
+              {orphanPreview.items.length > 0 && (
+                <ul>
+                  {orphanPreview.items.map((item) => (
+                    <li key={item.relativePath}>
+                      <div className="diagnostic-issue-copy">
+                        <strong>{item.summary}</strong>
+                        <code>{item.relativePath}</code>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {orphanPreview.warnings.map((warning) => (
+                <p className="inline-error" key={warning}>{warning}</p>
+              ))}
+              {orphanPreview.items.length > 0 && (
+                <>
+                  <label>
+                    <input
+                      checked={cleanupConfirmed}
+                      onChange={(event) => setCleanupConfirmed(event.target.checked)}
+                      type="checkbox"
+                    />
+                    我已核对清理范围，确认移除以上 CAS 残留
+                  </label>
+                  <button
+                    className="secondary-button"
+                    disabled={!cleanupConfirmed || cleaning || running}
+                    onClick={() => void cleanOrphans()}
+                    type="button"
+                  >
+                    {cleaning ? "清理中…" : "确认清理"}
+                  </button>
+                </>
+              )}
+            </article>
+          )}
           {result.sections.map((section) => (
             <article className="diagnostic-section" key={section.key}>
               <h2>{section.title}</h2>
@@ -2953,7 +3030,7 @@ function AgentThreadProjectOverview({
         <div>
           <span className="eyebrow">Subagent Threads</span>
           <h2 id="agent-instance-title">子 Agent 项目</h2>
-          <p>按 Workspace Scope 汇总子 Agent Thread；应用级观察服务每 5 秒同步一次。</p>
+          <p>按 Workspace Scope 汇总子 Agent Thread；当前列表每 5 秒同步一次。</p>
         </div>
         <div className="runtime-monitor-actions">
           {nativeSync && (
@@ -4122,6 +4199,7 @@ function CreateAgentPanel({
   const [disabledMcpServerIdsText, setDisabledMcpServerIdsText] = useState("");
   const [mcpToolPolicyDrafts, setMcpToolPolicyDrafts] =
     useState<AgentMcpToolPolicyDraft[]>([]);
+  const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -4375,36 +4453,19 @@ function CreateAgentPanel({
           setSandboxPolicy={setSandboxPolicy}
         />
 
-        <label className="field full-width">
-          <span>供应商 / 模型 <em>Optional</em></span>
-          <select
-            aria-invalid={invalidField === "modelId"}
-            onChange={(event) => {
-              const nextModelId = event.target.value;
-              const nextModel = models.find((model) => model.id === nextModelId);
-              setModelId(nextModelId);
-              setReasoningPolicy(normalizeReasoningPolicy(reasoningPolicy, nextModel));
-              if (invalidField === "modelId") setInvalidField(null);
-              if (invalidField === "reasoningPolicy") setInvalidField(null);
-            }}
-            value={modelId}
-          >
-            <option value="">No model assigned</option>
-            {models.map((model) => (
-              <option
-                disabled={model.compatibility === "UNSUPPORTED" || model.compatibility === "GATEWAY_REQUIRED"}
-                key={model.id}
-                value={model.id}
-              >
-                {model.providerKey} / {model.displayName} — {compatibilityLabel(model.compatibility)}
-              </option>
-            ))}
-          </select>
-          {selectedModel?.compatibility === "UNKNOWN" && (
-            <em>该 Model 可保存，但启用 Agent 前必须在 Models 页面完成工具闭环测试。</em>
-          )}
-          {invalidField === "modelId" && <small className="field-error">所选 Model 不存在或与该 Agent 不兼容。</small>}
-        </label>
+        <AgentModelFields
+          modelId={modelId}
+          modelInvalid={invalidField === "modelId"}
+          models={models}
+          onModelChange={(nextModelId) => {
+            const nextModel = models.find((model) => model.id === nextModelId);
+            setModelId(nextModelId);
+            setReasoningPolicy(normalizeReasoningPolicy(reasoningPolicy, nextModel));
+            if (invalidField === "modelId" || invalidField === "reasoningPolicy") setInvalidField(null);
+          }}
+          onProviderChange={setProviderId}
+          providerId={providerId}
+        />
 
         {error && <div className="inline-error full-width" role="alert"><strong>Agent 保存失败</strong><span>{error}</span></div>}
 
@@ -4441,6 +4502,7 @@ function AgentDetailPanel({
   refreshMcpServers: () => Promise<void>;
 }) {
   const [agent, setAgent] = useState<AgentDetailResponse | null>(null);
+  const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
   const [disabledMcpServerIdsText, setDisabledMcpServerIdsText] = useState("");
   const [mcpToolPolicyDrafts, setMcpToolPolicyDrafts] =
@@ -4461,6 +4523,7 @@ function AgentDetailPanel({
           ...value,
           reasoningPolicy: normalizeReasoningPolicy(value.reasoningPolicy, selectedModel),
         });
+        setProviderId(value.modelBinding?.providerId ?? "");
         setModelId(nextModelId);
         setDisabledMcpServerIdsText(value.disabledMcpServerIds.join("\n"));
         setMcpToolPolicyDrafts(mcpToolPolicyDraftsFrom(value.mcpToolPolicies));
@@ -4507,6 +4570,7 @@ function AgentDetailPanel({
         mcpToolPolicies: serializeMcpToolPolicies(mcpToolPolicyDrafts),
       });
       setAgent(refreshed);
+      setProviderId(refreshed.modelBinding?.providerId ?? "");
       setModelId(refreshed.modelBinding?.id ?? "");
       setDisabledMcpServerIdsText(refreshed.disabledMcpServerIds.join("\n"));
       setMcpToolPolicyDrafts(mcpToolPolicyDraftsFrom(refreshed.mcpToolPolicies));
@@ -4714,36 +4778,23 @@ function AgentDetailPanel({
           setSandboxPolicy={(value) => setAgent({ ...agent, sandboxPolicy: value })}
         />
 
-        <label className="field full-width">
-          <span>供应商 / 模型</span>
-          <select
-            aria-invalid={invalidField === "modelId"}
-            onChange={(event) => {
-              const nextModelId = event.target.value;
-              const nextModel = models.find((model) => model.id === nextModelId);
-              setModelId(nextModelId);
-              setAgent({
-                ...agent,
-                reasoningPolicy: normalizeReasoningPolicy(agent.reasoningPolicy, nextModel),
-              });
-              if (invalidField === "modelId") setInvalidField(null);
-              if (invalidField === "reasoningPolicy") setInvalidField(null);
-            }}
-            value={modelId}
-          >
-            <option value="">No model assigned</option>
-            {models.map((model) => (
-              <option
-                disabled={model.compatibility === "UNSUPPORTED" || model.compatibility === "GATEWAY_REQUIRED"}
-                key={model.id}
-                value={model.id}
-              >
-                {model.providerKey} / {model.displayName} — {compatibilityLabel(model.compatibility)}
-              </option>
-            ))}
-          </select>
-          {invalidField === "modelId" && <small className="field-error">所选 Model 不存在或与该 Agent 不兼容。</small>}
-        </label>
+        <AgentModelFields
+          currentBinding={agent.modelBinding}
+          modelId={modelId}
+          modelInvalid={invalidField === "modelId"}
+          models={models}
+          onModelChange={(nextModelId) => {
+            const nextModel = models.find((model) => model.id === nextModelId);
+            setModelId(nextModelId);
+            setAgent({
+              ...agent,
+              reasoningPolicy: normalizeReasoningPolicy(agent.reasoningPolicy, nextModel),
+            });
+            if (invalidField === "modelId" || invalidField === "reasoningPolicy") setInvalidField(null);
+          }}
+          onProviderChange={setProviderId}
+          providerId={providerId}
+        />
 
         <CompatibilityPanel compatibility={agent.compatibility} />
 
@@ -4768,6 +4819,93 @@ function AgentDetailPanel({
         </div>
       </form>
     </section>
+  );
+}
+
+function AgentModelFields({
+  currentBinding,
+  modelId,
+  modelInvalid,
+  models,
+  onModelChange,
+  onProviderChange,
+  providerId,
+}: {
+  currentBinding?: AgentModelReference | null;
+  modelId: string;
+  modelInvalid: boolean;
+  models: ModelSummary[];
+  onModelChange: (value: string) => void;
+  onProviderChange: (value: string) => void;
+  providerId: string;
+}) {
+  const providers = new Map<string, { name: string; key: string }>();
+  for (const model of models) {
+    if (!providers.has(model.providerId)) {
+      providers.set(model.providerId, { name: model.providerName, key: model.providerKey });
+    }
+  }
+  if (currentBinding && !providers.has(currentBinding.providerId)) {
+    providers.set(currentBinding.providerId, {
+      name: currentBinding.providerName,
+      key: currentBinding.providerKey,
+    });
+  }
+  const providerModels = models.filter((model) => model.providerId === providerId);
+  const selectedModel = providerModels.find((model) => model.id === modelId);
+  const unavailableBinding = currentBinding?.id === modelId && !selectedModel
+    ? currentBinding
+    : null;
+
+  return (
+    <>
+      <label className="field full-width">
+        <span>供应商 <em>Optional</em></span>
+        <select
+          onChange={(event) => {
+            onProviderChange(event.target.value);
+            onModelChange("");
+          }}
+          value={providerId}
+        >
+          <option value="">请选择供应商（可不绑定模型）</option>
+          {Array.from(providers, ([id, provider]) => (
+            <option key={id} value={id}>{provider.name} ({provider.key})</option>
+          ))}
+        </select>
+        <small>先选择供应商，再选择其下的模型；切换供应商会清空已选模型。</small>
+      </label>
+      <label className="field full-width">
+        <span>模型 <em>Optional</em></span>
+        <select
+          aria-invalid={modelInvalid}
+          disabled={!providerId}
+          onChange={(event) => onModelChange(event.target.value)}
+          value={modelId}
+        >
+          <option value="">{providerId ? "暂不绑定模型" : "请先选择供应商"}</option>
+          {unavailableBinding && (
+            <option disabled value={unavailableBinding.id}>
+              {unavailableBinding.displayName} — 当前绑定（不可新选）
+            </option>
+          )}
+          {providerModels.map((model) => (
+            <option
+              disabled={model.compatibility === "UNSUPPORTED" || model.compatibility === "GATEWAY_REQUIRED"}
+              key={model.id}
+              value={model.id}
+            >
+              {model.displayName} — {compatibilityLabel(model.compatibility)}
+            </option>
+          ))}
+        </select>
+        {selectedModel?.compatibility === "UNKNOWN" && (
+          <em>该 Model 可保存，但启用 Agent 前必须在 Models 页面完成工具闭环测试。</em>
+        )}
+        {unavailableBinding && <small>当前模型不在可选列表中；可更换或清除绑定。</small>}
+        {modelInvalid && <small className="field-error">所选 Model 不存在或与该 Agent 不兼容。</small>}
+      </label>
+    </>
   );
 }
 
@@ -4885,49 +5023,6 @@ function phaseLabel(value: OrchestrationPhase): string {
   return labels[value];
 }
 
-type AgentSkillVariant = "NONE" | "SLIM" | "NORMAL";
-
-const bundledAgentSkillFamilies: Array<{
-  name: string;
-  normalKey: AgentSkillKey;
-  slimKey: AgentSkillKey;
-  normalDescription: string;
-  slimDescription: string;
-}> = [
-  {
-    name: "Caveman",
-    normalKey: "caveman",
-    slimKey: "caveman-slim",
-    normalDescription: "保留原项目的完整模式、强度选项、示例与规则。",
-    slimDescription: "仅保留压缩表达的核心规则，适合日常子 Agent。",
-  },
-  {
-    name: "Ponytail",
-    normalKey: "ponytail",
-    slimKey: "ponytail-slim",
-    normalDescription: "保留原项目的完整工作流、模式、示例与规则。",
-    slimDescription: "仅保留最小实现、范围控制与验证规则。",
-  },
-];
-
-function selectedSkillVariant(
-  value: AgentSkillKey[],
-  family: (typeof bundledAgentSkillFamilies)[number],
-): AgentSkillVariant {
-  if (value.includes(family.slimKey)) return "SLIM";
-  if (value.includes(family.normalKey)) return "NORMAL";
-  return "NONE";
-}
-
-function skillVariantDescription(
-  variant: AgentSkillVariant,
-  family: (typeof bundledAgentSkillFamilies)[number],
-): string {
-  if (variant === "SLIM") return family.slimDescription;
-  if (variant === "NORMAL") return family.normalDescription;
-  return "不显式绑定此 Skill 家族。";
-}
-
 function AgentSkillFields({
   onChange,
   value,
@@ -4935,60 +5030,39 @@ function AgentSkillFields({
   onChange: (value: AgentSkillKey[]) => void;
   value: AgentSkillKey[];
 }) {
-  function selectVariant(
-    family: (typeof bundledAgentSkillFamilies)[number],
-    variant: AgentSkillVariant,
-  ) {
-    const remaining = value.filter(
-      (key) => key !== family.normalKey && key !== family.slimKey,
-    );
-    const selected =
-      variant === "SLIM"
-        ? family.slimKey
-        : variant === "NORMAL"
-          ? family.normalKey
-          : null;
-    onChange((selected ? [...remaining, selected] : remaining).sort());
-  }
-
   return (
     <fieldset className="agent-skill-field full-width">
       <div className="agent-skill-heading">
         <span className="field-label-with-info">
           内置 Skills
-          <InfoTip label="选中的 Skill 随 CAS 分发并写入当前 CODEX_HOME；不依赖本机预先安装。" />
+          <InfoTip label="选中的 Skill 由 CAS 内置并仅绑定给 Child；不依赖本机预先安装。" />
         </span>
         <button
           className="reference-link"
-          onClick={() => onChange(["caveman-slim", "ponytail-slim"])}
+          onClick={() => onChange(["cas-slim"])}
           type="button"
         >
           应用精简预设
         </button>
       </div>
       <div className="agent-skill-options">
-        {bundledAgentSkillFamilies.map((family) => {
-          const variant = selectedSkillVariant(value, family);
-          return (
-            <label className="agent-skill-version-option" key={family.name}>
-              <strong>{family.name}</strong>
-              <select
-                onChange={(event) =>
-                  selectVariant(family, event.target.value as AgentSkillVariant)
-                }
-                value={variant}
-              >
-                <option value="NONE">未启用</option>
-                <option value="SLIM">CAS 精简版（推荐）</option>
-                <option value="NORMAL">正常版</option>
-              </select>
-              <small>{skillVariantDescription(variant, family)}</small>
-            </label>
-          );
-        })}
+        <label className="agent-skill-version-option">
+          <strong>执行与汇报</strong>
+          <select
+            onChange={(event) =>
+              onChange(event.target.value ? [event.target.value as AgentSkillKey] : [])
+            }
+            value={value[0] ?? ""}
+          >
+            <option value="">未启用</option>
+            <option value="cas-slim">CAS 精简规则（可选）</option>
+            <option value="caveman">Caveman 完整版</option>
+          </select>
+          <small>精简版合并最小实现与简洁汇报；完整版仅保留 Caveman。</small>
+        </label>
       </div>
       <small>
-        每个家族只能选择一个版本。未启用时不写入该 Skill；正常版保留完整规则，精简版减少子 Agent 上下文占用。
+        新 Agent 默认不绑定 Skill；仅 Child 加载手动选择的 Skill。Primary 的精简提醒在同一会话第二个用户回合注入一次。
       </small>
     </fieldset>
   );
@@ -5458,7 +5532,7 @@ function ProvidersPage() {
         <div>
           <span className="eyebrow">Providers</span>
           <h1>模型服务来源</h1>
-          <p>管理第三方 Responses API，以及复用当前 ChatGPT 登录的 Codex 原生模型。</p>
+          <p>管理 Responses 与 Chat Completions 模型服务，以及复用当前 ChatGPT 登录的 Codex 原生模型。</p>
         </div>
         {!panelOpen && (
           <button
@@ -5570,7 +5644,7 @@ function ProviderRow({
         </div>
         <p>
           <span>{provider.name}</span>
-          <span>Responses API</span>
+          <span>{provider.protocol === "CHAT_COMPLETIONS" ? "Chat Completions · CAS 转换" : "Responses API"}</span>
           <span>{provider.providerType === "PRESET" ? "Preset" : "Custom"}</span>
           <span>Cache {provider.cacheSupport}</span>
         </p>
@@ -5628,6 +5702,7 @@ function DeepSeekLogo() {
 function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [providers, setProviders] = useState<ProviderSummary[]>([]);
+  const [expandedProviderId, setExpandedProviderId] = useState<string | null>();
   const [loading, setLoading] = useState(true);
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<ModelSummary | null>(null);
@@ -5716,6 +5791,16 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
     (provider) => provider.presetId !== "codex-native",
   );
   const panelOpen = adding || editing !== null;
+  const modelsByProvider = new Map<string, ModelSummary[]>();
+  for (const model of models) {
+    const group = modelsByProvider.get(model.providerId);
+    if (group) group.push(model);
+    else modelsByProvider.set(model.providerId, [model]);
+  }
+  const activeProviderId = expandedProviderId === undefined
+    ? models.find((model) => model.providerPresetId === "codex-native")?.providerId
+      ?? models[0]?.providerId
+    : expandedProviderId;
 
   return (
     <>
@@ -5723,7 +5808,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
         <div>
           <span className="eyebrow">Models</span>
           <h1>可绑定模型</h1>
-          <p>验证 Responses API、Function Calling 工具闭环与 Codex Multi-Agent 兼容性。</p>
+          <p>按供应商查看模型；点击供应商展开或收起，保留协议与工具调用验证。</p>
         </div>
         {!panelOpen && addableProviders.length > 0 && (
           <button
@@ -5776,7 +5861,7 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
         <section className="empty-state">
           <div className="empty-icon">M</div>
           <h2>请先添加 Provider</h2>
-          <p>Model 必须属于一个已保存的 Responses Provider。</p>
+          <p>Model 必须属于一个已保存的 Provider。</p>
           <button className="primary-button" onClick={onOpenProviders}>前往 Providers</button>
         </section>
       )}
@@ -5795,57 +5880,96 @@ function ModelsPage({ onOpenProviders }: { onOpenProviders: () => void }) {
       )}
 
       {!panelOpen && !loading && !error && models.length > 0 && (
-        <section className="model-table-wrap" aria-label="Model 列表">
-          <table className="model-table">
-            <thead>
-              <tr>
-                <th>Provider</th>
-                <th>Model</th>
-                <th>
-                  <span className="table-heading-with-info">
-                    Compatibility
-                    <InfoTip label="CAS 对模型接入方式与 Codex 工具调用兼容性的判断；聚焦具体状态可查看原因。" />
+        <section className="model-provider-groups" aria-label="按供应商分组的模型">
+          {Array.from(modelsByProvider, ([providerId, providerModels]) => {
+            const first = providerModels[0];
+            const expanded = activeProviderId === providerId;
+            const provider = providers.find((item) => item.id === providerId);
+            const enabledCount = providerModels.filter((model) => model.enabled).length;
+            return (
+              <article className="model-provider-group" key={providerId}>
+                <button
+                  aria-controls={`provider-models-${providerId}`}
+                  aria-expanded={expanded}
+                  className="model-provider-toggle"
+                  onClick={() => setExpandedProviderId(expanded ? null : providerId)}
+                  type="button"
+                >
+                  <ProviderIcon
+                    className="provider-avatar"
+                    name={first.providerName}
+                    presetId={first.providerPresetId}
+                  />
+                  <span className="model-provider-copy">
+                    <strong>{first.providerName}</strong>
+                    <code>{first.providerKey}</code>
                   </span>
-                </th>
-                <th>
-                  <span className="table-heading-with-info">
-                    Context
-                    <InfoTip label="模型可供 Codex 使用的上下文窗口；Unknown 表示尚未配置。" />
+                  <span className="model-provider-meta">
+                    {provider && !provider.enabled && <span className="result blocked">已禁用</span>}
+                    <span>{providerModels.length} 个模型 · {enabledCount} 个启用</span>
+                    <UiIcon name={expanded ? "chevron-down" : "chevron-right"} />
                   </span>
-                </th>
-                <th>
-                  <span className="table-heading-with-info">
-                    Lifecycle
-                    <InfoTip label="模型当前是否允许用于新 Agent 配置；Disabled 不影响已有历史记录。" />
-                  </span>
-                </th>
-                <th>
-                  <span className="table-heading-with-info">
-                    Verification
-                    <InfoTip label="最近一次 Responses API 与 Function Calling 工具闭环测试结果。" />
-                  </span>
-                </th>
-                <th aria-label="操作" />
-              </tr>
-            </thead>
-            <tbody>
-              {models.map((model) => (
-                <ModelRow
-                  deleting={deletingId === model.id}
-                  key={model.id}
-                  model={model}
-                  onDelete={() => void handleDelete(model)}
-                  onEdit={() => {
-                    setActionError(null);
-                    setSuccess(null);
-                    setEditing(model);
-                  }}
-                  onTest={() => void handleTest(model)}
-                  testing={testingId === model.id}
-                />
-              ))}
-            </tbody>
-          </table>
+                </button>
+                <div
+                  className="model-table-wrap"
+                  hidden={!expanded}
+                  id={`provider-models-${providerId}`}
+                >
+                  {expanded && (
+                    <table className="model-table" aria-label={`${first.providerName} 模型`}>
+                      <thead>
+                        <tr>
+                          <th>Model</th>
+                          <th>
+                            <span className="table-heading-with-info">
+                              Compatibility
+                              <InfoTip label="CAS 对模型接入方式与 Codex 工具调用兼容性的判断；聚焦具体状态可查看原因。" />
+                            </span>
+                          </th>
+                          <th>
+                            <span className="table-heading-with-info">
+                              Context
+                              <InfoTip label="模型可供 Codex 使用的上下文窗口；Unknown 表示尚未配置。" />
+                            </span>
+                          </th>
+                          <th>
+                            <span className="table-heading-with-info">
+                              Lifecycle
+                              <InfoTip label="模型当前是否允许用于新 Agent 配置；Disabled 不影响已有历史记录。" />
+                            </span>
+                          </th>
+                          <th>
+                            <span className="table-heading-with-info">
+                              Verification
+                              <InfoTip label="最近一次 Provider 协议与 Function Calling 工具闭环测试结果。" />
+                            </span>
+                          </th>
+                          <th aria-label="操作" />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {providerModels.map((model) => (
+                          <ModelRow
+                            deleting={deletingId === model.id}
+                            key={model.id}
+                            model={model}
+                            onDelete={() => void handleDelete(model)}
+                            onEdit={() => {
+                              setActionError(null);
+                              setSuccess(null);
+                              setEditing(model);
+                            }}
+                            onTest={() => void handleTest(model)}
+                            testing={testingId === model.id}
+                          />
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </article>
+            );
+          })}
         </section>
       )}
     </>
@@ -5898,10 +6022,6 @@ function ModelRow({
   return (
     <tr className={!model.enabled ? "model-disabled" : undefined}>
       <td>
-        <code>{model.providerKey}</code>
-        <small>{model.providerName}</small>
-      </td>
-      <td>
         <strong>{model.displayName}</strong>
         <span className="model-id-line">
           <Tooltip content={model.modelId} focusable label={`Model ID：${model.modelId}`}>
@@ -5940,7 +6060,7 @@ function ModelRow({
           <Tooltip
             content={model.providerPresetId === "codex-native"
               ? "Codex 原生模型复用当前登录会话，无需第三方 Responses API 测试。"
-              : "验证 Responses API 与 Function Calling 工具闭环。"}
+              : "验证当前 Provider 协议与 Function Calling 工具闭环。"}
             focusable={model.providerPresetId === "codex-native"}
             label="Model 测试说明"
           >
@@ -6251,7 +6371,7 @@ function compatibilityLabel(value: ModelSummary["compatibility"]): string {
 function compatibilityDescription(value: ModelSummary["compatibility"]): string {
   const descriptions = {
     NATIVE: "有较强证据确认该模型针对 Codex 或其所需行为完成原生适配。",
-    COMPATIBLE: "CAS已验证Responses API 和 Function Calling 工具闭环，可用于Codex Agent。（但请根据Codex中实际提示为准）",
+    COMPATIBLE: "CAS 已验证 Provider 协议接入和 Function Calling 工具闭环；实际运行仍以 Codex 中的结果为准。",
     GATEWAY_REQUIRED: "当前不能直接用于 Codex，需要协议转换网关。",
     UNSUPPORTED: "存在明确的不兼容问题，不能用于 Codex Agent。",
     UNKNOWN: "CAS 暂无足够证据判断该模型是否兼容 Codex Agent。",
@@ -6271,9 +6391,9 @@ function lifecycleDescription(model: ModelSummary): string {
 }
 
 function verificationDescription(value: ModelSummary["lastTestStatus"]): string {
-  if (value === null) return "尚未使用当前 Provider Credential 发起 Responses Function Calling 工具闭环测试。";
+  if (value === null) return "尚未使用当前 Provider Credential 发起 Function Calling 工具闭环测试。";
   const descriptions = {
-    SUCCESS: "最近一次 Responses API 与 Function Calling 工具闭环测试通过。",
+    SUCCESS: "最近一次 Provider 协议与 Function Calling 工具闭环测试通过。",
     CREDENTIAL_MISSING: "Provider Credential 不存在或已从系统凭据库移除。",
     AUTH_FAILED: "Provider 拒绝了当前 Credential。",
     MODEL_NOT_FOUND: "Provider 不识别当前 Model ID。",
@@ -6291,7 +6411,7 @@ function modelTestStatusLabel(value: Exclude<Awaited<ReturnType<typeof testModel
     AUTH_FAILED: "Auth failed",
     MODEL_NOT_FOUND: "Model not found",
     RATE_LIMITED: "Rate limited",
-    PROTOCOL_ERROR: "Responses protocol error",
+    PROTOCOL_ERROR: "Provider protocol error",
     UNREACHABLE: "Unreachable",
     SERVER_ERROR: "Server error",
   } as const;
@@ -6378,6 +6498,7 @@ interface ProviderFormState {
   providerKey: string;
   name: string;
   baseUrl: string;
+  protocol: ProviderProtocol;
   secret: string;
   enabled: boolean;
 }
@@ -6387,6 +6508,7 @@ const formDefaults: Record<ProviderKind, ProviderFormState> = {
     providerKey: "codex-native",
     name: "Codex Native (ChatGPT)",
     baseUrl: "https://api.openai.com/v1/",
+    protocol: "RESPONSES",
     secret: "",
     enabled: true,
   },
@@ -6394,6 +6516,7 @@ const formDefaults: Record<ProviderKind, ProviderFormState> = {
     providerKey: "deepseek",
     name: "DeepSeek",
     baseUrl: "https://api.deepseek.com/",
+    protocol: "RESPONSES",
     secret: "",
     enabled: true,
   },
@@ -6401,6 +6524,7 @@ const formDefaults: Record<ProviderKind, ProviderFormState> = {
     providerKey: "",
     name: "",
     baseUrl: "https://",
+    protocol: "RESPONSES",
     secret: "",
     enabled: true,
   },
@@ -6487,7 +6611,9 @@ function EditProviderPanel({
           <p>
             {provider.presetId === "codex-native"
               ? "该预设复用当前 Codex 的 ChatGPT 登录会话，不保存 API Key。"
-              : "Credential 保持原值，不会读取或回显。"}
+              : provider.protocol === "CHAT_COMPLETIONS"
+                ? "Credential 保持原值；Chat 兼容模式仅开放文本与非 strict 的独立 Function 工具，不支持内置搜索、Namespace/MCP 工具或非 none 推理强度。"
+                : "Credential 保持原值，不会读取或回显。"}
           </p>
         </div>
         <button className="ghost-button" disabled={saving} onClick={onCancel}>取消</button>
@@ -6683,7 +6809,7 @@ function AddProviderPanel({
       name: form.name,
       presetId: kind === "custom" ? null : kind,
       baseUrl: form.baseUrl,
-      protocol: "RESPONSES",
+      protocol: form.protocol,
       auth: kind === "codex-native"
         ? { strategy: "NONE" }
         : { strategy: "OS_SECRET_HELPER", secret: form.secret },
@@ -6718,7 +6844,7 @@ function AddProviderPanel({
               ? "添加 Codex Native"
               : kind === "deepseek"
                 ? "添加 DeepSeek"
-                : "添加 Custom Responses Provider"}
+                : "添加 Custom Provider"}
           </h2>
           <p>
             {kind === "codex-native"
@@ -6766,7 +6892,7 @@ function AddProviderPanel({
             </button>
           </div>
           <div className="preset-helper-row">
-            <small>Codex 原生登录 · 自定义 · 官方预设。</small>
+          <small>Codex 原生登录 · 自定义 Responses 或 Chat Completions · 官方预设。</small>
             <button className="reference-link" onClick={() => setReferenceOpen(true)} type="button">
               <UiIcon name="book" />
               API 支持参考
@@ -6871,7 +6997,20 @@ function AddProviderPanel({
 
         <div className="field">
           <span>Protocol</span>
-          <div className="static-value">Responses API</div>
+          {kind === "custom" ? (
+            <select
+              onChange={(event) => setForm({ ...form, protocol: event.target.value as ProviderProtocol })}
+              value={form.protocol}
+            >
+              <option value="RESPONSES">Responses API</option>
+              <option value="CHAT_COMPLETIONS">Chat Completions（经 CAS 转换）</option>
+            </select>
+          ) : (
+            <div className="static-value">Responses API</div>
+          )}
+          {kind === "custom" && form.protocol === "CHAT_COMPLETIONS" && (
+            <small>仅支持文本与非 strict 的独立 Function 工具；内置搜索、Namespace/MCP 工具和非 none 推理强度不可用。CAS 运行期间通过本机网关转换；URL 可填至 /v1 或完整 /v1/chat/completions。</small>
+          )}
         </div>
 
         <label className="enabled-field">

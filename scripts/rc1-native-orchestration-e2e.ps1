@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [ValidateSet("RC1", "RC2", "MANAGED", "PHASE6")]
+    [ValidateSet("RC1", "RC2", "MANAGED", "PHASE6", "PILOT")]
     [string]$Stage = "RC1",
     [ValidateSet("Idle", "Running", "Storm", "StartupFailure")]
     [string]$Scenario = "Idle",
@@ -10,7 +10,13 @@ param(
     [string]$CodexExecutable = "codex",
     [ValidateRange(30, 600)]
     [int]$TimeoutSeconds = 180,
-    [string]$ResultPath
+    [string]$ResultPath,
+    [string]$PrebuiltHelperPath,
+    [string]$PrebuiltTestPath,
+    [ValidateSet("PAIR", "OFF", "ON")]
+    [string]$PilotRuns = "PAIR",
+    [ValidateSet("SMALL", "QUALIFIED")]
+    [string]$PilotVariant = "SMALL"
 )
 
 Set-StrictMode -Version Latest
@@ -18,7 +24,8 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($SourceDatabase)) {
-    $SourceDatabase = Join-Path $env:LOCALAPPDATA "com.codexagentswitch.desktop\cas.db"
+    $casUserDirectory = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    $SourceDatabase = Join-Path $casUserDirectory ".codex-agent-switch\com.codexagentswitch.desktop\cas.db"
 }
 if ([string]::IsNullOrWhiteSpace($SourceCodexHome)) {
     $SourceCodexHome = Join-Path $env:USERPROFILE ".codex"
@@ -35,7 +42,13 @@ if ([string]::IsNullOrWhiteSpace($ResultPath)) {
     $resultDirectory = Join-Path ([IO.Path]::GetTempPath()) "cas-$stageSlug-results"
     $ResultPath = Join-Path $resultDirectory "$runId.json"
 }
-$helperPath = Join-Path $repoRoot "src-tauri\target\debug\cas-helper.exe"
+$benchmarkRoot = Join-Path (Split-Path -Parent $ResultPath) "$runId-runs"
+$benchmarkTemplate = Join-Path $repoRoot "benchmarks\efficiency-fixture"
+$helperPath = if ([string]::IsNullOrWhiteSpace($PrebuiltHelperPath)) {
+    Join-Path $repoRoot "src-tauri\target\debug\cas-helper.exe"
+} else {
+    $PrebuiltHelperPath
+}
 $manifestPath = Join-Path $repoRoot "src-tauri\Cargo.toml"
 
 if ($Stage -ne "PHASE6" -and -not (Test-Path -LiteralPath $SourceDatabase -PathType Leaf)) {
@@ -49,6 +62,10 @@ if ($requiresNativeRuntime -and -not (Test-Path -LiteralPath $SourceCodexHome -P
 $environmentNames = @(
     "CAS_DATABASE_PATH",
     "CAS_E2E_AGENT_KEY",
+    "CAS_E2E_BENCHMARK_ROOT",
+    "CAS_E2E_BENCHMARK_TEMPLATE",
+    "CAS_E2E_PILOT_RUNS",
+    "CAS_E2E_PILOT_VARIANT",
     "CAS_E2E_CODEX_EXECUTABLE",
     "CAS_E2E_HELPER_PATH",
     "CAS_E2E_RESULT_PATH",
@@ -84,16 +101,23 @@ try {
         }
     }
 
-    if ($Stage -ne "PHASE6") {
+    if ($Stage -ne "PHASE6" -and [string]::IsNullOrWhiteSpace($PrebuiltHelperPath)) {
         Write-Host "[$Stage] Build current cas-helper..."
         & cargo build --quiet --manifest-path $manifestPath -p cas-helper
         if ($LASTEXITCODE -ne 0) {
             throw "cas-helper build failed."
         }
     }
+    elseif ($Stage -ne "PHASE6" -and -not (Test-Path -LiteralPath $helperPath -PathType Leaf)) {
+        throw "Prebuilt cas-helper not found: $helperPath"
+    }
 
     [Environment]::SetEnvironmentVariable("CAS_DATABASE_PATH", (Join-Path $e2eRoot "cas-data\cas.db"), "Process")
     [Environment]::SetEnvironmentVariable("CAS_E2E_AGENT_KEY", $AgentKey, "Process")
+    [Environment]::SetEnvironmentVariable("CAS_E2E_BENCHMARK_ROOT", $benchmarkRoot, "Process")
+    [Environment]::SetEnvironmentVariable("CAS_E2E_BENCHMARK_TEMPLATE", $benchmarkTemplate, "Process")
+    [Environment]::SetEnvironmentVariable("CAS_E2E_PILOT_RUNS", $PilotRuns, "Process")
+    [Environment]::SetEnvironmentVariable("CAS_E2E_PILOT_VARIANT", $PilotVariant, "Process")
     [Environment]::SetEnvironmentVariable("CAS_E2E_CODEX_EXECUTABLE", $CodexExecutable, "Process")
     [Environment]::SetEnvironmentVariable("CAS_E2E_HELPER_PATH", $helperPath, "Process")
     [Environment]::SetEnvironmentVariable("CAS_E2E_RESULT_PATH", $ResultPath, "Process")
@@ -130,13 +154,25 @@ try {
         $testName = "runtime_bridge::rc_e2e::managed_session_rc2_scheduling_matrix"
         Write-Host "[RC2] Run real CAS2 Job/Receipt/Review SPAWN -> REUSE, then compatibility scheduling matrix..."
     }
+    elseif ($Stage -eq "PILOT") {
+        $testName = "runtime_bridge::rc_e2e::managed_session_efficiency_pair_off01_on01"
+        Write-Host "[PILOT] Run $PilotVariant OFF-01 -> ON-01 pair without global AGENTS fallback..."
+    }
     else {
         $testName = "runtime_bridge::rc_e2e::managed_session_rc1_spawn_bind_idle_reuse"
         Write-Host "[RC1] Run real CAS2 TaskPacket -> Job -> SPAWN/REUSE -> Receipt -> Review..."
     }
-    & cargo test --quiet --manifest-path $manifestPath `
-        $testName `
-        -- --ignored --exact --nocapture
+    if ([string]::IsNullOrWhiteSpace($PrebuiltTestPath)) {
+        & cargo test --quiet --manifest-path $manifestPath --lib `
+            $testName `
+            -- --ignored --exact --nocapture
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $PrebuiltTestPath -PathType Leaf)) {
+            throw "Prebuilt test binary not found: $PrebuiltTestPath"
+        }
+        & $PrebuiltTestPath $testName --ignored --exact --nocapture
+    }
     $testExitCode = $LASTEXITCODE
 
     if (Test-Path -LiteralPath $ResultPath -PathType Leaf) {

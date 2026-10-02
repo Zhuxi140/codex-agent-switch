@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::persistence::{PersistenceError, open_database};
 use crate::provider::ApiError;
 
-const BUNDLED_SKILL_KEYS: [&str; 4] = ["caveman", "caveman-slim", "ponytail", "ponytail-slim"];
+const BUNDLED_SKILL_KEYS: [&str; 2] = ["caveman", "cas-slim"];
 
 pub(crate) struct AgentService {
     repository: Mutex<SqliteAgentRepository>,
@@ -1316,11 +1316,8 @@ fn normalize_skill_keys(mut values: Vec<String>) -> Result<Vec<String>, AgentSer
     let valid = values
         .iter()
         .all(|value| BUNDLED_SKILL_KEYS.contains(&value.as_str()));
-    let conflicting = [("caveman", "caveman-slim"), ("ponytail", "ponytail-slim")]
-        .iter()
-        .any(|(normal, slim)| {
-            values.iter().any(|value| value == normal) && values.iter().any(|value| value == slim)
-        });
+    let conflicting = values.iter().any(|value| value == "caveman")
+        && values.iter().any(|value| value == "cas-slim");
     (valid && !conflicting)
         .then_some(values)
         .ok_or(AgentServiceError::InvalidField("skillKeys"))
@@ -1470,7 +1467,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Execution,
-        default_skill_keys: &["caveman-slim", "ponytail-slim"],
+        default_skill_keys: &[],
     },
     AgentPresetDefinition {
         key: "explorer",
@@ -1483,7 +1480,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Discovery,
-        default_skill_keys: &["caveman-slim"],
+        default_skill_keys: &[],
     },
     AgentPresetDefinition {
         key: "reviewer",
@@ -1496,7 +1493,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Review,
-        default_skill_keys: &["caveman-slim"],
+        default_skill_keys: &[],
     },
     AgentPresetDefinition {
         key: "tester",
@@ -1509,7 +1506,7 @@ const AGENT_PRESETS: &[AgentPresetDefinition] = &[
         preferred_capabilities: COMMON_PREFERRED,
         minimum_context_window: None,
         orchestration_phase: OrchestrationPhase::Verification,
-        default_skill_keys: &["caveman-slim"],
+        default_skill_keys: &[],
     },
 ];
 
@@ -2054,10 +2051,7 @@ mod tests {
         assert_eq!(agent.role_key.as_deref(), Some("executor"));
         assert_eq!(agent.orchestration_phase.as_deref(), Some("EXECUTION"));
         assert_eq!(agent.reuse_strategy, "AUTO");
-        assert_eq!(
-            agent.skill_keys,
-            vec!["caveman-slim".to_owned(), "ponytail-slim".to_owned()]
-        );
+        assert!(agent.skill_keys.is_empty());
         assert_eq!(
             agent.required_capabilities,
             vec!["CODEX_MULTI_AGENT".to_owned(), "TOOL_CALLING".to_owned()]
@@ -2066,6 +2060,15 @@ mod tests {
         assert_eq!(
             agent.compatibility.status,
             BindingCompatibilityStatus::Compatible
+        );
+    }
+
+    #[test]
+    fn bundled_skills_are_opt_in_for_every_preset() {
+        assert!(
+            AGENT_PRESETS
+                .iter()
+                .all(|preset| preset.default_skill_keys.is_empty())
         );
     }
 
@@ -2108,16 +2111,9 @@ mod tests {
     fn agent_skills_validate_round_trip_and_retire_old_threads() {
         let service = AgentService::in_memory();
         let mut create = request(Some("executor"), None);
-        create.skill_keys = Some(vec![
-            "ponytail".to_owned(),
-            "caveman".to_owned(),
-            "ponytail".to_owned(),
-        ]);
+        create.skill_keys = Some(vec!["cas-slim".to_owned(), "cas-slim".to_owned()]);
         let agent = service.create(create).unwrap();
-        assert_eq!(
-            agent.skill_keys,
-            vec!["caveman".to_owned(), "ponytail".to_owned()]
-        );
+        assert_eq!(agent.skill_keys, vec!["cas-slim".to_owned()]);
         service
             .repository()
             .unwrap()
@@ -2176,7 +2172,7 @@ mod tests {
         );
 
         let mut conflicting = request(Some("reviewer"), None);
-        conflicting.skill_keys = Some(vec!["caveman".to_owned(), "caveman-slim".to_owned()]);
+        conflicting.skill_keys = Some(vec!["caveman".to_owned(), "cas-slim".to_owned()]);
         assert_eq!(
             service.create(conflicting).unwrap_err().code(),
             "VALIDATION_ERROR"

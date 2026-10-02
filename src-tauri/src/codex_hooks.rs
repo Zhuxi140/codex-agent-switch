@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::codex_config::{RUNTIME_HOOK_EVENTS, RUNTIME_HOOK_MARKER};
+use crate::codex_config::{
+    CAS_ASSESS_MCP_SERVER_ID, RUNTIME_HOOK_EVENTS, RUNTIME_HOOK_MARKER, RUNTIME_HOOK_MCP_TOOL,
+};
 
 const HOOK_STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -103,6 +105,8 @@ struct HooksListEntry {
 #[serde(rename_all = "camelCase")]
 struct HookMetadata {
     command: Option<String>,
+    server: Option<String>,
+    tool: Option<String>,
     enabled: bool,
     event_name: String,
     source_path: Option<String>,
@@ -121,6 +125,8 @@ fn classify_hooks(
             hook.command
                 .as_deref()
                 .is_some_and(|command| command.contains(RUNTIME_HOOK_MARKER))
+                || (hook.server.as_deref() == Some(CAS_ASSESS_MCP_SERVER_ID)
+                    && hook.tool.as_deref() == Some(RUNTIME_HOOK_MCP_TOOL))
         })
         .collect::<Vec<_>>();
     let installed = hooks.len();
@@ -192,7 +198,7 @@ fn classify_hooks(
             RuntimeHookStatus::Modified,
             installed,
             trusted,
-            "CAS Runtime Hook 在上次信任后发生变化；必须在 Codex 的 /hooks 中重新审核。".to_owned(),
+            "CAS Runtime Hook 在上次信任后发生变化；请在 Codex Desktop 的“设置 → Hooks”中重新审核，或使用 Codex CLI 的 /hooks。".to_owned(),
         );
     }
     if hooks.iter().any(|hook| hook.trust_status == "untrusted") {
@@ -218,7 +224,9 @@ fn classify_hooks(
         RuntimeHookStatus::Active,
         installed,
         trusted,
-        format!("当前 Codex 报告全部 {installed} 项 CAS Runtime Hook 已启用并受信任。"),
+        format!(
+            "Codex 报告全部 {installed} 项 CAS Runtime Hook 已启用并受信任；实际执行仍需用运行记录验证。"
+        ),
     )
 }
 
@@ -400,6 +408,8 @@ mod tests {
             command: Some(format!(
                 "\"cas-helper\" hook \"cas.db\" {RUNTIME_HOOK_MARKER}"
             )),
+            server: None,
+            tool: None,
             enabled,
             event_name: event_name.to_owned(),
             source_path: Some("C:\\fixture\\.codex\\config.toml".to_owned()),
@@ -440,6 +450,22 @@ mod tests {
     }
 
     #[test]
+    fn hook_status_accepts_trusted_mcp_runtime_hooks() {
+        let hooks = complete_hooks("trusted")
+            .into_iter()
+            .map(|mut hook| {
+                hook.command = None;
+                hook.server = Some(CAS_ASSESS_MCP_SERVER_ID.to_owned());
+                hook.tool = Some(RUNTIME_HOOK_MCP_TOOL.to_owned());
+                hook
+            })
+            .collect();
+        let active = classify_fixture(hooks);
+        assert_eq!(active.status, RuntimeHookStatus::Active);
+        assert_eq!(active.installed_hook_count, 5);
+    }
+
+    #[test]
     fn hook_status_fails_closed_for_modified_disabled_and_partial_config() {
         let modified = classify_fixture(complete_hooks("modified"));
         assert_eq!(modified.status, RuntimeHookStatus::Modified);
@@ -459,6 +485,8 @@ mod tests {
     fn hook_status_ignores_non_cas_hooks() {
         let unrelated = HookMetadata {
             command: Some("other-hook".to_owned()),
+            server: None,
+            tool: None,
             enabled: true,
             event_name: "stop".to_owned(),
             source_path: Some("C:\\fixture\\.codex\\config.toml".to_owned()),

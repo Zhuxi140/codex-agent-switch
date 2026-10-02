@@ -19,6 +19,7 @@ use serde_json::Value;
 use url::Url;
 use uuid::Uuid;
 
+use crate::chat_compat::{chat_endpoint, chat_to_responses, responses_to_chat};
 use crate::persistence::{PersistenceError, open_database};
 use crate::provider::ApiError;
 
@@ -303,7 +304,7 @@ impl SqliteModelRepository {
     fn probe_target(&self, id: &str) -> Result<ModelProbeTarget, ModelRepositoryError> {
         self.connection
             .query_row(
-                "SELECT m.model_id, p.base_url, c.id, p.preset_id = 'codex-native'
+                "SELECT m.model_id, p.base_url, c.id, p.preset_id = 'codex-native', p.protocol
                  FROM models m
                  JOIN providers p ON p.id = m.provider_id
                  LEFT JOIN credentials c ON c.provider_id = p.id AND c.credential_key = 'primary'
@@ -315,6 +316,7 @@ impl SqliteModelRepository {
                         base_url: row.get(1)?,
                         credential_id: row.get(2)?,
                         native: row.get(3)?,
+                        chat_completions: row.get::<_, String>(4)? == "CHAT_COMPLETIONS",
                     })
                 },
             )
@@ -522,11 +524,16 @@ struct ModelProbeTarget {
     base_url: String,
     credential_id: Option<String>,
     native: bool,
+    chat_completions: bool,
 }
 
 fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnectionTestResponse {
     let started = Instant::now();
-    let endpoint = match responses_endpoint(&target.base_url) {
+    let endpoint = match if target.chat_completions {
+        chat_endpoint(&target.base_url)
+    } else {
+        responses_endpoint(&target.base_url)
+    } {
         Ok(endpoint) => endpoint,
         Err(()) => return ModelConnectionTestResponse::protocol_error(None, None),
     };
@@ -558,11 +565,12 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         &serde_json::json!({
             "model": target.model_id,
             "input": "Reply with CAS_RESPONSES_OK.",
-            "max_output_tokens": 64,
+            "max_output_tokens": if target.chat_completions { 512 } else { 64 },
             "stream": false,
             "store": false
         }),
         started,
+        target.chat_completions,
     );
     let (status, body, request_id) = match basic_response {
         Ok(response) => response,
@@ -601,7 +609,7 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         &serde_json::json!({
             "model": target.model_id,
             "input": [{ "role": "user", "content": probe_prompt }],
-            "max_output_tokens": 128,
+            "max_output_tokens": if target.chat_completions { 512 } else { 128 },
             "tools": [probe_tool.clone()],
             // 与 Codex 实际运行一致；DeepSeek 思考模式会拒绝 required。
             "tool_choice": "auto",
@@ -610,6 +618,7 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
             "store": false
         }),
         started,
+        target.chat_completions,
     );
     let (status, body, request_id) = match tool_call_response {
         Ok(response) => response,
@@ -648,7 +657,7 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
         &serde_json::json!({
             "model": target.model_id,
             "input": tool_input,
-            "max_output_tokens": 128,
+            "max_output_tokens": if target.chat_completions { 512 } else { 128 },
             "tools": [probe_tool],
             "tool_choice": "auto",
             "parallel_tool_calls": false,
@@ -656,6 +665,7 @@ fn run_model_probe(target: ModelProbeTarget, secret: SecretValue) -> ModelConnec
             "store": false
         }),
         started,
+        target.chat_completions,
     );
     let (status, body, request_id) = match tool_result_response {
         Ok(response) => response,
@@ -687,7 +697,19 @@ fn execute_probe_request(
     authorization: &HeaderValue,
     body: &Value,
     started: Instant,
+    chat_completions: bool,
 ) -> Result<(StatusCode, Vec<u8>, Option<String>), ModelConnectionTestResponse> {
+    let chat_body = if chat_completions {
+        Some(
+            responses_to_chat(body)
+                .map_err(|_| {
+                    ModelConnectionTestResponse::protocol_error(Some(elapsed_ms(started)), None)
+                })?
+                .body,
+        )
+    } else {
+        None
+    };
     let response = client
         .post(endpoint.clone())
         .header(AUTHORIZATION, authorization.clone())
@@ -695,10 +717,24 @@ fn execute_probe_request(
             "user-agent",
             concat!("Codex-Agent-Switch/", env!("CARGO_PKG_VERSION")),
         )
-        .json(body)
+        .json(chat_body.as_ref().unwrap_or(body))
         .send()
         .map_err(|_| ModelConnectionTestResponse::unreachable(Some(elapsed_ms(started))))?;
-    read_probe_response(response, started)
+    let (status, bytes, request_id) = read_probe_response(response, started)?;
+    if !chat_completions || !status.is_success() {
+        return Ok((status, bytes, request_id));
+    }
+    let converted = serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|completion| chat_to_responses(&completion).ok())
+        .and_then(|response| serde_json::to_vec(&response).ok())
+        .ok_or_else(|| {
+            ModelConnectionTestResponse::protocol_error(
+                Some(elapsed_ms(started)),
+                request_id.clone(),
+            )
+        })?;
+    Ok((status, converted, request_id))
 }
 
 fn read_probe_response(
@@ -870,6 +906,41 @@ pub(crate) fn initial_models_for_preset(
         return Err(CatalogError::InvalidResource);
     }
     Ok(definitions.into_iter().map(NewPresetModel::from).collect())
+}
+
+pub(crate) fn backfill_native_gpt6_models(
+    transaction: &Transaction<'_>,
+) -> Result<(), PersistenceError> {
+    let mut statement =
+        transaction.prepare("SELECT id FROM providers WHERE preset_id = 'codex-native'")?;
+    let provider_ids = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let timestamp =
+        transaction.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| {
+            row.get::<_, String>(0)
+        })?;
+    for provider_id in provider_ids {
+        let models =
+            initial_models_for_preset("codex-native").map_err(|_| PersistenceError::Unavailable)?;
+        for model in models.iter().filter(|model| {
+            matches!(
+                model.model_id.as_str(),
+                "gpt-6-sol" | "gpt-6-luna" | "gpt-6-astra"
+            )
+        }) {
+            let exists = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM models WHERE provider_id = ?1 AND model_id = ?2)",
+                params![provider_id, model.model_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !exists {
+                insert_preset_model(transaction, &provider_id, model, &timestamp)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn insert_preset_model(
@@ -1803,13 +1874,20 @@ mod tests {
         ));
 
         let native_models = initial_models_for_preset("codex-native").unwrap();
-        assert_eq!(native_models.len(), 3);
+        assert_eq!(native_models.len(), 6);
         assert_eq!(
             native_models
                 .iter()
                 .map(|model| model.model_id.as_str())
                 .collect::<Vec<_>>(),
-            ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-luna"]
+            [
+                "gpt-5.6",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-6-astra",
+            ]
         );
         assert!(
             native_models
@@ -1821,6 +1899,26 @@ mod tests {
                 .iter()
                 .all(|model| model.context_window == Some(258_400))
         );
+        for model in native_models
+            .iter()
+            .filter(|model| model.model_id.starts_with("gpt-6-"))
+        {
+            assert_eq!(model.max_output_tokens, Some(128_000));
+            assert!(
+                !model
+                    .reasoning_efforts
+                    .iter()
+                    .any(|effort| effort == "none")
+            );
+            assert_eq!(
+                model.default_reasoning.as_deref(),
+                Some(if model.model_id == "gpt-6-astra" {
+                    "low"
+                } else {
+                    "medium"
+                })
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@
   "version": "0.5.0-rc.1",
   "identifier": "com.codexagentswitch.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run prepare:sidecar:dev && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build:bundle",
     "frontendDist": "../dist"

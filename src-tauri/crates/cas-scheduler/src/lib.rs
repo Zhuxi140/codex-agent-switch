@@ -3,14 +3,14 @@ pub mod runtime_policy;
 pub mod scoring;
 
 /// REUSE 短租约时长：覆盖「预检返回 REUSE」到「follow-up 使 Thread 进入 RUNNING」的窗口。
-// ponytail: 固定 TTL，过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
+// 固定 TTL 过短会在慢启动时放行第二个 REUSE；需按实测调整或改为显式释放。
 pub const REUSE_CLAIM_TTL_SECONDS: i64 = 120;
 /// SPAWN 预留与初始租约时长：需覆盖 Primary 从 schedule 到 bind 完成认领的全过程，
 /// 包括 bind 等待原生 Thread 记录持久化的窗口（上游在 Child turn 结束前后才落库）。
 pub const SPAWN_RESERVATION_TTL_SECONDS: i64 = 600;
-const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的 Child Agent，不是 Primary。只完成 TASK 包中的一个可独立验收的工作单元，并把 GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP 视为边界。不得扩展到相邻问题、额外重构、文档、提交、发布、依赖安装，或未明确授权的公开 API、数据模型与产品行为变更。缺少安全推进所需信息、需要未冻结决策、越过允许范围或磁盘事实冲突会改变方向时，立即停止并把控制权交还 Primary；不得猜测或重新执行 Primary 编排流程，也不得递归创建同职责子 Agent。首行必须返回 `RESULT: DONE`、`RESULT: NEEDS_DECISION`、`RESULT: PARTIAL` 或 `RESULT: BLOCKED`，且不得声称未实际验证的结果。";
-const DELEGATED_TOOL_INSTRUCTIONS: &str = "工具契约：本地工具仍受阶段及 ALLOW/DENY 约束。外部 MCP、插件或连接器只可调用 TOOLS 明列且完成 ACCEPT 必需的项；`TOOLS: -` 表示禁用。任何外部写入、消息发送、发布、登录、授权或安装还必须由 ALLOW 明确许可，否则返回 `RESULT: NEEDS_DECISION`。Skill 只按任务匹配和已绑定规则加载，不得扫描或调用无关 Skill。";
-const EXECUTION_PHASE_INSTRUCTIONS: &str = "阶段契约：EXECUTION。优先使用本地已有工具，只在 ALLOW 内做满足 ACCEPT 的最小实现及针对性验证；不负责需求规划、独立审查、发布或相邻清理。随后只报告适用的 `CHANGED`、`VERIFIED`、`REMAINING`、`EVIDENCE`、`NEXT`。";
+const DELEGATED_AGENT_INSTRUCTIONS: &str = "你是由 Primary 委派的 Child Agent，不是 Primary。只完成 TASK 中一个可独立验收的工作单元；GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP 均为边界。禁相邻问题、额外重构、文档、提交、发布、依赖安装及未授权的公开 API、数据模型或产品行为变更。信息不足、需要未冻结决策、越界或磁盘事实冲突会改变方向时，立即停止并交还 Primary；不猜测、不重跑编排、不得递归创建同职责子 Agent。首行必须返回 `RESULT: DONE`、`RESULT: NEEDS_DECISION`、`RESULT: PARTIAL` 或 `RESULT: BLOCKED`；不得声称未验证的结果。";
+const DELEGATED_TOOL_INSTRUCTIONS: &str = "工具契约：本地工具受阶段及 ALLOW/DENY 约束。外部 MCP、插件或连接器须在 TOOLS 中且为 ACCEPT 必需；`TOOLS: -` 表示禁用。外部写入、消息发送、发布、登录、授权或安装还须 ALLOW 明确许可，否则返回 `RESULT: NEEDS_DECISION`。不得扫描或调用无关 Skill。";
+const EXECUTION_PHASE_INSTRUCTIONS: &str = "阶段契约：EXECUTION。优先使用本地已有工具；在 ALLOW 内做 ACCEPT 所需最小实现及针对性验证，不负责规划、独立审查、发布或相邻清理。只报告适用的 `CHANGED`、`VERIFIED`、`REMAINING`、`EVIDENCE`、`NEXT`。";
 const DISCOVERY_PHASE_INSTRUCTIONS: &str = "阶段契约：DISCOVERY。只读调查，不修改文件或外部状态，TOOLS 中的外部工具也仅可只读取证；证据应定位到文件、符号或行号，并区分事实、推断与未知项。随后只报告适用的 `EVIDENCE`、`INFERENCE`、`UNKNOWN`、`NEXT`。";
 const REVIEW_PHASE_INSTRUCTIONS: &str = "阶段契约：REVIEW。只做独立审查，不修改文件或外部状态；仅报告可复现的正确性、安全性、回归或测试缺口，不报告纯风格偏好。每个 `FINDING` 包含严重度、位置、证据和影响；无问题时返回 `NO_FINDINGS`。";
 const VERIFICATION_PHASE_INSTRUCTIONS: &str = "阶段契约：VERIFICATION。只复现或验证，不修改产品代码与文档；仅当 TASK 明确授权时可修改测试文件，测试和构建产物不视为产品修改。TOOLS 中的测试或浏览器工具仍不得造成未授权外部状态变更。随后只报告适用的 `COMMAND`、`OUTCOME`、`FAILURE`、`ARTIFACTS`、`NEXT`。";
@@ -95,9 +95,7 @@ pub fn skill_fingerprint_values(skill_keys: Vec<String>) -> Vec<String> {
         .map(|key| {
             let revision = match key.as_str() {
                 "caveman" => "full-v1",
-                "caveman-slim" => "slim-v1",
-                "ponytail" => "full-v1",
-                "ponytail-slim" => "slim-v1",
+                "cas-slim" => "slim-v1",
                 _ => "unknown-v1",
             };
             format!("{key}@{revision}")
@@ -531,6 +529,25 @@ mod tests {
     }
 
     #[test]
+    fn delegated_execution_contract_keeps_safety_with_bounded_prompt_size() {
+        let rendered = render_delegated_agent_instructions_for_phase("", Some("EXECUTION"));
+        assert!(rendered.chars().count() <= 640);
+        for required in [
+            "GOAL、DECISIONS、ALLOW、DENY、TOOLS、CWD、ACCEPT、STOP",
+            "未授权的公开 API、数据模型或产品行为变更",
+            "磁盘事实冲突会改变方向",
+            "不得递归创建同职责子 Agent",
+            "`TOOLS: -` 表示禁用",
+            "外部写入、消息发送、发布、登录、授权或安装",
+            "ALLOW 明确许可",
+            "RESULT: NEEDS_DECISION",
+            "最小实现及针对性验证",
+        ] {
+            assert!(rendered.contains(required), "缺少契约：{required}");
+        }
+    }
+
+    #[test]
     fn delegated_agent_contract_changes_with_orchestration_phase() {
         let execution =
             render_delegated_agent_instructions_for_phase("角色规则。", Some("EXECUTION"));
@@ -713,8 +730,8 @@ mod tests {
             vec!["caveman@full-v1"]
         );
         assert_eq!(
-            skill_fingerprint_values(vec!["caveman-slim".to_owned()]),
-            vec!["caveman-slim@slim-v1"]
+            skill_fingerprint_values(vec!["cas-slim".to_owned()]),
+            vec!["cas-slim@slim-v1"]
         );
     }
 

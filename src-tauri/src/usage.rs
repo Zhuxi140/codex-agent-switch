@@ -3,9 +3,10 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::SystemTime;
 
 use cas_native_lifecycle::{
-    ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
+    RolloutState, ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
 };
 use cas_scheduler::{
     Candidate as AgentThreadCandidate, Profile as AgentSchedulingProfile, REUSE_CLAIM_TTL_SECONDS,
@@ -31,12 +32,21 @@ use crate::provider::ApiError;
 
 pub(crate) struct UsageService {
     repository: Mutex<SqliteUsageRepository>,
+    rollout_cache: Mutex<BTreeMap<PathBuf, CachedRollout>>,
+}
+
+#[derive(Clone, Copy)]
+struct CachedRollout {
+    length: u64,
+    modified_at: SystemTime,
+    state: RolloutState,
 }
 
 impl UsageService {
     pub(crate) fn open(database_path: &Path) -> Result<Self, UsageServiceError> {
         Ok(Self {
             repository: Mutex::new(SqliteUsageRepository::open(database_path)?),
+            rollout_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -143,7 +153,11 @@ impl UsageService {
                 "当前 Codex 状态库结构与 CAS 适配器不兼容；同步已安全停止。",
             ));
         }
-        let records = match load_native_subagent_records(&source) {
+        let mut rollout_cache = self
+            .rollout_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let records = match load_native_subagent_records(&source, &mut rollout_cache) {
             Ok(records) => records,
             Err(_) => {
                 return Ok(NativeSubagentSyncResponse::incompatible(
@@ -152,24 +166,61 @@ impl UsageService {
                 ));
             }
         };
+        drop(rollout_cache);
         let discovered_count = records.len();
         let mut synced_count = 0;
-        let mut repository = self.repository()?;
-        let transaction = repository
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(UsageServiceError::from)?;
-        for record in records {
-            let Some((agent_id, agent_name, _configured_context_window)) =
-                resolve_native_agent(&transaction, &record).map_err(UsageServiceError::from)?
-            else {
-                continue;
-            };
-            upsert_native_agent_instance(&transaction, &record, &agent_id, &agent_name)
-                .map_err(UsageServiceError::from)?;
-            synced_count += 1;
+        if !records.is_empty() {
+            let mut repository = self.repository()?;
+            let mut checked_keys = BTreeSet::new();
+            let mut has_mapped_agent = false;
+            for record in &records {
+                let key = (
+                    record.agent_role.as_deref(),
+                    record.model_provider.as_str(),
+                    record.model_slug.as_deref(),
+                );
+                if checked_keys.insert(key)
+                    && resolve_native_agent(&repository.connection, record)
+                        .map_err(UsageServiceError::from)?
+                        .is_some()
+                {
+                    has_mapped_agent = true;
+                    break;
+                }
+            }
+            if has_mapped_agent {
+                let transaction = repository
+                    .connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(UsageServiceError::from)?;
+                let mut resolved_agents: BTreeMap<
+                    (Option<&str>, &str, Option<&str>),
+                    Option<(String, String, Option<i64>)>,
+                > = BTreeMap::new();
+                for record in &records {
+                    let key = (
+                        record.agent_role.as_deref(),
+                        record.model_provider.as_str(),
+                        record.model_slug.as_deref(),
+                    );
+                    let resolved = if let Some(resolved) = resolved_agents.get(&key) {
+                        resolved.clone()
+                    } else {
+                        let resolved = resolve_native_agent(&transaction, record)
+                            .map_err(UsageServiceError::from)?;
+                        resolved_agents.insert(key, resolved.clone());
+                        resolved
+                    };
+                    let Some((agent_id, agent_name, _configured_context_window)) = resolved else {
+                        continue;
+                    };
+                    upsert_native_agent_instance(&transaction, record, &agent_id, &agent_name)
+                        .map_err(UsageServiceError::from)?;
+                    synced_count += 1;
+                }
+                transaction.commit().map_err(UsageServiceError::from)?;
+            }
         }
-        transaction.commit().map_err(UsageServiceError::from)?;
         Ok(NativeSubagentSyncResponse {
             capability: NativeSubagentSyncCapability::Supported,
             source_path: Some(source_path),
@@ -565,6 +616,7 @@ impl UsageService {
     pub(crate) fn in_memory() -> Self {
         Self {
             repository: Mutex::new(SqliteUsageRepository::in_memory().unwrap()),
+            rollout_cache: Mutex::new(BTreeMap::new()),
         }
     }
 }
@@ -2341,6 +2393,7 @@ fn table_columns(
 
 fn load_native_subagent_records(
     connection: &Connection,
+    rollout_cache: &mut BTreeMap<PathBuf, CachedRollout>,
 ) -> Result<Vec<NativeSubagentRecord>, rusqlite::Error> {
     let mut statement = connection.prepare(
         "SELECT child.id, edge.parent_thread_id, child.agent_role,
@@ -2352,10 +2405,13 @@ fn load_native_subagent_records(
          JOIN threads child ON child.id = edge.child_thread_id
          ORDER BY child.updated_at DESC",
     )?;
-    statement
+    let mut observed_paths = BTreeSet::new();
+    let records = statement
         .query_map([], |row| {
             let thread_id = row.get::<_, String>(0)?;
-            let rollout = rollout_state(Path::new(&row.get::<_, String>(8)?)).ok();
+            let rollout_path = PathBuf::from(row.get::<_, String>(8)?);
+            observed_paths.insert(rollout_path.clone());
+            let rollout = cached_rollout_state(rollout_cache, &rollout_path);
             let status =
                 match thread_state_from_rollout(&row.get::<_, String>(6)?, rollout.as_ref()) {
                     NativeThreadState::Closed => "CLOSED",
@@ -2379,7 +2435,42 @@ fn load_native_subagent_records(
                 updated_at: row.get(10)?,
             })
         })?
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    rollout_cache.retain(|path, _| observed_paths.contains(path));
+    Ok(records)
+}
+
+fn cached_rollout_state(
+    cache: &mut BTreeMap<PathBuf, CachedRollout>,
+    path: &Path,
+) -> Option<RolloutState> {
+    let signature = fs::metadata(path)
+        .ok()
+        .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?)));
+    if let (Some(cached), Some((length, modified_at))) = (cache.get(path), signature) {
+        if cached.length == length && cached.modified_at == modified_at {
+            return Some(cached.state);
+        }
+    }
+    cache.remove(path);
+    let state = rollout_state(path).ok()?;
+    if let Some((length, modified_at)) = signature {
+        let unchanged = fs::metadata(path)
+            .ok()
+            .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?)))
+            == Some((length, modified_at));
+        if unchanged {
+            cache.insert(
+                path.to_path_buf(),
+                CachedRollout {
+                    length,
+                    modified_at,
+                    state,
+                },
+            );
+        }
+    }
+    Some(state)
 }
 
 fn normalize_native_scope(cwd: &str) -> Option<String> {
@@ -2387,10 +2478,10 @@ fn normalize_native_scope(cwd: &str) -> Option<String> {
 }
 
 fn resolve_native_agent(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     record: &NativeSubagentRecord,
 ) -> Result<Option<(String, String, Option<i64>)>, rusqlite::Error> {
-    let mut statement = transaction.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT a.id, a.name, m.context_window,
                 CASE
                     WHEN ?2 IS NOT NULL
@@ -2469,7 +2560,7 @@ fn upsert_native_agent_instance(
     agent_id: &str,
     agent_name: &str,
 ) -> Result<(), rusqlite::Error> {
-    transaction.execute(
+    let mut statement = transaction.prepare_cached(
         "INSERT INTO agent_thread_instances (
             id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
             scope_key, status, input_tokens, cached_input_tokens, output_tokens,
@@ -2530,22 +2621,22 @@ fn upsert_native_agent_instance(
             OR agent_thread_instances.closed_at IS NOT excluded.closed_at
             OR agent_thread_instances.last_observed_at IS NOT excluded.last_observed_at
            )",
-        params![
-            format!("native-{}", record.thread_id),
-            agent_id,
-            agent_name,
-            record.thread_id,
-            record.parent_thread_id,
-            record.scope_key.as_deref(),
-            record.status,
-            record.total_tokens,
-            record.current_context_tokens,
-            record.context_window,
-            Option::<String>::None,
-            record.created_at,
-            record.updated_at,
-        ],
     )?;
+    statement.execute(params![
+        format!("native-{}", record.thread_id),
+        agent_id,
+        agent_name,
+        record.thread_id,
+        record.parent_thread_id,
+        record.scope_key.as_deref(),
+        record.status,
+        record.total_tokens,
+        record.current_context_tokens,
+        record.context_window,
+        Option::<String>::None,
+        record.created_at,
+        record.updated_at,
+    ])?;
     Ok(())
 }
 
@@ -3158,6 +3249,124 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rollout_cache_reuses_unchanged_file_and_reparses_after_append() {
+        let root = std::env::temp_dir().join(format!("cas-rollout-cache-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        let complete = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n";
+        fs::write(&path, complete).unwrap();
+        let mut cache = BTreeMap::new();
+
+        let first = cached_rollout_state(&mut cache, &path).unwrap();
+        assert_eq!(first.lifecycle, Some(NativeThreadState::Idle));
+        cache.get_mut(&path).unwrap().state.lifecycle = Some(NativeThreadState::Running);
+        assert_eq!(
+            cached_rollout_state(&mut cache, &path).unwrap().lifecycle,
+            Some(NativeThreadState::Running)
+        );
+
+        fs::write(&path, format!("{complete}{complete}")).unwrap();
+        assert_eq!(
+            cached_rollout_state(&mut cache, &path).unwrap().lifecycle,
+            Some(NativeThreadState::Idle)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_native_sync_does_not_require_cas_writer_lock() {
+        let root = std::env::temp_dir().join(format!("cas-native-empty-sync-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source_path = root.join("state_7.sqlite");
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_role TEXT,
+                    model_provider TEXT NOT NULL, model TEXT, tokens_used INTEGER NOT NULL,
+                    cwd TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        drop(source);
+
+        let database_path = root.join("cas.db");
+        let service = UsageService::open(&database_path).unwrap();
+        let mut writer = Connection::open(&database_path).unwrap();
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let result = service.sync_native_subagents(&root);
+        drop(lock);
+        drop(writer);
+        drop(service);
+
+        let success = result.is_ok();
+        drop(result);
+        fs::remove_file(source_path).unwrap();
+        fs::remove_file(database_path).unwrap();
+        fs::remove_dir(root).unwrap();
+        assert!(success, "没有原生子 Agent 时不应等待 CAS 写锁");
+    }
+
+    #[test]
+    fn unmapped_native_sync_does_not_require_cas_writer_lock() {
+        let root = std::env::temp_dir().join(format!("cas-native-unmapped-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = Connection::open(root.join("state_7.sqlite")).unwrap();
+        source
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, agent_role TEXT,
+                    model_provider TEXT NOT NULL, model TEXT, tokens_used INTEGER NOT NULL,
+                    cwd TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL, child_thread_id TEXT NOT NULL PRIMARY KEY,
+                    status TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO threads (id, rollout_path, agent_role, model_provider, model,
+                    tokens_used, cwd, created_at, updated_at)
+                 VALUES ('unmapped-child', ?1, 'executor', 'cas_missing', 'missing-model',
+                    0, 'C:\\workspace', 1786600000, 1786600300)",
+                [root.join("rollout.jsonl").to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+                 VALUES ('primary', 'unmapped-child', 'open')",
+                [],
+            )
+            .unwrap();
+        drop(source);
+
+        let database_path = root.join("cas.db");
+        let service = UsageService::open(&database_path).unwrap();
+        let mut writer = Connection::open(&database_path).unwrap();
+        let lock = writer
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        let result = service.sync_native_subagents(&root);
+        drop(lock);
+        drop(writer);
+        drop(service);
+        fs::remove_dir_all(root).unwrap();
+        let result = result.unwrap();
+        assert_eq!(result.discovered_count, 1);
+        assert_eq!(result.synced_count, 0);
+        assert_eq!(result.unmapped_count, 1);
+    }
+
+    #[test]
     fn native_subagent_state_sync_maps_primary_child_and_total_tokens() {
         let root =
             std::env::temp_dir().join(format!("cas-native-subagent-sync-{}", Uuid::new_v4()));
@@ -3252,15 +3461,39 @@ mod tests {
         // F-10：原生 threads.updated_at 语义未证明为模型请求时间，只能推进观察时间。
         assert_eq!(instances[0].last_model_usage_at, None);
         assert!(instances[0].last_observed_at.is_some());
+        let second_rollout = root.join("rollout-second.jsonl");
+        fs::copy(root.join("rollout.jsonl"), &second_rollout).unwrap();
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute(
+                "INSERT INTO threads (
+                    id, rollout_path, agent_role, model_provider, model, tokens_used, cwd,
+                    created_at, updated_at
+                 ) SELECT 'thread-child-native-2', ?1, agent_role, model_provider, model,
+                          tokens_used, cwd, created_at, updated_at
+                   FROM threads WHERE id = 'thread-child-native'",
+                [second_rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        source
+            .execute(
+                "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status)
+                 VALUES ('thread-primary', 'thread-child-native-2', 'open')",
+                [],
+            )
+            .unwrap();
+        drop(source);
         let second_sync = service.sync_native_subagents(&root).unwrap();
-        assert_eq!(second_sync.synced_count, 1);
-        assert_eq!(
-            service
-                .list_agent_instances(AgentThreadInstanceListRequest::default())
-                .unwrap()
-                .items
-                .len(),
-            1
+        assert_eq!(second_sync.synced_count, 2);
+        let instances = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap()
+            .items;
+        assert_eq!(instances.len(), 2);
+        assert!(
+            instances
+                .iter()
+                .all(|instance| instance.agent_id.as_deref() == Some("agent-1"))
         );
         let repository = service.repository().unwrap();
         assert_eq!(

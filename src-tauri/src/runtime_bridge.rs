@@ -1333,10 +1333,25 @@ fn is_isolated_e2e_workspace_request(message: &Value) -> bool {
         return false;
     };
     is_isolated_e2e_workspace_request_for_root(message, &root)
+        || std::env::var_os("CAS_E2E_BENCHMARK_ROOT")
+            .map(PathBuf::from)
+            .is_some_and(|benchmark_root| {
+                ["OFF-01", "ON-01"].iter().any(|run_id| {
+                    is_isolated_e2e_workspace_request_for_workspace(
+                        message,
+                        &benchmark_root.join(run_id),
+                    )
+                })
+            })
 }
 
 #[cfg(test)]
 fn is_isolated_e2e_workspace_request_for_root(message: &Value, root: &Path) -> bool {
+    is_isolated_e2e_workspace_request_for_workspace(message, &root.join("workspace"))
+}
+
+#[cfg(test)]
+fn is_isolated_e2e_workspace_request_for_workspace(message: &Value, workspace: &Path) -> bool {
     if message
         .pointer("/params/networkApprovalContext")
         .is_some_and(|value| !value.is_null())
@@ -1349,7 +1364,7 @@ fn is_isolated_e2e_workspace_request_for_root(message: &Value, root: &Path) -> b
     let Some(cwd) = message.pointer("/params/cwd").and_then(Value::as_str) else {
         return false;
     };
-    Path::new(cwd).starts_with(root.join("workspace"))
+    Path::new(cwd).starts_with(workspace)
 }
 
 #[cfg(not(test))]
@@ -2992,6 +3007,15 @@ mod tests {
                 }
             }),
             root,
+        ));
+        let benchmark_workspace = Path::new("D:\\CAS-E2E-Results\\pilot-runs\\OFF-01");
+        assert!(is_isolated_e2e_workspace_request_for_workspace(
+            &request("D:\\CAS-E2E-Results\\pilot-runs\\OFF-01"),
+            benchmark_workspace,
+        ));
+        assert!(!is_isolated_e2e_workspace_request_for_workspace(
+            &request("D:\\CAS-E2E-Results\\pilot-runs\\ON-01"),
+            benchmark_workspace,
         ));
     }
 

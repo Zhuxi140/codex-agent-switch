@@ -25,12 +25,14 @@ use crate::codex_config::{
     global_orchestration_projection_semantic, model_catalog_projection_semantic,
     orchestration_projection_semantic, project_exclusion_projection_matches,
     provider_projection_semantic, remove_global_orchestration_projection,
-    remove_model_catalog_projection, remove_orchestration_projection, remove_provider_projection,
-    render_agent_projection, restore_model_catalog_projection, restore_orchestration_projection,
+    remove_model_catalog_projection, remove_orchestration_projection,
+    remove_orphaned_cas_projection, remove_provider_projection, render_agent_projection,
+    restore_model_catalog_projection, restore_orchestration_projection,
     restore_project_exclusion_projection, restore_provider_projection,
-    upgrade_orchestration_baseline, upsert_global_orchestration_projection,
-    upsert_model_catalog_projection, upsert_orchestration_projection_with_hooks,
-    upsert_project_exclusion_projection, upsert_provider_projection,
+    upgrade_orchestration_baseline, upsert_cas_assessment_mcp,
+    upsert_global_orchestration_projection, upsert_model_catalog_projection,
+    upsert_orchestration_projection_with_hooks, upsert_project_exclusion_projection,
+    upsert_provider_projection,
 };
 use crate::codex_environment::{self, CodexEnvironment};
 use crate::codex_hooks::{RuntimeHookStatus, RuntimeHookStatusResponse, probe_runtime_hook_status};
@@ -55,6 +57,11 @@ const CONFIG_RELATIVE_PATH: &str = "config.toml";
 const GLOBAL_INSTRUCTIONS_PATH: &str = "AGENTS.md";
 const GLOBAL_OVERRIDE_INSTRUCTIONS_PATH: &str = "AGENTS.override.md";
 const ORCHESTRATION_RULES_RELATIVE_PATH: &str = "cas/CAS_ORCHESTRATION.md";
+const DELEGATION_SKILL_RELATIVE_PATH: &str = "skills/cas-delegate/SKILL.md";
+const DELEGATION_SKILL_POLICY_RELATIVE_PATH: &str = "skills/cas-delegate/agents/openai.yaml";
+const DELEGATION_SKILL: &str = include_str!("../bundled-skills/cas-delegate/SKILL.md");
+const DELEGATION_SKILL_POLICY: &str =
+    include_str!("../bundled-skills/cas-delegate/agents/openai.yaml");
 const EXEC_POLICY_RELATIVE_PATH: &str = "rules/cas-runtime.rules";
 const MIXED_CATALOG_KEY: &str = "mixed-v1";
 const ACTIVE_TRANSACTION_STATUSES: [&str; 5] = [
@@ -78,21 +85,13 @@ const BUNDLED_SKILLS: &[BundledSkill] = &[
         license: include_str!("../bundled-skills/caveman/LICENSE"),
     },
     BundledSkill {
-        key: "ponytail",
-        skill: include_str!("../bundled-skills/ponytail/SKILL.md"),
-        license: include_str!("../bundled-skills/ponytail/LICENSE"),
-    },
-    BundledSkill {
-        key: "caveman-slim",
-        skill: include_str!("../bundled-skills/caveman-slim/SKILL.md"),
-        license: include_str!("../bundled-skills/caveman-slim/LICENSE"),
-    },
-    BundledSkill {
-        key: "ponytail-slim",
-        skill: include_str!("../bundled-skills/ponytail-slim/SKILL.md"),
-        license: include_str!("../bundled-skills/ponytail-slim/LICENSE"),
+        key: "cas-slim",
+        skill: include_str!("../bundled-skills/cas-slim/SKILL.md"),
+        license: include_str!("../bundled-skills/cas-slim/LICENSE"),
     },
 ];
+
+const RETIRED_BUNDLED_SKILL_KEYS: &[&str] = &["caveman-slim", "ponytail", "ponytail-slim"];
 
 pub(crate) struct ConfigurationService {
     database_path: PathBuf,
@@ -327,7 +326,30 @@ impl ConfigurationService {
             self.fixed_codex_home.is_some() || self.environment()?.runtime_hooks_available;
         let runtime_hook_status = self.runtime_hook_status();
         let database = diagnose_database(&connection)?;
-        let configuration = diagnose_configuration(self.get_status());
+        let mut configuration = diagnose_configuration(self.get_status());
+        match self.preview_orphan_cleanup() {
+            Ok(orphan_preview) => {
+                if !orphan_preview.items.is_empty() {
+                    configuration.issues.push(DiagnosticIssue::warning(
+                        "CAS_ORPHANED_RESOURCES",
+                        format!(
+                            "检测到 {} 项失去所有权记录的 CAS 投影；请查看清理预览并显式确认。常规配置同步不会自动移除它们。",
+                            orphan_preview.items.len()
+                        ),
+                    ));
+                }
+                if !orphan_preview.warnings.is_empty() {
+                    configuration.issues.push(DiagnosticIssue::warning(
+                        "CAS_ORPHAN_CLEANUP_SKIPPED",
+                        orphan_preview.warnings.join("\n"),
+                    ));
+                }
+            }
+            Err(_) => configuration.issues.push(DiagnosticIssue::warning(
+                "CAS_ORPHAN_SCAN_FAILED",
+                "无法完成 CAS 残留扫描；请先检查 Codex 配置文件结构。",
+            )),
+        }
         let orchestration =
             diagnose_orchestration(&connection, runtime_hooks_available, &runtime_hook_status)?;
         let providers = diagnose_providers(&connection, request.include_network_checks)?;
@@ -356,6 +378,319 @@ impl ConfigurationService {
             changes: preview.changes,
             blockers: preview.blockers,
             warnings: preview.warnings,
+        })
+    }
+
+    pub(crate) fn preview_orphan_cleanup(
+        &self,
+    ) -> Result<OrphanCleanupPreview, ConfigurationError> {
+        let plan = self.orphan_cleanup_plan()?;
+        Ok(OrphanCleanupPreview {
+            fingerprint: plan.fingerprint,
+            items: plan
+                .changes
+                .into_iter()
+                .map(|change| OrphanCleanupItem {
+                    relative_path: change.relative_path,
+                    summary: change.summary,
+                })
+                .collect(),
+            warnings: plan.warnings,
+        })
+    }
+
+    pub(crate) fn apply_orphan_cleanup(
+        &self,
+        request: OrphanCleanupRequest,
+    ) -> Result<OrphanCleanupResponse, ConfigurationError> {
+        if !request.confirmed {
+            return Err(ConfigurationError::ApplyBlocked(
+                "ORPHAN_CLEANUP_CONFIRMATION_REQUIRED".to_owned(),
+            ));
+        }
+        let _operation = self.operation_guard()?;
+        let _process_lock = ProcessLock::acquire(&self.data_home.join("configuration.lock"))?;
+        let connection = open_database(&self.database_path)?;
+        ensure_no_active_transaction(&connection)?;
+        drop(connection);
+        let plan = self.orphan_cleanup_plan()?;
+        if plan.fingerprint != request.expected_fingerprint {
+            return Err(ConfigurationError::DesiredStateChanged);
+        }
+        if plan.changes.is_empty() {
+            return Ok(OrphanCleanupResponse {
+                snapshot_id: None,
+                cleaned_count: 0,
+                restart_recommended: false,
+            });
+        }
+        let scope = plan
+            .changes
+            .iter()
+            .map(|change| SnapshotManifestResource {
+                resource_type: change.resource_type.to_owned(),
+                logical_key: change.logical_key.clone(),
+                relative_path: change.relative_path.clone(),
+                was_managed: false,
+                origin_entity_type: None,
+                origin_entity_id: None,
+            })
+            .collect::<Vec<_>>();
+        for change in &plan.changes {
+            let path = safe_join(&plan.codex_home, &change.relative_path)?;
+            reject_symlink_chain(&plan.codex_home, &path)?;
+        }
+        let snapshot = self.create_snapshot("BEFORE_ORPHAN_CLEANUP", &plan.codex_home, &scope)?;
+        for change in &plan.changes {
+            let path = safe_join(&plan.codex_home, &change.relative_path)?;
+            reject_symlink_chain(&plan.codex_home, &path)?;
+            if hash_text(&read_optional_utf8(&path)?) != change.original_hash {
+                return Err(ConfigurationError::DesiredStateChanged);
+            }
+        }
+        let write_result = (|| -> Result<(), ConfigurationError> {
+            for change in &plan.changes {
+                let path = safe_join(&plan.codex_home, &change.relative_path)?;
+                reject_symlink_chain(&plan.codex_home, &path)?;
+                if let Some(after) = &change.after {
+                    atomic_write(&path, after.as_bytes())?;
+                } else {
+                    fs::remove_file(&path)?;
+                }
+            }
+            for change in &plan.changes {
+                let path = safe_join(&plan.codex_home, &change.relative_path)?;
+                reject_symlink_chain(&plan.codex_home, &path)?;
+                let complete = match &change.after {
+                    Some(after) => read_optional_utf8(&path)? == *after,
+                    None => !path.exists(),
+                };
+                if !complete {
+                    return Err(ConfigurationError::ApplyBlocked(
+                        "ORPHAN_CLEANUP_INCOMPLETE".to_owned(),
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            for change in &plan.changes {
+                let path = safe_join(&plan.codex_home, &change.relative_path)?;
+                reject_symlink_chain(&plan.codex_home, &path)?;
+            }
+            restore_snapshot_exact(&snapshot)?;
+            return Err(error);
+        }
+        Ok(OrphanCleanupResponse {
+            snapshot_id: Some(snapshot.id),
+            cleaned_count: plan.changes.len(),
+            restart_recommended: true,
+        })
+    }
+
+    fn orphan_cleanup_plan(&self) -> Result<OrphanCleanupPlan, ConfigurationError> {
+        let codex_home = self.codex_home()?;
+        let connection = open_database(&self.database_path)?;
+        let managed = load_managed_resources(&connection)?;
+        let can_repair = !orchestration_is_active(&connection)?
+            && !managed.values().any(|resource| {
+                matches!(
+                    resource.resource_type.as_str(),
+                    AGENT_RESOURCE
+                        | ORCHESTRATION_RESOURCE
+                        | GLOBAL_INSTRUCTIONS_RESOURCE
+                        | ORCHESTRATION_RULES_RESOURCE
+                        | BUNDLED_SKILL_RESOURCE
+                        | EXEC_POLICY_RESOURCE
+                )
+            });
+        let mut changes = Vec::new();
+        let mut warnings = Vec::new();
+        if can_repair {
+            let config_path = codex_home.join(CONFIG_RELATIVE_PATH);
+            reject_symlink_chain(&codex_home, &config_path)?;
+            let config = read_optional_utf8(&config_path)?;
+            let cleaned_config = remove_orphaned_cas_projection(&config)?;
+            let remaining_config = cleaned_config
+                .parse::<DocumentMut>()
+                .map_err(ConfigError::from)?;
+            if remaining_config
+                .get("mcp_servers")
+                .and_then(|item| item.as_table())
+                .and_then(|servers| servers.get("cas_assessment"))
+                .is_some()
+            {
+                warnings
+                    .push("mcp_servers.cas_assessment 不符合 CAS 所有权标记，已保留。".to_owned());
+            }
+            if cleaned_config != config {
+                changes.push(OrphanChange {
+                    resource_type: ORCHESTRATION_RESOURCE,
+                    logical_key: "primary-strict-stop".to_owned(),
+                    relative_path: CONFIG_RELATIVE_PATH.to_owned(),
+                    original_hash: hash_text(&config),
+                    after: Some(cleaned_config),
+                    summary: "清除 CAS 指令、MCP、Hook；保留其他设置与 Hook 信任记录".to_owned(),
+                });
+            }
+            let global_path = codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+            reject_symlink_chain(&codex_home, &global_path)?;
+            let global = read_optional_utf8(&global_path)?;
+            let cleaned_global = remove_global_orchestration_projection(&global, None)?;
+            if cleaned_global != global {
+                changes.push(OrphanChange {
+                    resource_type: GLOBAL_INSTRUCTIONS_RESOURCE,
+                    logical_key: GLOBAL_INSTRUCTIONS_PATH.to_owned(),
+                    relative_path: GLOBAL_INSTRUCTIONS_PATH.to_owned(),
+                    original_hash: hash_text(&global),
+                    after: Some(cleaned_global),
+                    summary: "清除全局 AGENTS.md 中带标记的 CAS 入口".to_owned(),
+                });
+            }
+            include_orphan_file(
+                &codex_home,
+                ORCHESTRATION_RULES_RELATIVE_PATH,
+                ORCHESTRATION_RULES_RESOURCE,
+                ORCHESTRATION_RULES_RELATIVE_PATH,
+                "移除旧版 CAS 编排规则",
+                |content| {
+                    content
+                        .replace("\r\n", "\n")
+                        .starts_with("# CAS Runtime First 调用规则\n")
+                },
+                &mut changes,
+                &mut warnings,
+            )?;
+            include_orphan_file(
+                &codex_home,
+                EXEC_POLICY_RELATIVE_PATH,
+                EXEC_POLICY_RESOURCE,
+                EXEC_POLICY_RELATIVE_PATH,
+                "移除 CAS helper 命令放行规则",
+                |content| content.starts_with("# Managed by Codex Agent Switch."),
+                &mut changes,
+                &mut warnings,
+            )?;
+            include_orphan_file(
+                &codex_home,
+                DELEGATION_SKILL_RELATIVE_PATH,
+                BUNDLED_SKILL_RESOURCE,
+                DELEGATION_SKILL_RELATIVE_PATH,
+                "移除 CAS 委派 Skill",
+                |content| {
+                    content
+                        .replace("\r\n", "\n")
+                        .starts_with("---\nname: cas-delegate\n")
+                },
+                &mut changes,
+                &mut warnings,
+            )?;
+            include_orphan_file(
+                &codex_home,
+                DELEGATION_SKILL_POLICY_RELATIVE_PATH,
+                BUNDLED_SKILL_RESOURCE,
+                DELEGATION_SKILL_POLICY_RELATIVE_PATH,
+                "移除 CAS 委派 Skill 策略",
+                |content| content.replace("\r\n", "\n") == DELEGATION_SKILL_POLICY,
+                &mut changes,
+                &mut warnings,
+            )?;
+            let agents_dir = codex_home.join("agents");
+            reject_symlink_chain(&codex_home, &agents_dir)?;
+            if agents_dir.is_dir() {
+                for entry in fs::read_dir(&agents_dir)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    let Some(key) = name
+                        .strip_prefix("cas-")
+                        .and_then(|value| value.strip_suffix(".toml"))
+                    else {
+                        continue;
+                    };
+                    let relative_path = format!("agents/{name}");
+                    include_orphan_file(
+                        &codex_home,
+                        &relative_path,
+                        AGENT_RESOURCE,
+                        key,
+                        "移除失去 CAS 绑定记录的 Agent 配置",
+                        |content| {
+                            content.parse::<DocumentMut>().ok().is_some_and(|document| {
+                                document.get("name").and_then(|item| item.as_str()) == Some(key)
+                                    && document
+                                        .get("developer_instructions")
+                                        .and_then(|item| item.as_str())
+                                        .is_some_and(|text| {
+                                            text.contains("你是由 Primary 委派的 Child Agent")
+                                        })
+                            })
+                        },
+                        &mut changes,
+                        &mut warnings,
+                    )?;
+                }
+            }
+            for key in BUNDLED_SKILLS
+                .iter()
+                .map(|skill| skill.key)
+                .chain(RETIRED_BUNDLED_SKILL_KEYS.iter().copied())
+            {
+                let skill_path = format!("cas/bundled-skills/{key}/SKILL.md");
+                let matched = include_orphan_file(
+                    &codex_home,
+                    &skill_path,
+                    BUNDLED_SKILL_RESOURCE,
+                    &format!("{key}/SKILL.md"),
+                    "移除 CAS 随附 Skill",
+                    |content| {
+                        content
+                            .replace("\r\n", "\n")
+                            .starts_with(&format!("---\nname: {key}\n"))
+                    },
+                    &mut changes,
+                    &mut warnings,
+                )?;
+                if matched {
+                    let license_path = format!("cas/bundled-skills/{key}/LICENSE");
+                    include_orphan_file(
+                        &codex_home,
+                        &license_path,
+                        BUNDLED_SKILL_RESOURCE,
+                        &format!("{key}/LICENSE"),
+                        "移除 CAS 随附 Skill 许可证副本",
+                        |_| true,
+                        &mut changes,
+                        &mut warnings,
+                    )?;
+                }
+            }
+            if !changes.is_empty() && load_orchestration_baseline_json(&connection)?.is_none() {
+                warnings.push(
+                    "原始编排基线已丢失；权限、agents.enabled 与 multi_agent 设置不会被猜测回滚。"
+                        .to_owned(),
+                );
+            }
+        }
+        changes.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        let fingerprint = hash_text(
+            &changes
+                .iter()
+                .map(|change| {
+                    format!(
+                        "{}\0{}\0{}\n",
+                        change.relative_path,
+                        change.original_hash,
+                        change.after.as_deref().map(hash_text).unwrap_or_default()
+                    )
+                })
+                .collect::<String>(),
+        );
+        Ok(OrphanCleanupPlan {
+            codex_home,
+            fingerprint,
+            changes,
+            warnings,
         })
     }
 
@@ -1136,7 +1471,6 @@ impl ConfigurationService {
         let helper_path = self.helper_path()?;
         let runtime_hooks_available =
             self.fixed_codex_home.is_some() || self.environment()?.runtime_hooks_available;
-        let runtime_hook_command = runtime_hook_command(&helper_path, &self.database_path);
         let config_path = codex_home.join(CONFIG_RELATIVE_PATH);
         reject_symlink(&config_path)?;
         let existing_config = read_optional_utf8(&config_path)?;
@@ -1248,8 +1582,10 @@ impl ConfigurationService {
                             "ORCHESTRATION_BASELINE_MISSING".to_owned(),
                         )
                     })?,
-                    runtime_hooks_available.then_some(runtime_hook_command.as_str()),
+                    runtime_hooks_available,
                 )?;
+                final_config =
+                    upsert_cas_assessment_mcp(&final_config, &helper_path, &self.database_path)?;
             }
         }
 
@@ -1547,6 +1883,11 @@ impl ConfigurationService {
         if let Some(path) = self.fixed_helper_path.as_ref() {
             return Ok(path.clone());
         }
+        if cfg!(debug_assertions)
+            && let Some(path) = option_env!("CAS_DEV_HELPER_PATH")
+        {
+            return Ok(PathBuf::from(path));
+        }
         let executable = std::env::current_exe()?;
         let name = if cfg!(windows) {
             "cas-helper.exe"
@@ -1730,6 +2071,52 @@ pub(crate) struct ConfigurationApplyPreview {
     blockers: Vec<DiagnosticIssue>,
     warnings: Vec<DiagnosticIssue>,
     has_changes: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrphanCleanupPreview {
+    fingerprint: String,
+    items: Vec<OrphanCleanupItem>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OrphanCleanupItem {
+    relative_path: String,
+    summary: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrphanCleanupRequest {
+    expected_fingerprint: String,
+    confirmed: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OrphanCleanupResponse {
+    snapshot_id: Option<String>,
+    cleaned_count: usize,
+    restart_recommended: bool,
+}
+
+struct OrphanCleanupPlan {
+    codex_home: PathBuf,
+    fingerprint: String,
+    changes: Vec<OrphanChange>,
+    warnings: Vec<String>,
+}
+
+struct OrphanChange {
+    resource_type: &'static str,
+    logical_key: String,
+    relative_path: String,
+    original_hash: String,
+    after: Option<String>,
+    summary: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1992,6 +2379,7 @@ struct OwnedProviderProjection {
     base_url: String,
     helper_command: String,
     credential_id: String,
+    chat_completions: bool,
 }
 
 impl OwnedProviderProjection {
@@ -2002,6 +2390,7 @@ impl OwnedProviderProjection {
             base_url: &self.base_url,
             helper_command: &self.helper_command,
             credential_id: &self.credential_id,
+            chat_completions: self.chat_completions,
         }
     }
 }
@@ -2161,6 +2550,8 @@ impl ConfigurationError {
                 "PROVIDER_CREDENTIAL_MISSING" => "Provider 缺少 Credential。",
                 "MODEL_CATALOG_UNAVAILABLE" => "Agent 缺少 Codex Runtime Model Catalog。",
                 "ORCHESTRATION_BASELINE_MISSING" => "编排基线缺失，无法安全同步配置。",
+                "ORPHAN_CLEANUP_CONFIRMATION_REQUIRED" => "清理残留前必须显式确认。",
+                "ORPHAN_CLEANUP_INCOMPLETE" => "残留清理未完成，已尝试从 Snapshot 恢复。",
                 _ => "配置同步被前置校验阻止。",
             },
             Self::SnapshotNotFound => "Snapshot 不存在。",
@@ -2258,18 +2649,6 @@ type DesiredLoad = (
     Vec<DiagnosticIssue>,
 );
 
-fn runtime_hook_command(helper_path: &Path, database_path: &Path) -> String {
-    format!(
-        "{} hook {} cas-runtime-enforcement-v1",
-        quote_command_argument(helper_path),
-        quote_command_argument(database_path)
-    )
-}
-
-fn quote_command_argument(path: &Path) -> String {
-    format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""))
-}
-
 fn load_desired_resources(
     connection: &Connection,
     codex_home: &Path,
@@ -2303,7 +2682,7 @@ fn load_desired_resources(
                     a.reasoning_policy, a.managed, b.id, m.id, m.model_id, m.enabled,
                     m.compatibility_level, p.id, p.provider_key, p.name, p.base_url,
                     p.enabled, c.id, a.orchestration_phase,
-                    m.default_reasoning, m.reasoning_supported, p.preset_id
+                    m.default_reasoning, m.reasoning_supported, p.preset_id, p.protocol
              FROM agents a
              LEFT JOIN agent_model_bindings b ON b.agent_id = a.id AND b.enabled = 1
              LEFT JOIN models m ON m.id = b.model_id
@@ -2337,6 +2716,7 @@ fn load_desired_resources(
                             .get::<_, Option<i64>>(20)?
                             .map(|value| value != 0),
                         provider_preset_id: row.get(21)?,
+                        provider_protocol: row.get(22)?,
                         effective_reasoning_effort: None,
                         skill_keys: Vec::new(),
                         disabled_mcp_server_ids: Vec::new(),
@@ -2492,12 +2872,18 @@ fn load_desired_resources(
         let codex_provider_id = format!("cas_{provider_key}");
         let native_provider = agent.provider_preset_id.as_deref() == Some("codex-native");
         if !native_provider && projected_providers.insert(provider_entity_id.clone()) {
+            let chat_completions = agent.provider_protocol.as_deref() == Some("CHAT_COMPLETIONS");
             let provider_projection = OwnedProviderProjection {
                 provider_id: codex_provider_id.clone(),
                 display_name: provider_name.clone(),
-                base_url: agent.base_url.clone().expect("validated provider"),
+                base_url: if chat_completions {
+                    crate::chat_gateway::provider_base_url(provider_entity_id)
+                } else {
+                    agent.base_url.clone().expect("validated provider")
+                },
                 helper_command: helper_command.clone(),
                 credential_id: agent.credential_id.clone().unwrap_or_default(),
+                chat_completions,
             };
             let rendered = upsert_provider_projection("", &provider_projection.borrowed())?;
             let semantic = provider_projection_semantic(&rendered, &codex_provider_id)?
@@ -2509,7 +2895,14 @@ fn load_desired_resources(
                 target_path: codex_home.join(CONFIG_RELATIVE_PATH),
                 semantic,
                 content: None,
-                summary: format!("配置 Responses Provider {provider_name}"),
+                summary: format!(
+                    "配置 {} Provider {provider_name}",
+                    if chat_completions {
+                        "Chat Completions 兼容"
+                    } else {
+                        "Responses"
+                    }
+                ),
                 origin_entity_type: "PROVIDER".to_owned(),
                 origin_entity_id: provider_entity_id.clone(),
                 provider: Some(provider_projection),
@@ -2568,22 +2961,8 @@ fn load_desired_resources(
                         session_catalog_path: None,
                     });
                 }
-                // Codex 只从 $CODEX_HOME/skills/<key>/SKILL.md 发现技能；agent 定义内
-                // 的 skills.config 不被 Runtime 消费，必须同时投影到规范位置。
-                let codex_skill_relative_path = format!("skills/{}/SKILL.md", skill.key);
-                resources.push(DesiredResource {
-                    resource_type: BUNDLED_SKILL_RESOURCE.to_owned(),
-                    logical_key: codex_skill_relative_path.clone(),
-                    target_path: safe_join(codex_home, &codex_skill_relative_path)?,
-                    relative_path: codex_skill_relative_path,
-                    semantic: skill.skill.to_owned(),
-                    content: Some(skill.skill.to_owned()),
-                    summary: format!("配置内置 Skill {} 到 Codex 技能目录", skill.key),
-                    origin_entity_type: "SKILL".to_owned(),
-                    origin_entity_id: skill.key.to_owned(),
-                    provider: None,
-                    session_catalog_path: None,
-                });
+                // 全局 skills 目录也会被 Primary 发现。Agent 绑定的技能只保留在
+                // CAS 私有路径，由 Child 的 developer_instructions 按需读取。
             }
         }
         if !skills_valid {
@@ -2599,7 +2978,6 @@ fn load_desired_resources(
             developer_instructions: &agent.instruction,
             orchestration_phase: agent.phase.as_deref(),
             model_catalog_path: Some(model_catalog_path),
-            skill_keys: &agent.skill_keys,
             skill_paths: &skill_paths,
             disabled_mcp_server_ids: &agent.disabled_mcp_server_ids,
             mcp_tool_policies: &agent.mcp_tool_policies,
@@ -2648,14 +3026,35 @@ fn load_desired_resources(
             provider: None,
             session_catalog_path: None,
         });
+        for (relative_path, content) in [
+            (DELEGATION_SKILL_RELATIVE_PATH, DELEGATION_SKILL),
+            (
+                DELEGATION_SKILL_POLICY_RELATIVE_PATH,
+                DELEGATION_SKILL_POLICY,
+            ),
+        ] {
+            resources.push(DesiredResource {
+                resource_type: BUNDLED_SKILL_RESOURCE.to_owned(),
+                logical_key: relative_path.to_owned(),
+                relative_path: relative_path.to_owned(),
+                target_path: safe_join(codex_home, relative_path)?,
+                semantic: content.to_owned(),
+                content: Some(content.to_owned()),
+                summary: "配置用户显式委派 Skill".to_owned(),
+                origin_entity_type: "SKILL".to_owned(),
+                origin_entity_id: "cas-delegate".to_owned(),
+                provider: None,
+                session_catalog_path: None,
+            });
+        }
         let bootstrap = render_orchestration_bootstrap(&rules_path);
-        let hook_command = runtime_hook_command(helper_path, database_path);
         let rendered = upsert_orchestration_projection_with_hooks(
             "",
             &bootstrap,
             &baseline,
-            runtime_hooks_available.then_some(hook_command.as_str()),
+            runtime_hooks_available,
         )?;
+        let rendered = upsert_cas_assessment_mcp(&rendered, helper_path, database_path)?;
         let semantic = orchestration_projection_semantic(&rendered)?
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         resources.push(DesiredResource {
@@ -2675,13 +3074,14 @@ fn load_desired_resources(
             session_catalog_path: None,
         });
 
-        // AGENTS 与 developer_instructions 只保留同源的按需入口；完整调用契约位于
-        // 独立 CAS-owned 规则文件。委派准入、租约与写入强制仍由 Runtime/Hook/DB 承担。
+        // developer_instructions 保留决策入口；AGENTS 只标注规则位置，避免重复注入。
+        // 委派准入、租约与写入强制仍由 Runtime/Hook/DB 承担。
         let relative_path = resolve_global_instructions_path(codex_home)?;
         let target_path = safe_join(codex_home, &relative_path)?;
         reject_symlink(&target_path)?;
+        let pointer = render_global_orchestration_pointer(&rules_path);
         let content =
-            upsert_global_orchestration_projection(&read_optional_utf8(&target_path)?, &bootstrap)?;
+            upsert_global_orchestration_projection(&read_optional_utf8(&target_path)?, &pointer)?;
         let semantic = global_orchestration_projection_semantic(&content)?
             .ok_or(ConfigurationError::InvalidSnapshot)?;
         resources.push(DesiredResource {
@@ -2770,6 +3170,7 @@ struct ActiveAgentProjectionRow {
     model_default_reasoning: Option<String>,
     model_reasoning_supported: Option<bool>,
     provider_preset_id: Option<String>,
+    provider_protocol: Option<String>,
     effective_reasoning_effort: Option<String>,
     skill_keys: Vec<String>,
     disabled_mcp_server_ids: Vec<String>,
@@ -2792,6 +3193,11 @@ fn render_control_plane_exec_policy(helper_path: &Path, database_path: &Path) ->
         .expect("serializing database path cannot fail");
     format!(
         "# Managed by Codex Agent Switch. Remove through CAS Default mode.\n\
+prefix_rule(\n\
+    pattern = [{helper}, \"job-plan\", {database}],\n\
+    decision = \"allow\",\n\
+    justification = \"CAS evaluates candidates and schedules only eligible Jobs.\",\n\
+)\n\n\
 prefix_rule(\n\
     pattern = [{helper}, \"job-assess\", {database}],\n\
     decision = \"allow\",\n\
@@ -2857,21 +3263,21 @@ fn render_orchestration_instructions(
     format!(
         "CAS Primary 编排协议（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\
 当前失败策略：{failure_policy_label}\n\n\
-- 规则只约束 Primary/root；Child 忽略本块且不递归委派。\n\
-- 默认由 Primary 完成；用户/项目禁委派优先。任务优先级只决定先后，不单独触发委派。\n\
-- 小任务直接完成，不运行评估；仅候选调用本地 `job-assess`，无额外模型。只选 phase 匹配的 Active Agent；边界/验收不明或交接成本高则留 Primary。\n\
-- 角色门槛：DISCOVERY 两条调用链/三模块（须文件行号证据）；EXECUTION 两个非机械目标或跨模块且有测试；REVIEW 高风险或用户明确要求；VERIFICATION 跨环境/多阶段（须独立验收）。普通检索、单点修复和单命令测试留 Primary。\n\
-- Child 继承权限；父任务必须使用 Auto 或 Workspace；Read Only 写前提示 `/permissions`。\n\
-- 直输 `CAS:OFF`/`CAS:ON` 才生效：OFF Primary 负责，ON 恢复。\n\n\
+- 规则只约束 Primary/root；Child 不读本块、不递归委派。\n\
+- 默认由 Primary 完成；用户/项目禁委派优先。评分和优先级均不授权委派。\n\
+- 小任务直接做；仅有界、独立验收、低交接成本的候选调用 CAS MCP `assess_delegation`，只选 phase 匹配的 Active Agent。\n\
+- `CAS2|ASSESS|SUGGEST|5|5|<reason>|<phase>` 只建议、不调度；Primary 继续完成任务，禁创建 Job/Child 或改字段重试。用户明确要求本次委派时才使用 `$cas-delegate` Skill，提交 `explicit_request=true`；`CAS:ON`/评分不授权。模型由当前绑定决定，不硬编码型号。\n\
+- 角色门槛：DISCOVERY 两条调用链/三模块（文件行号证据）；EXECUTION 两个独立验收目标（共享实现算1）或跨模块且有测试；REVIEW 高风险或用户明确要求；VERIFICATION 跨环境/多阶段。普通检索、单点修复、单命令测试留 Primary。\n\
+- Child 继承权限；父任务必须使用 Auto 或 Workspace；Read Only 写前用 `/permissions`。\n\
+- 仅直输 `CAS:OFF`/`CAS:ON` 生效：OFF 由 Primary 负责，ON 恢复候选建议，不代表本次委派。\n\n\
 {active_agents}\n\n\
 CAS2\n\
 1. H=`\"{}\"`、D=`\"{}\"`、W=绝对 `cwd`；`workdir=\"{}\"`（禁用项目目录）；`sandbox_permissions=require_escalated`；Parent=`CODEX_THREAD_ID`。\n\
-1a. 候选用 PTY `H job-assess D <agent-key> W`，stdin JSON 必填 `{{\"bounded\":true,\"acceptance_defined\":true,\"independent\":true,\"handoff_small\":true}}`；选填 `call_chains/modules/work_units/tests_defined/high_risk/environments/stages/estimated_minutes/explicit_request/delegation_forbidden`。返回 `CAS2|ASSESS|<PRIMARY/DELEGATE/UNAVAILABLE>|<score>|5|<reason>|<phase>`；仅 DELEGATE 进 2。评分非准入。\n\
-2. 不可变 draft：`{{\"schema_version\":1,\"job_id\":\"...\",\"idempotency_key\":\"...\",\"task_scope_key\":\"...\",\"objective\":\"...\",\"allowed_scope\":[\"...\"],\"constraints\":[],\"success_criteria\":[\"...\"],\"allowed_tools\":[],\"permission_policy\":\"INHERIT\",\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\",\"context_references\":[],\"output_contract\":\"STANDARD_V1\",\"review_policy\":\"PRIMARY_REQUIRED\"}}`。ID 稳定；`task_scope_key`=`[a-z0-9][a-z0-9_-]{{0,63}}`；Runtime 补身份，禁止猜 Scope。\n\
-3. PTY：`H job-schedule D <agent-key> W`；`write_stdin` 发 JSON 行；禁管道/重定向/临时文件。只接受 `CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>|<thread-id或->|<reason>|<job-id>|<attempt-id或->`。\n\
+2. 仅明确委派时提交 JSON：`{{\"assessment\":{{\"bounded\":true,\"acceptance_defined\":true,\"independent\":true,\"handoff_small\":true}},\"task_packet\":{{\"schema_version\":1,\"job_id\":\"...\",\"idempotency_key\":\"...\",\"task_scope_key\":\"...\",\"objective\":\"...\",\"allowed_scope\":[\"...\"],\"constraints\":[],\"success_criteria\":[\"...\"],\"allowed_tools\":[],\"permission_policy\":\"INHERIT\",\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\",\"context_references\":[],\"output_contract\":\"STANDARD_V1\",\"review_policy\":\"PRIMARY_REQUIRED\"}}}}`。assessment 按需填 `call_chains/modules/work_units/tests_defined/high_risk/environments/stages`；ID 稳定，task_scope_key=`[a-z0-9][a-z0-9_-]{{0,63}}`；Runtime 补身份，禁止猜 Scope。\n\
+3. PTY：`H job-plan D <agent-key> W`；`write_stdin` 发单行 JSON，禁管道/重定向/临时文件。ASSESS=PRIMARY/UNAVAILABLE：无 Job；SUGGEST：不调度；其余 `CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>|<thread>|<reason>|<job>|<attempt>` 依 Runtime 执行。评分非准入。\n\
 4. SPAWN：使用 `agent_type=<name>`、`fork_turns=\"none\"` 和完整任务调 `spawn_agent`→bind；禁占位/补发；不得覆盖 `model` / `reasoning_effort`。REUSE=bind→`send_input(target=<child>,message=<任务>)`；缺搜 `multi_agent_v1.send_input`。bind=`H job-bind D <job-id> <attempt-id> <child-thread-id> W`；验 NATIVE_STATE_DB。bind 失败不算已委派；无 Job/Attempt 准入则 Hook 拒绝。\n\
 5. Child prompt 仅含 `GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`；`TOOLS` 只列名；不附对话、工具说明或控制协议。首行 `RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED`。同一任务同时只运行一个 Child；等待超时不等于失败。{write_rule}\n\
-6. Child 结束：`H job-observe D <job-id> <attempt-id> <child-thread-id> W`；只接受 `CAS2|RESULT_OBSERVED|<child>|RECOVERY_READ|<job>|<attempt>`，否则不 Review。\n\
+6. Child 结束：`H job-observe D <job-id> <attempt-id> <child-thread-id> W`；只接受 `CAS2|RESULT_OBSERVED|<child>|RECOVERY_READ|<job>|<attempt>` 才 Review。\n\
 7. 禁止未审查就追加。PTY：`H job-review D <job-id> <attempt-id>`；stdin=`{{\"decision\":\"APPROVE|REVISION_REQUIRED|REJECT\",\"reason\":\"...\",\"evidence_refs\":[\"child:...\",\"verification:...\"]}}`，至少两个不同非空证据。只接受 `CAS2|REVIEWED|-|<state>|<job>|<attempt>|<review>`；成功才释放 Lease。成功保留 Thread，严禁 `close_agent`。\n\
 8. `REVISION_REQUIRED`：同一 TaskPacket 重做 3，新 Attempt 再 bind/send_input；保留旧记录。{failure_rule}\n\n\
 排除、Agent 可用性、复用、并发、租约与恢复由 CAS Runtime；Primary 不读 Thread、Token、Cache。本协议只是调用提醒，不是强制来源。",
@@ -2884,8 +3290,8 @@ CAS2\n\
 fn render_orchestration_rules_document(instructions: &str) -> String {
     format!(
         "# CAS Runtime First 调用规则\n\n\
-> 此文件由 Codex Agent Switch 管理，只提供 Primary 调用 Runtime 与原生子 Agent 的契约。\n\
-> 调度、准入、权限、租约、审计和状态事实以 CAS Runtime、Hook 与数据库为准。\n\
+> 仅供 Primary 调用 Runtime/原生子 Agent。\n\
+> 状态以 Runtime/Hook/数据库为准。\n\
 > 不要把本文复制回 `AGENTS.md` 或 `config.toml`。\n\n\
 {instructions}\n"
     )
@@ -2898,6 +3304,15 @@ fn render_orchestration_bootstrap(rules_path: &Path) -> String {
 - 默认由 Primary 处理；优先级或耗时不单独触发委派。用户明确要求，或任务可能需要跨模块调查/有界实现、多阶段验证、高风险独立审查时，先读取 `{}` 的角色门槛再决定；单点修复、少量检索、单命令测试直接由 Primary 完成。用户/项目禁令优先。\n\
 - `CAS:OFF`/`CAS:ON` 是显式会话逃生口：OFF 由 Primary 负责，ON 恢复。\n\
 - 本入口与规则文件都不是强制事实源；调度、准入、权限、租约和审计以 CAS Runtime、Hook 与数据库为准，且不替代 Codex 沙箱或用户审批。",
+        rules_path.to_string_lossy()
+    )
+}
+
+fn render_global_orchestration_pointer(rules_path: &Path) -> String {
+    format!(
+        "## CAS Primary delegation gate（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\n\
+- 仅 Primary：默认由 Primary 处理；用户/项目禁委派优先。考虑委派时读取 `{}`。\n\
+- 准入以 CAS Runtime/Hook 为准，不替代 Codex 沙箱或用户审批。",
         rules_path.to_string_lossy()
     )
 }
@@ -4522,16 +4937,27 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
             return Err(ConfigurationError::InvalidSnapshot);
         }
         if resource.resource_type == BUNDLED_SKILL_RESOURCE
-            && (!BUNDLED_SKILLS.iter().any(|skill| {
-                ["SKILL.md", "LICENSE"].iter().any(|file_name| {
-                    resource.logical_key == format!("{}/{file_name}", skill.key)
-                        && resource.relative_path
-                            == format!("cas/bundled-skills/{}/{file_name}", skill.key)
+            && (!BUNDLED_SKILLS
+                .iter()
+                .map(|skill| skill.key)
+                .chain(RETIRED_BUNDLED_SKILL_KEYS.iter().copied())
+                .any(|key| {
+                    ["SKILL.md", "LICENSE"].iter().any(|file_name| {
+                        resource.logical_key == format!("{key}/{file_name}")
+                            && resource.relative_path
+                                == format!("cas/bundled-skills/{key}/{file_name}")
+                    })
                 })
-            }) && !(resource.logical_key == resource.relative_path
-                && BUNDLED_SKILLS.iter().any(|skill| {
-                    resource.relative_path == format!("skills/{}/SKILL.md", skill.key)
-                })))
+                && !(resource.logical_key == resource.relative_path
+                    && (BUNDLED_SKILLS
+                        .iter()
+                        .map(|skill| skill.key)
+                        .chain(RETIRED_BUNDLED_SKILL_KEYS.iter().copied())
+                        .any(|key| resource.relative_path == format!("skills/{key}/SKILL.md"))
+                        || matches!(
+                            resource.relative_path.as_str(),
+                            DELEGATION_SKILL_RELATIVE_PATH | DELEGATION_SKILL_POLICY_RELATIVE_PATH
+                        ))))
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }
@@ -4797,6 +5223,41 @@ fn read_optional_utf8(path: &Path) -> Result<String, ConfigurationError> {
     }
 }
 
+fn include_orphan_file(
+    codex_home: &Path,
+    relative_path: &str,
+    resource_type: &'static str,
+    logical_key: &str,
+    summary: &str,
+    is_owned: impl Fn(&str) -> bool,
+    changes: &mut Vec<OrphanChange>,
+    warnings: &mut Vec<String>,
+) -> Result<bool, ConfigurationError> {
+    let path = safe_join(codex_home, relative_path)?;
+    reject_symlink_chain(codex_home, &path)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_file() {
+        warnings.push(format!("{relative_path} 不是普通文件，已跳过。"));
+        return Ok(false);
+    }
+    let content = fs::read_to_string(&path)?;
+    if !is_owned(&content) {
+        warnings.push(format!("{relative_path} 不符合 CAS 所有权标记，已跳过。"));
+        return Ok(false);
+    }
+    changes.push(OrphanChange {
+        resource_type,
+        logical_key: logical_key.to_owned(),
+        relative_path: relative_path.to_owned(),
+        original_hash: hash_text(&content),
+        after: None,
+        summary: summary.to_owned(),
+    });
+    Ok(true)
+}
+
 fn resolve_project_path(value: &str) -> Result<PathBuf, ConfigurationError> {
     let value = value.trim();
     if value.is_empty() {
@@ -4932,6 +5393,38 @@ fn reject_symlink(path: &Path) -> Result<(), ConfigurationError> {
         }
     }
     Ok(())
+}
+
+fn reject_symlink_chain(base: &Path, path: &Path) -> Result<(), ConfigurationError> {
+    let mut current = path;
+    loop {
+        if !current.starts_with(base) {
+            return Err(ConfigurationError::InvalidSnapshot);
+        }
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                let mut is_reparse_point = metadata.file_type().is_symlink();
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    is_reparse_point |= metadata.file_attributes() & 0x400 != 0;
+                }
+                if is_reparse_point {
+                    return Err(ConfigurationError::Io(io::Error::other(
+                        "refusing to access a symbolic link",
+                    )));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if current == base {
+            return Ok(());
+        }
+        current = current
+            .parent()
+            .ok_or(ConfigurationError::InvalidSnapshot)?;
+    }
 }
 
 fn hash_text(value: &str) -> String {
@@ -5161,6 +5654,12 @@ mod tests {
 
     impl TestContext {
         fn new() -> Self {
+            let context = Self::empty();
+            seed_desired_state(&context.database);
+            context
+        }
+
+        fn empty() -> Self {
             let root = std::env::temp_dir().join(format!("cas-config-{}", Uuid::new_v4()));
             let data_home = root.join("data");
             let codex_home = root.join("codex");
@@ -5182,7 +5681,6 @@ mod tests {
             let database = data_home.join("cas.db");
             let service =
                 ConfigurationService::for_test(database.clone(), data_home, codex_home.clone());
-            seed_desired_state(&database);
             Self {
                 root,
                 database,
@@ -5196,6 +5694,292 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn helper_path_uses_prepared_development_binary_and_preserves_test_override() {
+        let mut context = TestContext::empty();
+        let fixed = context.service.helper_path().unwrap();
+        assert_eq!(Some(&fixed), context.service.fixed_helper_path.as_ref());
+        context.service.fixed_helper_path = None;
+        let selected = context.service.helper_path().unwrap();
+        if cfg!(debug_assertions)
+            && let Some(path) = option_env!("CAS_DEV_HELPER_PATH")
+        {
+            assert_eq!(selected, PathBuf::from(path));
+            let hash = format!("{:x}", Sha256::digest(fs::read(&selected).unwrap()));
+            assert_eq!(
+                selected.parent().unwrap().file_name().unwrap().to_str(),
+                Some(hash.as_str())
+            );
+        } else {
+            assert_eq!(selected.parent(), std::env::current_exe().unwrap().parent());
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_previews_then_removes_only_marked_cas_resources() {
+        let context = TestContext::empty();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        let original_config = r#"developer_instructions = '''
+用户规则
+<<< CAS ORCHESTRATION v1 >>>
+旧 CAS 规则
+<<< END CAS ORCHESTRATION v1 >>>'''
+default_permissions = ":workspace"
+
+[agents]
+enabled = true
+
+[features]
+multi_agent = true
+
+[mcp_servers.user]
+command = "user-helper"
+
+[mcp_servers.cas_assessment]
+command = "cas-helper"
+args = ["mcp-assess", "cas.db"]
+
+[hooks.state]
+trusted_hash = "keep-trust"
+
+[[hooks.PreToolUse]]
+matcher = ".*"
+
+[[hooks.PreToolUse.hooks]]
+type = "mcp_tool"
+server = "cas_assessment"
+tool = "cas_runtime_hook"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "user-hook"
+"#;
+        fs::write(&config_path, original_config).unwrap();
+        let global_path = context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH);
+        fs::write(
+            &global_path,
+            "# 用户规则\n\n<!-- CAS ORCHESTRATION v1 BEGIN -->\nCAS 入口\n<!-- CAS ORCHESTRATION v1 END -->\n",
+        )
+        .unwrap();
+        for (relative_path, content) in [
+            (
+                ORCHESTRATION_RULES_RELATIVE_PATH,
+                "# CAS Runtime First 调用规则\n旧规则\n",
+            ),
+            (
+                EXEC_POLICY_RELATIVE_PATH,
+                "# Managed by Codex Agent Switch. Remove through CAS Default mode.\n",
+            ),
+            (
+                DELEGATION_SKILL_RELATIVE_PATH,
+                "---\nname: cas-delegate\ndescription: 旧版\n---\n",
+            ),
+            (
+                "agents/cas-executor.toml",
+                "name = \"executor\"\ndeveloper_instructions = \"你是由 Primary 委派的 Child Agent\"\n",
+            ),
+            ("agents/cas-user.toml", "name = \"user\"\n"),
+            (
+                "cas/bundled-skills/ponytail/SKILL.md",
+                "---\nname: ponytail\ndescription: 旧版\n---\n",
+            ),
+            ("cas/bundled-skills/ponytail/LICENSE", "license"),
+        ] {
+            let path = context.codex_home.join(relative_path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, content).unwrap();
+        }
+        let policy_path = context
+            .codex_home
+            .join(DELEGATION_SKILL_POLICY_RELATIVE_PATH);
+        fs::create_dir_all(policy_path.parent().unwrap()).unwrap();
+        fs::write(&policy_path, DELEGATION_SKILL_POLICY).unwrap();
+        let original_files = [
+            GLOBAL_INSTRUCTIONS_PATH,
+            ORCHESTRATION_RULES_RELATIVE_PATH,
+            EXEC_POLICY_RELATIVE_PATH,
+            DELEGATION_SKILL_RELATIVE_PATH,
+            DELEGATION_SKILL_POLICY_RELATIVE_PATH,
+            "agents/cas-executor.toml",
+            "cas/bundled-skills/ponytail/SKILL.md",
+            "cas/bundled-skills/ponytail/LICENSE",
+        ]
+        .into_iter()
+        .map(|relative_path| {
+            (
+                relative_path,
+                fs::read(context.codex_home.join(relative_path)).unwrap(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+        let preview = context.service.preview_orphan_cleanup().unwrap();
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), original_config);
+        assert!(
+            preview
+                .items
+                .iter()
+                .any(|item| item.relative_path == "config.toml")
+        );
+        assert!(
+            preview
+                .items
+                .iter()
+                .any(|item| item.relative_path == "agents/cas-executor.toml")
+        );
+        assert!(
+            preview
+                .items
+                .iter()
+                .any(|item| item.relative_path == EXEC_POLICY_RELATIVE_PATH)
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cas-user.toml"))
+        );
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("基线已丢失"))
+        );
+        let diagnostics = context
+            .service
+            .run_diagnostics(DiagnosticsRunRequest::default())
+            .unwrap();
+        assert!(diagnostics.sections.iter().any(|section| {
+            section
+                .issues
+                .iter()
+                .any(|issue| issue.code == "CAS_ORPHANED_RESOURCES")
+        }));
+        assert!(matches!(
+            context.service.apply_orphan_cleanup(OrphanCleanupRequest {
+                expected_fingerprint: preview.fingerprint.clone(),
+                confirmed: false,
+            }),
+            Err(ConfigurationError::ApplyBlocked(_))
+        ));
+        let response = context
+            .service
+            .apply_orphan_cleanup(OrphanCleanupRequest {
+                expected_fingerprint: preview.fingerprint,
+                confirmed: true,
+            })
+            .unwrap();
+        assert_eq!(response.cleaned_count, preview.items.len());
+        assert!(response.snapshot_id.is_some());
+        assert!(
+            context
+                .service
+                .preview_orphan_cleanup()
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let config = fs::read_to_string(&config_path).unwrap();
+        let document = config.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["developer_instructions"].as_str(),
+            Some("用户规则")
+        );
+        assert_eq!(document["default_permissions"].as_str(), Some(":workspace"));
+        assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+        assert_eq!(document["features"]["multi_agent"].as_bool(), Some(true));
+        assert!(config.contains("user-helper"));
+        assert!(config.contains("user-hook"));
+        assert!(config.contains("keep-trust"));
+        assert!(!config.contains("cas_runtime_hook"));
+        assert!(
+            fs::read_to_string(&global_path)
+                .unwrap()
+                .contains("# 用户规则")
+        );
+        assert!(
+            !fs::read_to_string(&global_path)
+                .unwrap()
+                .contains("CAS ORCHESTRATION")
+        );
+        assert!(context.codex_home.join("agents/cas-user.toml").is_file());
+        assert!(!context.codex_home.join("agents/cas-executor.toml").exists());
+        assert!(!context.codex_home.join(EXEC_POLICY_RELATIVE_PATH).exists());
+        let snapshot_id = response.snapshot_id.unwrap();
+        context
+            .service
+            .snapshot_restore(SnapshotRestoreRequest { snapshot_id })
+            .unwrap();
+        let restored_config = fs::read_to_string(&config_path).unwrap();
+        assert!(restored_config.contains("cas_runtime_hook"));
+        assert_eq!(restored_config.matches("user-hook").count(), 1);
+        assert!(restored_config.contains("keep-trust"));
+        assert!(
+            context
+                .codex_home
+                .join("agents/cas-executor.toml")
+                .is_file()
+        );
+        assert!(context.codex_home.join(EXEC_POLICY_RELATIVE_PATH).is_file());
+        for (relative_path, original) in original_files {
+            assert_eq!(
+                fs::read(context.codex_home.join(relative_path)).unwrap(),
+                original,
+                "Snapshot 未恢复 {relative_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn orphan_cleanup_rejects_changes_after_preview() {
+        let context = TestContext::empty();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        fs::write(
+            &config_path,
+            "developer_instructions = '<<< CAS ORCHESTRATION v1 >>>\\n旧规则\\n<<< END CAS ORCHESTRATION v1 >>>'\n",
+        )
+        .unwrap();
+        let preview = context.service.preview_orphan_cleanup().unwrap();
+        fs::write(
+            &config_path,
+            "developer_instructions = '<<< CAS ORCHESTRATION v1 >>>\\n新规则\\n<<< END CAS ORCHESTRATION v1 >>>'\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            context.service.apply_orphan_cleanup(OrphanCleanupRequest {
+                expected_fingerprint: preview.fingerprint,
+                confirmed: true,
+            }),
+            Err(ConfigurationError::DesiredStateChanged)
+        ));
+        assert!(fs::read_to_string(&config_path).unwrap().contains("新规则"));
+    }
+
+    #[test]
+    fn orphan_cleanup_reports_unknown_mcp_without_removing_it() {
+        let context = TestContext::empty();
+        let config_path = context.codex_home.join(CONFIG_RELATIVE_PATH);
+        let config = "[mcp_servers.cas_assessment]\ncommand = 'user-helper'\nargs = ['other']\n";
+        fs::write(&config_path, config).unwrap();
+        let preview = context.service.preview_orphan_cleanup().unwrap();
+        assert!(preview.items.is_empty());
+        assert!(
+            preview
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cas_assessment"))
+        );
+        let response = context
+            .service
+            .apply_orphan_cleanup(OrphanCleanupRequest {
+                expected_fingerprint: preview.fingerprint,
+                confirmed: true,
+            })
+            .unwrap();
+        assert_eq!(response.cleaned_count, 0);
+        assert_eq!(fs::read_to_string(config_path).unwrap(), config);
     }
 
     #[test]
@@ -5353,14 +6137,61 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        for skill_key in ["caveman-slim", "ponytail-slim"] {
-            connection
-                .execute(
-                    "INSERT INTO agent_skill_bindings (agent_id, skill_key) VALUES (?1, ?2)",
-                    params![agent_id, skill_key],
-                )
-                .unwrap();
-        }
+        connection
+            .execute(
+                "INSERT INTO agent_skill_bindings (agent_id, skill_key) VALUES (?1, 'cas-slim')",
+                [&agent_id],
+            )
+            .unwrap();
+        let legacy_global_path = context.codex_home.join("skills/ponytail-slim/SKILL.md");
+        fs::create_dir_all(legacy_global_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_global_path, "retired CAS skill").unwrap();
+        let legacy_private_path = context
+            .codex_home
+            .join("cas/bundled-skills/ponytail/SKILL.md");
+        fs::create_dir_all(legacy_private_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_private_path, "retired CAS skill").unwrap();
+        let user_skill_path = context.codex_home.join("skills/user-skill/SKILL.md");
+        fs::create_dir_all(user_skill_path.parent().unwrap()).unwrap();
+        fs::write(&user_skill_path, "user owned skill").unwrap();
+        connection
+            .execute(
+                "INSERT INTO managed_resources (
+                    id, resource_type, logical_key, physical_location, ownership,
+                    semantic_hash, content_hash, created_at, updated_at
+                 ) VALUES (
+                    'legacy-global-skill', ?1, 'skills/ponytail-slim/SKILL.md',
+                    ?2, 'CAS', ?3, ?4,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 )",
+                params![
+                    BUNDLED_SKILL_RESOURCE,
+                    legacy_global_path.to_string_lossy(),
+                    hash_text("retired CAS skill"),
+                    hash_bytes(b"retired CAS skill"),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO managed_resources (
+                    id, resource_type, logical_key, physical_location, ownership,
+                    semantic_hash, content_hash, created_at, updated_at
+                 ) VALUES (
+                    'legacy-private-skill', ?1, 'ponytail/SKILL.md',
+                    ?2, 'CAS', ?3, ?4,
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                 )",
+                params![
+                    BUNDLED_SKILL_RESOURCE,
+                    legacy_private_path.to_string_lossy(),
+                    hash_text("retired CAS skill"),
+                    hash_bytes(b"retired CAS skill"),
+                ],
+            )
+            .unwrap();
         drop(connection);
 
         context
@@ -5368,30 +6199,23 @@ mod tests {
             .apply(ConfigurationApplyRequest::default())
             .unwrap();
 
-        let caveman_path = context
+        let slim_path = context
             .codex_home
-            .join("cas/bundled-skills/caveman-slim/SKILL.md");
-        let ponytail_path = context
-            .codex_home
-            .join("cas/bundled-skills/ponytail-slim/SKILL.md");
+            .join("cas/bundled-skills/cas-slim/SKILL.md");
         assert_eq!(
-            fs::read_to_string(&caveman_path).unwrap(),
-            BUNDLED_SKILLS[2].skill
+            fs::read_to_string(&slim_path).unwrap(),
+            BUNDLED_SKILLS[1].skill
         );
+        assert!(!legacy_global_path.exists());
+        assert!(!legacy_private_path.exists());
         assert_eq!(
-            fs::read_to_string(&ponytail_path).unwrap(),
-            BUNDLED_SKILLS[3].skill
+            fs::read_to_string(&user_skill_path).unwrap(),
+            "user owned skill"
         );
         assert!(
             context
                 .codex_home
-                .join("cas/bundled-skills/caveman-slim/LICENSE")
-                .is_file()
-        );
-        assert!(
-            context
-                .codex_home
-                .join("cas/bundled-skills/ponytail-slim/LICENSE")
+                .join("cas/bundled-skills/cas-slim/LICENSE")
                 .is_file()
         );
 
@@ -5400,16 +6224,13 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         let skill_configs = agent["skills"]["config"].as_array_of_tables().unwrap();
-        assert_eq!(skill_configs.len(), 2);
-        let caveman = skill_configs.get(0).unwrap();
-        let ponytail = skill_configs.get(1).unwrap();
-        assert_eq!(caveman["path"].as_str(), caveman_path.to_str());
-        assert_eq!(caveman["enabled"].as_bool(), Some(true));
-        assert_eq!(ponytail["path"].as_str(), ponytail_path.to_str());
-        assert_eq!(ponytail["enabled"].as_bool(), Some(true));
+        assert_eq!(skill_configs.len(), 1);
+        let slim = skill_configs.get(0).unwrap();
+        assert_eq!(slim["path"].as_str(), slim_path.to_str());
+        assert_eq!(slim["enabled"].as_bool(), Some(true));
         let instructions = agent["developer_instructions"].as_str().unwrap();
-        assert!(instructions.contains("必须使用 caveman-slim"));
-        assert!(instructions.contains("必须使用 ponytail-slim"));
+        assert!(instructions.contains("必须读取并遵循当前 Child 绑定的 CAS Skill"));
+        assert!(instructions.contains(slim_path.to_str().unwrap()));
 
         let switched = context
             .service
@@ -5418,66 +6239,64 @@ mod tests {
             })
             .unwrap();
         let snapshot_id = switched.snapshot_id.unwrap();
-        assert!(!caveman_path.exists());
-        assert!(!ponytail_path.exists());
+        assert!(!slim_path.exists());
 
         context
             .service
             .snapshot_restore(SnapshotRestoreRequest { snapshot_id })
             .unwrap();
         assert_eq!(
-            fs::read_to_string(caveman_path).unwrap(),
-            BUNDLED_SKILLS[2].skill
-        );
-        assert_eq!(
-            fs::read_to_string(ponytail_path).unwrap(),
-            BUNDLED_SKILLS[3].skill
+            fs::read_to_string(slim_path).unwrap(),
+            BUNDLED_SKILLS[1].skill
         );
     }
 
     #[test]
     fn codex_native_agent_omits_provider_projection_and_credential() {
-        let context = TestContext::new();
-        let connection = open_database(&context.database).unwrap();
-        connection
-            .execute(
-                "UPDATE providers
-                 SET provider_key = 'codex-native', name = 'Codex Native (ChatGPT)',
-                     base_url = 'https://api.openai.com/v1/', preset_id = 'codex-native'
-                 WHERE provider_key = 'deepseek'",
-                [],
-            )
-            .unwrap();
-        connection.execute("DELETE FROM credentials", []).unwrap();
-        connection
-            .execute(
-                "UPDATE models
-                 SET model_id = 'gpt-5.6-luna', display_name = 'GPT-5.6 Luna',
-                     context_window = 1050000, default_reasoning = 'medium'
-                 WHERE model_id = 'deepseek-v4-flash'",
-                [],
-            )
-            .unwrap();
-        drop(connection);
+        for model_id in ["gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"] {
+            let context = TestContext::new();
+            let connection = open_database(&context.database).unwrap();
+            connection
+                .execute(
+                    "UPDATE providers
+                     SET provider_key = 'codex-native', name = 'Codex Native (ChatGPT)',
+                         base_url = 'https://api.openai.com/v1/', preset_id = 'codex-native'
+                     WHERE provider_key = 'deepseek'",
+                    [],
+                )
+                .unwrap();
+            connection.execute("DELETE FROM credentials", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE models
+                     SET model_id = ?1, display_name = ?1,
+                         context_window = 258400, default_reasoning = 'medium'
+                     WHERE model_id = 'deepseek-v4-flash'",
+                    [model_id],
+                )
+                .unwrap();
+            drop(connection);
 
-        let preview = context.service.preview_apply().unwrap();
-        assert!(preview.blockers.is_empty());
-        context
-            .service
-            .apply(ConfigurationApplyRequest {
-                expected_desired_state_hash: Some(preview.desired_state_hash),
-            })
-            .unwrap();
+            let preview = context.service.preview_apply().unwrap();
+            assert!(preview.blockers.is_empty(), "{model_id}");
+            context
+                .service
+                .apply(ConfigurationApplyRequest {
+                    expected_desired_state_hash: Some(preview.desired_state_hash),
+                })
+                .unwrap();
 
-        let config = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
-        let config = config.parse::<DocumentMut>().unwrap();
-        assert!(config.get("model_providers").is_none());
-        let agent = fs::read_to_string(context.codex_home.join("agents/cas-executor.toml"))
-            .unwrap()
-            .parse::<DocumentMut>()
-            .unwrap();
-        assert_eq!(agent["model"].as_str(), Some("gpt-5.6-luna"));
-        assert!(agent.get("model_provider").is_none());
+            let config = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
+            let config = config.parse::<DocumentMut>().unwrap();
+            assert!(config.get("model_providers").is_none());
+            let agent = fs::read_to_string(context.codex_home.join("agents/cas-executor.toml"))
+                .unwrap()
+                .parse::<DocumentMut>()
+                .unwrap();
+            assert_eq!(agent["model"].as_str(), Some(model_id));
+            assert_eq!(agent["model_reasoning_effort"].as_str(), Some("high"));
+            assert!(agent.get("model_provider").is_none());
+        }
     }
 
     #[test]
@@ -5651,7 +6470,7 @@ mod tests {
             fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap(),
             config_before
         );
-        assert_eq!(managed_resource_count(&context.database), 9);
+        assert_eq!(managed_resource_count(&context.database), 11);
     }
 
     #[test]
@@ -5720,7 +6539,7 @@ mod tests {
         );
         let global = fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert!(global.contains("CAS Primary delegation gate"));
-        assert_eq!(managed_resource_count(&context.database), 9);
+        assert_eq!(managed_resource_count(&context.database), 11);
     }
 
     #[test]
@@ -6163,6 +6982,13 @@ mod tests {
         let rules = fs::read_to_string(&rules_path).unwrap();
         assert!(rules.contains("CAS Primary 编排协议（"));
         assert!(rules.contains("默认由 Primary 完成"));
+        assert!(rules.contains("单点修复、单命令测试留 Primary"));
+        assert!(rules.contains("普通检索、单点修复、单命令测试留 Primary"));
+        assert!(rules.contains("单命令测试留 Primary"));
+        assert!(rules.contains("只选 phase 匹配的 Active Agent"));
+        assert!(rules.contains("同一任务同时只运行一个 Child"));
+        assert!(rules.contains("REVIEW 高风险或用户明确要求"));
+        assert!(!rules.contains("30 分钟"));
         assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
 
         context
@@ -6222,7 +7048,17 @@ mod tests {
         assert!(active_global.contains("CAS Primary delegation gate"));
         assert!(active_global.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
         assert!(active_global.contains("默认由 Primary 处理"));
-        assert!(active_global.contains("优先级或耗时不单独触发委派"));
+        assert!(!active_global.contains("优先级或耗时不单独触发委派"));
+        let primary = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert!(
+            primary["developer_instructions"]
+                .as_str()
+                .unwrap()
+                .contains("优先级或耗时不单独触发委派")
+        );
         assert!(!active_global.contains("任何写入/外部变更前"));
         assert!(!active_global.contains("CAS Primary 编排协议（"));
         assert!(!active_global.contains("send_input(target=<child>"));
@@ -6231,13 +7067,6 @@ mod tests {
             fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH)).unwrap();
         assert!(rules.contains("CAS Primary 编排协议（"));
         assert!(rules.contains("默认由 Primary 完成"));
-        assert!(rules.contains("单点修复和单命令测试留 Primary"));
-        assert!(rules.contains("普通检索、单点修复和单命令测试留 Primary"));
-        assert!(rules.contains("单命令测试留 Primary"));
-        assert!(rules.contains("只选 phase 匹配的 Active Agent"));
-        assert!(rules.contains("同一任务同时只运行一个 Child"));
-        assert!(rules.contains("REVIEW 高风险或用户明确要求"));
-        assert!(!rules.contains("30 分钟"));
         assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
         assert!(rules.contains("send_input(target=<child>"));
         assert!(rules.contains("禁占位/补发"));
@@ -6363,6 +7192,30 @@ mod tests {
             active_config["features"]["multi_agent_v2"].as_bool(),
             Some(false)
         );
+        assert_eq!(
+            active_config["mcp_servers"]["cas_assessment"]["args"]
+                .as_array()
+                .unwrap()
+                .get(0)
+                .and_then(|value| value.as_str()),
+            Some("mcp-assess")
+        );
+        assert_eq!(
+            fs::read_to_string(context.codex_home.join(DELEGATION_SKILL_RELATIVE_PATH)).unwrap(),
+            DELEGATION_SKILL
+        );
+        assert_eq!(
+            fs::read_to_string(
+                context
+                    .codex_home
+                    .join(DELEGATION_SKILL_POLICY_RELATIVE_PATH)
+            )
+            .unwrap(),
+            DELEGATION_SKILL_POLICY
+        );
+        assert!(DELEGATION_SKILL.chars().count() <= 500);
+        assert!(!DELEGATION_SKILL.contains("gpt-"));
+        assert!(DELEGATION_SKILL_POLICY.contains("allow_implicit_invocation: false"));
         let primary_instructions = active_config["developer_instructions"].as_str().unwrap();
         assert!(primary_instructions.contains("<<< CAS ORCHESTRATION v1 >>>"));
         assert!(primary_instructions.contains(ORCHESTRATION_RULES_RELATIVE_PATH));
@@ -6378,7 +7231,7 @@ mod tests {
         assert!(rules.contains("CAS Primary 编排协议（"));
         assert!(rules.contains("默认由 Primary 完成"));
         assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
-        assert!(rules.contains("CAS2|<REUSE、SPAWN、WAIT、BLOCK、EXISTING或UNCERTAIN>"));
+        assert!(rules.contains("CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>"));
         let exec_policy_path = context.codex_home.join(EXEC_POLICY_RELATIVE_PATH);
         assert_eq!(
             fs::read_to_string(&exec_policy_path).unwrap(),
@@ -6406,9 +7259,14 @@ mod tests {
         assert!(rules.contains("Primary 不读 Thread、Token、Cache"));
         let database_argument = format!("\"{}\"", context.database.to_string_lossy());
         assert!(rules.contains(&format!("D=`{database_argument}`")));
-        assert!(rules.contains("H job-schedule D <agent-key> W"));
-        assert!(rules.contains("H job-assess D <agent-key> W"));
-        assert!(rules.contains("小任务直接完成，不运行评估"));
+        assert!(rules.contains("H job-plan D <agent-key> W"));
+        assert!(!rules.contains("H job-assess D <agent-key> W"));
+        assert!(!rules.contains("H job-schedule D <agent-key> W"));
+        assert!(rules.contains("候选调用 CAS MCP `assess_delegation`"));
+        assert!(rules.contains("用户明确要求本次委派时才使用 `$cas-delegate` Skill"));
+        assert!(rules.contains("Primary 继续完成任务"));
+        assert!(rules.contains("`CAS2|ASSESS|SUGGEST|5|5|<reason>|<phase>` 只建议、不调度"));
+        assert!(rules.contains("模型由当前绑定决定，不硬编码型号"));
         assert!(rules.contains("H job-bind D <job-id> <attempt-id> <child-thread-id> W"));
         assert!(rules.contains("H job-observe D <job-id> <attempt-id> <child-thread-id> W"));
         assert!(rules.contains("H job-review D <job-id> <attempt-id>"));
@@ -6463,12 +7321,25 @@ mod tests {
         assert!(restored.get("agents").is_none());
         assert_eq!(restored["features"]["multi_agent"].as_bool(), Some(false));
         assert_eq!(restored["features"]["multi_agent_v2"].as_bool(), Some(true));
+        assert!(restored.get("mcp_servers").is_none());
         assert_eq!(
             fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap(),
             "# 用户全局规则\n\n保留这段内容。\n"
         );
         assert!(!rules_path.exists());
         assert!(!exec_policy_path.exists());
+        assert!(
+            !context
+                .codex_home
+                .join(DELEGATION_SKILL_RELATIVE_PATH)
+                .exists()
+        );
+        assert!(
+            !context
+                .codex_home
+                .join(DELEGATION_SKILL_POLICY_RELATIVE_PATH)
+                .exists()
+        );
     }
 
     #[test]
@@ -6477,6 +7348,9 @@ mod tests {
         let database = Path::new(r"C:\Users\tester\AppData\Local\CAS\cas.db");
         let policy = render_control_plane_exec_policy(helper, database);
 
+        assert!(policy.contains(
+            r#"pattern = ["C:\\Program Files\\Codex Agent Switch\\cas-helper.exe", "job-plan", "C:\\Users\\tester\\AppData\\Local\\CAS\\cas.db"]"#
+        ));
         assert!(policy.contains(
             r#"pattern = ["C:\\Program Files\\Codex Agent Switch\\cas-helper.exe", "job-schedule", "C:\\Users\\tester\\AppData\\Local\\CAS\\cas.db"]"#
         ));
@@ -6700,6 +7574,8 @@ mod tests {
         assert!(!bootstrap.contains("H job-schedule"));
         assert!(bootstrap.chars().count() <= 700 && bootstrap.lines().count() <= 12);
         let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
+        let pointer = render_global_orchestration_pointer(&rules_path);
+        assert!(pointer.chars().count() * 2 < bootstrap.chars().count());
         let strict = fs::read_to_string(&rules_path).unwrap();
         let helper_path = context.service.helper_path().unwrap();
         let dynamic_path_chars = helper_path.to_string_lossy().chars().count()

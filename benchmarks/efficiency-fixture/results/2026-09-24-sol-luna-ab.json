@@ -1,0 +1,83 @@
+{
+  "date": "2026-09-24",
+  "purpose": "比较同一综合编码任务在单 Primary 与单子 Agent 模式下的 token 消耗和质量",
+  "fixture_prompt": "benchmarks/efficiency-fixture/prompts/task-qualified.txt",
+  "fixture": "在隔离副本实现 normalizeRanges 和 subtractRanges，仅允许修改 src/ranges.mjs",
+  "runtime": {
+    "cli": "Codex 桌面应用内置 codex-cli 0.155.0-alpha.16",
+    "primary_model": "gpt-6-sol",
+    "primary_reasoning_effort": "medium",
+    "child_model": "gpt-5.6-luna",
+    "child_reasoning_effort": "medium",
+    "child_count_on": 1,
+    "sandbox": "danger-full-access，仅在隔离临时目录运行"
+  },
+  "successful_runs": {
+    "off": {
+      "thread_id": "01a0d1ec-9e0a-7813-b223-ff281c8b0c3e",
+      "primary": {
+        "input_tokens": 67348,
+        "cached_input_tokens": 59136,
+        "output_tokens": 1590,
+        "total_tokens": 68938
+      },
+      "total_tokens": 68938,
+      "acceptance": "6/6",
+      "additional_check": "边界值及 100 组确定性属性用例通过"
+    },
+    "on": {
+      "thread_id": "01a0d1ee-8817-7ad1-af87-40f789bbe10b",
+      "child_thread_id": "01a0d1ee-b60e-7882-bb40-2520ab35cb08",
+      "primary": {
+        "input_tokens": 93436,
+        "cached_input_tokens": 79104,
+        "output_tokens": 908,
+        "total_tokens": 94344
+      },
+      "child": {
+        "input_tokens": 186175,
+        "cached_input_tokens": 145408,
+        "output_tokens": 3553,
+        "total_tokens": 189728
+      },
+      "combined": {
+        "input_tokens": 279611,
+        "cached_input_tokens": 224512,
+        "output_tokens": 4461,
+        "total_tokens": 284072
+      },
+      "acceptance": "6/6",
+      "additional_check": "边界值及 100 组确定性属性用例通过"
+    }
+  },
+  "comparison": {
+    "on_over_off_total_tokens": 4.12,
+    "on_minus_off_total_tokens": 215134,
+    "quality_difference_observed": false,
+    "interpretation": "仅说明该单文件短任务的 ON 轮更耗原始 token；不能推断大型任务或 CAS 自动调度是否有效",
+    "validity_for_general_agent_efficiency": "inconclusive"
+  },
+  "observations": [
+    "系统 PATH 上的 codex-cli 0.153.4 不识别 gpt-6-sol；改用桌面应用内置 CLI 后才能运行。",
+    "嵌套 CLI 的 workspace-write 模式拦截本地读文件和测试命令；验收仅在隔离临时目录使用 danger-full-access。",
+    "ON 轮使用 --ephemeral 时子 Agent 创建失败（no thread with id）；去掉该参数后成功。因此 OFF 与 ON 的会话持久化设置不完全一致。",
+    "子 Agent 首次 apply_patch 对同一文件指定多个操作，被拒绝后重试，增加了模型轮次和 token。",
+    "子 Agent 自行运行验收，Primary 等待后又运行相同验收，产生重复验证。",
+    "隔离目录不是 Git 仓库，Agent 仍尝试 git status / git diff，产生无效工具调用。",
+    "ON 的 Primary 单独消耗 94344 tokens，已高于 OFF 整轮的 68938 tokens；本例委派未节省原始 token。"
+  ],
+  "follow_up": [
+    "把模型可用性及 CLI 版本预检加入基准运行器，失败时不要进入正式计量。",
+    "对单文件、短时、可由 Primary 一次完成的任务提高委派门槛；优先委派可独立交付且足够大的工作。",
+    "给子 Agent 明确实现责任，Primary 负责一次最终验收，避免重复测试和重复读文件。",
+    "另测 CAS 自动评估/调度链路；本轮只验证原生 Codex 子 Agent 模型分工，不覆盖 Chat Completions 网关。"
+  ],
+  "limitations": [
+    "题目是单文件短任务，缺少足够多的独立工作流，选题本身偏向 OFF 模式。",
+    "每种模式只有一次成功运行，不能推断统计显著性。",
+    "ON 与 OFF 的职责提示不同，且 ON 为允许子 Agent 创建关闭了 --ephemeral。",
+    "成功轮次 token 数不含模型探针及失败尝试；账户 5 小时用量由 63% 到 78%、周用量由 10% 到 12%，不能全部归因于成功轮次。",
+    "cached_input_tokens 是 input_tokens 的子集；reasoning_output_tokens 是 output_tokens 的子集，不重复相加。",
+    "原始 token 数不能直接等同于 ChatGPT 订阅额度或 API 费用。"
+  ]
+}

@@ -50,6 +50,57 @@ pub struct NativeAssessmentResult {
     pub phase: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativePlanResult {
+    Assessment(NativeAssessmentResult),
+    Scheduled(NativeScheduleResult),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NativePlanDraft {
+    assessment: serde_json::Value,
+    #[serde(default)]
+    task_packet: Option<serde_json::Value>,
+}
+
+/// 一次调用完成候选评估与明确请求后的调度；建议结果不创建 Job 或租约。
+pub fn plan_native_task(
+    database_path: &Path,
+    agent_key: &str,
+    workspace_scope_key: &str,
+    payload: &[u8],
+    prepare_schedule: impl FnOnce() -> Result<String, NativeControlError>,
+) -> Result<NativePlanResult, NativeControlError> {
+    let draft = serde_json::from_slice::<NativePlanDraft>(payload)
+        .map_err(|_| input_error("Job plan 需要 assessment；明确委派时还需要 task_packet。"))?;
+    let assessment_payload = serde_json::to_vec(&draft.assessment)
+        .map_err(|_| input_error("assessment 不是有效的 JSON。"))?;
+    let assessment = assess_native_task(
+        database_path,
+        agent_key,
+        workspace_scope_key,
+        &assessment_payload,
+    )?;
+    if assessment.action != "DELEGATE" {
+        return Ok(NativePlanResult::Assessment(assessment));
+    }
+    let packet = draft
+        .task_packet
+        .ok_or_else(|| input_error("明确委派时需要 task_packet。"))?;
+    let packet_payload =
+        serde_json::to_vec(&packet).map_err(|_| input_error("task_packet 不是有效的 JSON。"))?;
+    let parent_thread_id = prepare_schedule()?;
+    schedule_native_task(
+        database_path,
+        agent_key,
+        workspace_scope_key,
+        &parent_thread_id,
+        &packet_payload,
+    )
+    .map(NativePlanResult::Scheduled)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeAssessmentDraft {
@@ -162,9 +213,17 @@ fn score_assessment(phase: &str, draft: &NativeAssessmentDraft) -> NativeAssessm
         || (phase == "REVIEW" && draft.high_risk)
         || draft.explicit_request;
     let score = u8::from(role_evidence) * 3 + u8::from(amortized) + 1;
-    let action = if score >= 5 { "DELEGATE" } else { "PRIMARY" };
-    let reason_code = if score >= 5 {
-        "ROLE_GATE_MET"
+    let action = if score >= 5 && draft.explicit_request {
+        "DELEGATE"
+    } else if score >= 5 {
+        "SUGGEST"
+    } else {
+        "PRIMARY"
+    };
+    let reason_code = if action == "DELEGATE" {
+        "USER_REQUESTED"
+    } else if action == "SUGGEST" {
+        "CANDIDATE_RECOMMENDED"
     } else if !role_evidence {
         "ROLE_GATE_NOT_MET"
     } else {
@@ -492,7 +551,16 @@ mod tests {
         );
         facts["work_units"] = 2.into();
         let execution = score_assessment("EXECUTION", &draft(facts.clone()));
-        assert_eq!((execution.action, execution.score), ("DELEGATE", 5));
+        assert_eq!(
+            (execution.action, execution.score, execution.reason_code),
+            ("SUGGEST", 5, "CANDIDATE_RECOMMENDED")
+        );
+        facts["explicit_request"] = true.into();
+        let requested = score_assessment("EXECUTION", &draft(facts.clone()));
+        assert_eq!(
+            (requested.action, requested.reason_code),
+            ("DELEGATE", "USER_REQUESTED")
+        );
         facts["handoff_small"] = false.into();
         assert_eq!(
             score_assessment("EXECUTION", &draft(facts.clone())).action,
@@ -505,24 +573,25 @@ mod tests {
             "USER_FORBIDDEN"
         );
         facts["delegation_forbidden"] = false.into();
+        facts["explicit_request"] = false.into();
         facts["work_units"] = 0.into();
         facts["estimated_minutes"] = 0.into();
         facts["high_risk"] = true.into();
         assert_eq!(
             score_assessment("REVIEW", &draft(facts.clone())).action,
-            "DELEGATE"
+            "SUGGEST"
         );
         facts["high_risk"] = false.into();
         facts["call_chains"] = 2.into();
         facts["estimated_minutes"] = 15.into();
         assert_eq!(
             score_assessment("DISCOVERY", &draft(facts.clone())).action,
-            "DELEGATE"
+            "SUGGEST"
         );
         facts["environments"] = 2.into();
         assert_eq!(
             score_assessment("VERIFICATION", &draft(facts)).action,
-            "DELEGATE"
+            "SUGGEST"
         );
     }
 
@@ -551,7 +620,7 @@ mod tests {
         let assess = |key| {
             assess_native_task(&database_path, key, &root.to_string_lossy(), payload).unwrap()
         };
-        assert_eq!(assess("executor").action, "DELEGATE");
+        assert_eq!(assess("executor").action, "SUGGEST");
         assert_eq!(assess("missing").action, "UNAVAILABLE");
         connection
             .execute(
@@ -631,14 +700,134 @@ mod tests {
             "output_contract": "STANDARD_V1",
             "review_policy": "PRIMARY_REQUIRED"
         });
-        let schedule = schedule_native_task(
+        let primary_plan = serde_json::json!({
+            "assessment": {
+                "bounded": true, "acceptance_defined": true,
+                "independent": true, "handoff_small": true,
+                "work_units": 1
+            }
+        });
+        let mut schedule_prepared = false;
+        let primary_result = plan_native_task(
             &database_path,
             "executor",
             &root.to_string_lossy(),
-            "parent-native",
-            serde_json::to_string(&packet).unwrap().as_bytes(),
+            serde_json::to_string(&primary_plan).unwrap().as_bytes(),
+            || {
+                schedule_prepared = true;
+                Ok("parent-native".to_owned())
+            },
         )
         .unwrap();
+        assert!(!schedule_prepared);
+        assert!(matches!(
+            primary_result,
+            NativePlanResult::Assessment(NativeAssessmentResult {
+                action: "PRIMARY",
+                reason_code: "ROLE_GATE_NOT_MET",
+                ..
+            })
+        ));
+        let connection = open_database(&database_path).unwrap();
+        let job_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM orchestration_jobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let lease_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_delegation_leases",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((job_count, lease_count), (0, 0));
+        drop(connection);
+
+        let delegate_plan = serde_json::json!({
+            "assessment": {
+                "bounded": true, "acceptance_defined": true,
+                "independent": true, "handoff_small": true,
+                "work_units": 2
+            }
+        });
+        let mut schedule_prepared = false;
+        let suggestion = plan_native_task(
+            &database_path,
+            "executor",
+            &root.to_string_lossy(),
+            serde_json::to_string(&delegate_plan).unwrap().as_bytes(),
+            || {
+                schedule_prepared = true;
+                Ok("parent-native".to_owned())
+            },
+        )
+        .unwrap();
+        assert!(!schedule_prepared);
+        assert!(matches!(
+            suggestion,
+            NativePlanResult::Assessment(NativeAssessmentResult {
+                action: "SUGGEST",
+                reason_code: "CANDIDATE_RECOMMENDED",
+                ..
+            })
+        ));
+        let connection = open_database(&database_path).unwrap();
+        let job_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM orchestration_jobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let lease_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM runtime_delegation_leases",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((job_count, lease_count), (0, 0));
+        drop(connection);
+
+        let mut schedule_prepared = false;
+        let missing_packet = serde_json::json!({
+            "assessment": {
+                "bounded": true, "acceptance_defined": true,
+                "independent": true, "handoff_small": true,
+                "work_units": 2, "explicit_request": true
+            }
+        });
+        let error = plan_native_task(
+            &database_path,
+            "executor",
+            &root.to_string_lossy(),
+            serde_json::to_string(&missing_packet).unwrap().as_bytes(),
+            || {
+                schedule_prepared = true;
+                Ok("parent-native".to_owned())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "TASK_PACKET_FIELD_INVALID");
+        assert!(!schedule_prepared);
+
+        let requested_plan = serde_json::json!({
+            "assessment": {
+                "bounded": true, "acceptance_defined": true,
+                "independent": true, "handoff_small": true,
+                "work_units": 2, "explicit_request": true
+            },
+            "task_packet": packet
+        });
+        let NativePlanResult::Scheduled(schedule) = plan_native_task(
+            &database_path,
+            "executor",
+            &root.to_string_lossy(),
+            serde_json::to_string(&requested_plan).unwrap().as_bytes(),
+            || Ok("parent-native".to_owned()),
+        )
+        .unwrap() else {
+            panic!("explicitly requested eligible plan should schedule a native child");
+        };
         assert_eq!(schedule.action, "SPAWN");
         let attempt_id = schedule.attempt_id.unwrap();
 

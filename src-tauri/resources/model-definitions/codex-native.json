@@ -79,5 +79,86 @@
       { "name": "REASONING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
       { "name": "CODEX_MULTI_AGENT", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" }
     ]
+  },
+  {
+    "schemaVersion": 1,
+    "providerPresetId": "codex-native",
+    "modelId": "gpt-6-sol",
+    "displayName": "GPT-6 Sol",
+    "lifecycle": "ACTIVE",
+    "contextWindow": 258400,
+    "maxOutputTokens": 128000,
+    "reasoning": {
+      "status": "SUPPORTED",
+      "supportedEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "defaultEffort": "medium"
+    },
+    "compatibility": {
+      "level": "NATIVE",
+      "source": "OFFICIAL_CODEX",
+      "minimumCodexVersion": null,
+      "verifiedAt": "2026-09-28"
+    },
+    "capabilities": [
+      { "name": "RESPONSES_API", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "PARALLEL_TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "REASONING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "CODEX_MULTI_AGENT", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "providerPresetId": "codex-native",
+    "modelId": "gpt-6-luna",
+    "displayName": "GPT-6 Luna",
+    "lifecycle": "ACTIVE",
+    "contextWindow": 258400,
+    "maxOutputTokens": 128000,
+    "reasoning": {
+      "status": "SUPPORTED",
+      "supportedEfforts": ["low", "medium", "high", "xhigh", "max"],
+      "defaultEffort": "medium"
+    },
+    "compatibility": {
+      "level": "NATIVE",
+      "source": "OFFICIAL_CODEX",
+      "minimumCodexVersion": null,
+      "verifiedAt": "2026-09-28"
+    },
+    "capabilities": [
+      { "name": "RESPONSES_API", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "PARALLEL_TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "REASONING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "CODEX_MULTI_AGENT", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" }
+    ]
+  },
+  {
+    "schemaVersion": 1,
+    "providerPresetId": "codex-native",
+    "modelId": "gpt-6-astra",
+    "displayName": "GPT-6 Astra",
+    "lifecycle": "ACTIVE",
+    "contextWindow": 258400,
+    "maxOutputTokens": 128000,
+    "reasoning": {
+      "status": "SUPPORTED",
+      "supportedEfforts": ["low", "medium", "high", "xhigh", "max", "ultra"],
+      "defaultEffort": "low"
+    },
+    "compatibility": {
+      "level": "NATIVE",
+      "source": "OFFICIAL_CODEX",
+      "minimumCodexVersion": null,
+      "verifiedAt": "2026-09-28"
+    },
+    "capabilities": [
+      { "name": "RESPONSES_API", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "PARALLEL_TOOL_CALLING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "REASONING", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" },
+      { "name": "CODEX_MULTI_AGENT", "status": "SUPPORTED", "source": "OFFICIAL_CODEX", "confidence": "AUTHORITATIVE" }
+    ]
   }
 ]
