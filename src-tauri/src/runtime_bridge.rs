@@ -171,6 +171,7 @@ impl RuntimeBridgeService {
             .lock()
             .map_err(|_| ApiError::from(RuntimeBridgeError::StateUnavailable))?;
         let cwd = validate_cwd(&request.cwd).map_err(ApiError::from)?;
+        validate_agent_workspace(&cwd).map_err(ApiError::from)?;
         let input = validate_turn_input(&request.input).map_err(ApiError::from)?;
         if normalize_workspace_scope_key(&cwd).as_deref()
             != Some(request.task_packet.workspace_scope_key.as_str())
@@ -1898,6 +1899,15 @@ fn validate_cwd(cwd: &str) -> Result<String, RuntimeBridgeError> {
     Ok(cwd.to_owned())
 }
 
+fn validate_agent_workspace(cwd: &str) -> Result<(), RuntimeBridgeError> {
+    let mut entries = std::fs::read_dir(cwd).map_err(|_| RuntimeBridgeError::InvalidCwd)?;
+    match entries.next() {
+        Some(Ok(_)) => Ok(()),
+        Some(Err(_)) => Err(RuntimeBridgeError::InvalidCwd),
+        None => Err(RuntimeBridgeError::EmptyWorkspace),
+    }
+}
+
 fn validate_thread_id(thread_id: &str) -> Result<String, RuntimeBridgeError> {
     let thread_id = thread_id.trim();
     if thread_id.is_empty() || thread_id.len() > 256 {
@@ -2328,6 +2338,11 @@ impl From<RuntimeBridgeError> for ApiError {
                 "托管会话工作目录必须是已存在的绝对目录。",
                 false,
             ),
+            RuntimeBridgeError::EmptyWorkspace => (
+                "AGENT_WORKSPACE_EMPTY",
+                "子 Agent 工作目录为空；请先准备完整的隔离项目副本或 Git worktree。",
+                false,
+            ),
             RuntimeBridgeError::InvalidThreadId => (
                 "MANAGED_SESSION_THREAD_ID_INVALID",
                 "托管会话 Thread ID 无效。",
@@ -2461,6 +2476,7 @@ pub(crate) enum RuntimeBridgeError {
     ManagedSessionUnsupported(SchemaCapability),
     AgentExecutionUnsupported(SchemaCapability),
     InvalidCwd,
+    EmptyWorkspace,
     InvalidThreadId,
     InvalidInput,
     ThreadNotBound,
@@ -2506,6 +2522,7 @@ impl fmt::Display for RuntimeBridgeError {
                 "managed agent execution is not supported by the detected schema: {capability:?}"
             ),
             Self::InvalidCwd => formatter.write_str("managed session cwd is invalid"),
+            Self::EmptyWorkspace => formatter.write_str("agent workspace is empty"),
             Self::InvalidThreadId => formatter.write_str("managed session thread id is invalid"),
             Self::InvalidInput => formatter.write_str("managed turn input is invalid"),
             Self::ThreadNotBound => formatter.write_str("thread is not bound to runtime bridge"),

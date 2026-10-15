@@ -63,6 +63,31 @@ pub(crate) struct NormalizedUsage {
     pub(crate) partial: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskResultOutcome {
+    Done,
+    NeedsDecision,
+    Partial,
+    Blocked,
+}
+
+impl TaskResultOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::NeedsDecision => "NEEDS_DECISION",
+            Self::Partial => "PARTIAL",
+            Self::Blocked => "BLOCKED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TaskResult {
+    pub(crate) outcome: Option<TaskResultOutcome>,
+    pub(crate) final_response: String,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum NormalizedRuntimeEvent {
     ThreadStarted {
@@ -139,6 +164,43 @@ pub(crate) fn parse_event(
         "turn/completed" => parse_turn_finished(params),
         _ => Ok(None),
     }
+}
+
+pub(crate) fn parse_task_result(raw_event: &str) -> Option<TaskResult> {
+    let message: Value = serde_json::from_str(raw_event).ok()?;
+    let params = message.get("params").unwrap_or(&message);
+    let turn = object_field(params, "turn").unwrap_or(params);
+    let final_response = turn
+        .get("items")
+        .and_then(Value::as_array)?
+        .iter()
+        .rev()
+        .find(|item| {
+            item.get("type").and_then(Value::as_str) == Some("agentMessage")
+                && item.get("phase").and_then(Value::as_str) == Some("final_answer")
+        })?
+        .get("text")
+        .and_then(Value::as_str)?
+        .trim()
+        .to_owned();
+    if final_response.is_empty() {
+        return None;
+    }
+    let outcome = final_response
+        .lines()
+        .next()
+        .map(str::trim)
+        .and_then(|line| match line {
+            "RESULT: DONE" => Some(TaskResultOutcome::Done),
+            "RESULT: NEEDS_DECISION" => Some(TaskResultOutcome::NeedsDecision),
+            "RESULT: PARTIAL" => Some(TaskResultOutcome::Partial),
+            "RESULT: BLOCKED" => Some(TaskResultOutcome::Blocked),
+            _ => None,
+        });
+    Some(TaskResult {
+        outcome,
+        final_response,
+    })
 }
 
 pub(crate) fn parse_thread_response(

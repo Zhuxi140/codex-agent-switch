@@ -124,6 +124,52 @@ fn cached_input_provenance_tracks_provider_field_presence() {
 }
 
 #[test]
+fn task_result_uses_the_final_answer_contract() {
+    for (line, expected) in [
+        ("RESULT: DONE", TaskResultOutcome::Done),
+        ("RESULT: NEEDS_DECISION", TaskResultOutcome::NeedsDecision),
+        ("RESULT: PARTIAL", TaskResultOutcome::Partial),
+        ("RESULT: BLOCKED", TaskResultOutcome::Blocked),
+    ] {
+        let event = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": format!("{line}\n\nVERIFIED: evidence")
+                    }]
+                }
+            }
+        });
+        let result = parse_task_result(&event.to_string()).unwrap();
+        assert_eq!(result.outcome, Some(expected));
+        assert!(result.final_response.contains("VERIFIED: evidence"));
+    }
+
+    let invalid = serde_json::json!({
+        "method": "turn/completed",
+        "params": {
+            "turn": {
+                "items": [{
+                    "type": "agentMessage",
+                    "phase": "final_answer",
+                    "text": "Finished without the required contract."
+                }]
+            }
+        }
+    });
+    assert_eq!(
+        parse_task_result(&invalid.to_string()).unwrap().outcome,
+        None
+    );
+}
+
+#[test]
 fn missing_critical_ids_fail_closed() {
     assert_eq!(
         parse_thread_response(&fixture("missing-thread-id.json")),

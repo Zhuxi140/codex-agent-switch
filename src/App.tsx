@@ -15,6 +15,7 @@ import {
   applyOrphanCleanup,
   addProjectExclusion,
   addModel,
+  assessDelegation,
   cleanupAgentThreadInstances,
   createAgent,
   createProvider,
@@ -22,6 +23,7 @@ import {
   deleteModel,
   deleteProvider,
   deleteProjectExclusion,
+  executeAgentThread,
   getAgent,
   getAppBootstrap,
   getCodexEnvironment,
@@ -32,6 +34,7 @@ import {
   getSettings,
   getUsageSummary,
   getUsageMonitorStatus,
+  inspectAgentThreadInstance,
   listAgentPresets,
   listAgentScheduleDecisions,
   listRuntimeEnforcementEvents,
@@ -51,6 +54,8 @@ import {
   recommendAgentThreadInstance,
   redetectCodex,
   recoverUsageMonitor,
+  resumeManagedUsageSession,
+  reviewOrchestrationJob,
   resolveManagedSessionRecovery,
   restoreSnapshot,
   resolveRuntimeModeConflict,
@@ -60,6 +65,7 @@ import {
   stopUsageMonitor,
   setAgentThreadInstanceWorkspaceScope,
   setAgentThreadInstanceReuseState,
+  startManagedUsageSession,
   testModelConnection,
   switchRuntimeMode,
   syncNativeSubagents,
@@ -81,11 +87,15 @@ import {
   type AgentThreadInstanceStatus,
   type AgentThreadProjectSummaryResponse,
   type OrchestrationJobPageResponse,
+  type OrchestrationJobTracking,
   type AppBootstrapResponse,
   type CodexEnvironmentResponse,
   type CodexMcpServerResponse,
   type ConfigurationStatusResponse,
   type ConfigurationConflictResponse,
+  type DelegationAssessmentFacts,
+  type DelegationAssessmentProfile,
+  type DelegationAssessmentResult,
   type DiagnosticsResponse,
   type OrphanCleanupPreview,
   type ModelSummary,
@@ -99,6 +109,7 @@ import {
   type ProviderSummary,
   type ProjectExclusion,
   type ReasoningPolicy,
+  type ReviewOutcome,
   type RuntimeModeResponse,
   type RuntimeHookStatusResponse,
   type RuntimeBridgeStatusResponse,
@@ -2457,13 +2468,14 @@ function AgentRow({
 }
 
 type UsageRange = "TODAY" | "7_DAYS" | "ALL" | "CUSTOM";
-type UsageDetailView = "threads" | "runtime" | "decisions";
+type UsageDetailView = "lab" | "threads" | "runtime" | "decisions";
 
 const usageDetailViews: Array<{
   icon: IconName;
   label: string;
   value: UsageDetailView;
 }> = [
+  { icon: "dashboard", label: "委派评估", value: "lab" },
   { icon: "threads", label: "项目线程", value: "threads" },
   { icon: "shield", label: "运行约束", value: "runtime" },
   { icon: "clock", label: "调度决策", value: "decisions" },
@@ -2478,7 +2490,7 @@ function UsagePage({
 }) {
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentError, setAgentError] = useState<string | null>(null);
-  const [detailView, setDetailView] = useState<UsageDetailView>("threads");
+  const [detailView, setDetailView] = useState<UsageDetailView>("lab");
   const [monitorOpening, setMonitorOpening] = useState(false);
 
   useEffect(() => {
@@ -2550,7 +2562,9 @@ function UsagePage({
           </div>
         </div>
         <div className="usage-detail-panel">
-          {detailView === "threads" ? (
+          {detailView === "lab" ? (
+            <DelegationDecisionLab runtimeBridge={runtimeBridge} />
+          ) : detailView === "threads" ? (
             <AgentThreadInstancesPanel />
           ) : detailView === "runtime" ? (
             <RuntimeEnforcementPanel />
@@ -2584,6 +2598,733 @@ function ExpandableMessage({ className, text }: { className?: string; text: stri
         <p>{text}</p>
       </details>
     </div>
+  );
+}
+
+interface DelegationLabDraft {
+  objective: string;
+  successCriteria: string;
+  workspaceScopeKey: string;
+  phase: OrchestrationPhase;
+  profile: DelegationAssessmentProfile;
+  estimatedMinutes: number;
+  workUnits: number;
+  modules: number;
+  callChains: number;
+  environments: number;
+  stages: number;
+  bounded: boolean;
+  independent: boolean;
+  handoffSmall: boolean;
+  testsDefined: boolean;
+  highRisk: boolean;
+}
+
+interface DelegationLabPreview {
+  assessment: DelegationAssessmentResult;
+  recommendation: AgentThreadInstanceRecommendation | null;
+}
+
+const delegationProfileCopy: Record<
+  DelegationAssessmentProfile,
+  { label: string; description: string }
+> = {
+  CONSERVATIVE: { label: "保守", description: "证据和收益都明确时才建议委派" },
+  BALANCED: { label: "均衡", description: "适合日常多步骤任务" },
+  AGGRESSIVE: { label: "积极", description: "更早建议，但仍保留全部硬门槛" },
+};
+
+const delegationPhaseLabels: Record<OrchestrationPhase, string> = {
+  DISCOVERY: "检索与定位",
+  EXECUTION: "实现与修改",
+  VERIFICATION: "测试与验证",
+  REVIEW: "审查与复核",
+};
+
+function delegationReasonLabel(reasonCode: string): string {
+  return {
+    AGENT_NOT_EXECUTABLE: "该阶段没有可执行的 Active Agent",
+    BENEFIT_NOT_PROVEN: "委派收益尚未达到所选策略门槛",
+    CANDIDATE_RECOMMENDED: "任务边界与收益证据足以建议委派",
+    HANDOFF_COST_HIGH: "交接成本过高，Primary 直接完成更合适",
+    PHASE_UNSUPPORTED: "Agent 的编排阶段不受支持",
+    PROJECT_EXCLUDED: "该项目已明确排除编排",
+    ROLE_GATE_NOT_MET: "任务规模尚未达到该角色的委派条件",
+    TASK_NOT_INDEPENDENT: "任务边界、验收标准或独立性不足",
+    USER_FORBIDDEN: "用户明确禁止委派",
+    USER_REQUESTED: "用户确认委派，已通过价值评估",
+  }[reasonCode] ?? reasonCode;
+}
+
+function delegationRunId(): string {
+  const random = globalThis.crypto?.randomUUID?.().replaceAll("-", "")
+    ?? `${Date.now()}${Math.random().toString(16).slice(2)}`;
+  return `lab-${random.slice(0, 24).toLowerCase()}`;
+}
+
+interface DelegationLabExecution {
+  action: string;
+  jobId: string;
+  attemptId: string;
+  agentId: string;
+  workspaceScopeKey: string;
+  threadId: string | null;
+  status: string;
+}
+
+function restoreDelegationLabExecution(
+  tracking: OrchestrationJobTracking,
+): DelegationLabExecution | null {
+  const attempt = tracking.attempts.reduce(
+    (latest, candidate) => (
+      !latest || candidate.attemptNo > latest.attemptNo ? candidate : latest
+    ),
+    tracking.attempts[0] ?? null,
+  );
+  if (!attempt) return null;
+  return {
+    action: attempt.routeAction === "RESUME" ? "REUSED" : "SPAWNED",
+    jobId: tracking.jobId,
+    attemptId: attempt.attemptId,
+    agentId: tracking.agentId,
+    workspaceScopeKey: tracking.workspaceScopeKey,
+    threadId: attempt.codexThreadId,
+    status: attempt.state,
+  };
+}
+
+function delegationReviewEvidence(execution: DelegationLabExecution): string {
+  return [
+    `job:${execution.jobId}`,
+    `attempt:${execution.attemptId}`,
+    execution.threadId ? `thread:${execution.threadId}` : null,
+  ].filter((item): item is string => item !== null).join("\n");
+}
+
+function DelegationDecisionLab({
+  runtimeBridge,
+}: {
+  runtimeBridge: RuntimeBridgeStatusResponse | null;
+}) {
+  const [draft, setDraft] = useState<DelegationLabDraft>({
+    objective: "",
+    successCriteria: "",
+    workspaceScopeKey: "",
+    phase: "EXECUTION",
+    profile: "CONSERVATIVE",
+    estimatedMinutes: 15,
+    workUnits: 2,
+    modules: 1,
+    callChains: 0,
+    environments: 1,
+    stages: 1,
+    bounded: true,
+    independent: true,
+    handoffSmall: true,
+    testsDefined: true,
+    highRisk: false,
+  });
+  const [agents, setAgents] = useState<AgentSummary[]>([]);
+  const [runtimeMode, setRuntimeMode] = useState<RuntimeModeResponse | null>(null);
+  const [preview, setPreview] = useState<DelegationLabPreview | null>(null);
+  const [execution, setExecution] = useState<DelegationLabExecution | null>(null);
+  const [tracking, setTracking] = useState<OrchestrationJobTracking | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState<"PREVIEW" | "EXECUTE" | null>(null);
+  const [reviewBusy, setReviewBusy] = useState<ReviewOutcome | null>(null);
+  const [reviewReason, setReviewReason] = useState("");
+  const [reviewEvidence, setReviewEvidence] = useState("");
+  const [reviewMessage, setReviewMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    Promise.all([
+      listAgents(),
+      getRuntimeMode(),
+      listOrchestrationJobs({
+        workspaceScopeKey: null,
+        agentId: null,
+        page: 0,
+        pageSize: 100,
+      }),
+    ])
+      .then(([loadedAgents, mode, jobs]) => {
+        setAgents(loadedAgents);
+        setRuntimeMode(mode);
+        const labJobs = jobs.jobs.filter((job) => job.jobId.startsWith("lab-"));
+        const recentJob = labJobs.find((job) => !job.terminalAt) ?? labJobs[0] ?? null;
+        if (recentJob) {
+          const restoredExecution = restoreDelegationLabExecution(recentJob);
+          if (restoredExecution) {
+            setExecution(restoredExecution);
+            setTracking(recentJob);
+            setReviewEvidence(delegationReviewEvidence(restoredExecution));
+          }
+        }
+      })
+      .catch((reason: unknown) => setError(errorMessage(reason)));
+  }, []);
+
+  const activeBinding = runtimeMode?.activeBindings.find(
+    (binding) => binding.phase === draft.phase,
+  ) ?? null;
+  const selectedAgent = agents.find((agent) => agent.id === activeBinding?.agentId) ?? null;
+  const parentThreadId = runtimeBridge?.managedSession?.threadId ?? null;
+  const criteria = draft.successCriteria
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  const draftFingerprint = JSON.stringify(draft);
+
+  useEffect(() => {
+    setPreview(null);
+    setConfirmed(false);
+    setError(null);
+  }, [draftFingerprint]);
+
+  function updateDraft<Key extends keyof DelegationLabDraft>(
+    key: Key,
+    value: DelegationLabDraft[Key],
+  ) {
+    setDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  const facts = (explicitRequest: boolean): DelegationAssessmentFacts => ({
+    bounded: draft.bounded,
+    acceptance_defined: criteria.length > 0,
+    independent: draft.independent,
+    handoff_small: draft.handoffSmall,
+    profile: draft.profile,
+    delegation_forbidden: false,
+    explicit_request: explicitRequest,
+    estimated_minutes: draft.estimatedMinutes,
+    work_units: draft.workUnits,
+    modules: draft.modules,
+    call_chains: draft.callChains,
+    tests_defined: draft.testsDefined,
+    high_risk: draft.highRisk,
+    environments: draft.environments,
+    stages: draft.stages,
+  });
+
+  const validate = (): string | null => {
+    if (!draft.objective.trim()) return "请填写任务目标。";
+    if (criteria.length === 0) return "请至少填写一条可验证的验收标准。";
+    if (!draft.workspaceScopeKey.trim()) return "请填写绝对 Workspace 路径。";
+    if (!selectedAgent) return "所选阶段没有 Active Agent，请先在 Agents 页面完成绑定并应用。";
+    if (!selectedAgent.enabled || selectedAgent.availability !== "READY" || !selectedAgent.model) {
+      return "Active Agent 当前不可执行，请先修复模型绑定或兼容性。";
+    }
+    return null;
+  };
+
+  const assess = async () => {
+    const validation = validate();
+    if (validation) {
+      setError(validation);
+      return;
+    }
+    setBusy("PREVIEW");
+    setError(null);
+    setConfirmed(false);
+    try {
+      const assessment = await assessDelegation({
+        agentKey: selectedAgent!.agentKey,
+        workspaceScopeKey: draft.workspaceScopeKey.trim(),
+        facts: facts(false),
+      });
+      const recommendation = assessment.action === "SUGGEST"
+        ? await inspectAgentThreadInstance(
+          selectedAgent!.id,
+          draft.workspaceScopeKey.trim(),
+          parentThreadId,
+        )
+        : null;
+      setPreview({ assessment, recommendation });
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const execute = async () => {
+    const validation = validate();
+    if (validation || !preview || preview.assessment.action !== "SUGGEST") {
+      setError(validation ?? "当前评估没有建议委派。");
+      return;
+    }
+    if (!confirmed) {
+      setError("请先确认本次操作会创建真实 Job 并启动子 Agent。");
+      return;
+    }
+    if (
+      runtimeBridge?.status !== "RUNNING"
+      || !parentThreadId
+      || runtimeBridge?.managedSession?.status !== "IDLE"
+    ) {
+      setError("真实委派需要 Runtime Bridge 正在运行，且 Primary Session 已连接并处于 IDLE。");
+      return;
+    }
+    setBusy("EXECUTE");
+    setError(null);
+    try {
+      const confirmedAssessment = await assessDelegation({
+        agentKey: selectedAgent!.agentKey,
+        workspaceScopeKey: draft.workspaceScopeKey.trim(),
+        facts: facts(true),
+      });
+      if (confirmedAssessment.action !== "DELEGATE") {
+        setPreview((current) => current
+          ? { ...current, assessment: confirmedAssessment }
+          : current);
+        throw new Error("确认时评估结果已变化，未创建 Job。");
+      }
+      const runId = delegationRunId();
+      const recommendation = await inspectAgentThreadInstance(
+        selectedAgent!.id,
+        draft.workspaceScopeKey.trim(),
+        parentThreadId,
+        runId,
+      );
+      const result = await executeAgentThread({
+        taskPacket: {
+          schema_version: 1,
+          job_id: runId,
+          idempotency_key: runId,
+          agent_id: selectedAgent!.id,
+          parent_thread_id: parentThreadId,
+          workspace_scope_key: recommendation.workspaceScopeKey,
+          task_scope_key: runId,
+          objective: draft.objective.trim(),
+          allowed_scope: [recommendation.workspaceScopeKey],
+          constraints: [
+            "不得超出所选 Workspace Scope",
+            "只完成本 TaskPacket 定义的可验收工作单元",
+          ],
+          success_criteria: criteria,
+          allowed_tools: [],
+          permission_policy: "INHERIT",
+          execution_kind_policy: "MANAGED_WORKER_REQUIRED",
+          context_references: [],
+          output_contract: "STANDARD_V1",
+          review_policy: "PRIMARY_REQUIRED",
+        },
+        cwd: draft.workspaceScopeKey.trim(),
+        input: [
+          `任务：${draft.objective.trim()}`,
+          "验收标准：",
+          ...criteria.map((item) => `- ${item}`),
+          "只完成上述范围，完成后返回简洁、可核验的结果。",
+        ].join("\n"),
+        expectedDecision: recommendation.decision,
+        expectedCandidateThreadId: recommendation.candidateThreadId,
+      });
+      setPreview({ assessment: confirmedAssessment, recommendation });
+      setExecution(result);
+      setReviewReason("");
+      setReviewEvidence(delegationReviewEvidence(result));
+      setReviewMessage(null);
+      setConfirmed(false);
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const loadTracking = useCallback(async () => {
+    if (!execution) return;
+    const loaded = await listOrchestrationJobs({
+      workspaceScopeKey: execution.workspaceScopeKey,
+      agentId: execution.agentId,
+      page: 0,
+      pageSize: 20,
+    });
+    setTracking(loaded.jobs.find((job) => job.jobId === execution.jobId) ?? null);
+  }, [execution]);
+
+  useEffect(() => {
+    void loadTracking().catch(() => undefined);
+  }, [loadTracking]);
+  useVisiblePolling(loadTracking, 5_000, false);
+
+  const currentAttempt = tracking?.attempts.find(
+    (attempt) => attempt.attemptId === execution?.attemptId,
+  ) ?? null;
+  const durationSeconds = tracking
+    ? Math.max(
+      0,
+      Math.round(
+        (Date.parse(tracking.updatedAt) - Date.parse(tracking.createdAt)) / 1000,
+      ),
+    )
+    : null;
+  const workloadSummary = draft.phase === "DISCOVERY"
+    ? `${draft.estimatedMinutes} min · ${draft.modules} 模块 · ${draft.callChains} 调用链`
+    : draft.phase === "EXECUTION"
+      ? `${draft.estimatedMinutes} min · ${draft.workUnits} 工作单元`
+      : draft.phase === "VERIFICATION"
+        ? `${draft.estimatedMinutes} min · ${draft.environments} 环境 · ${draft.stages} 阶段`
+        : `${draft.estimatedMinutes} min · ${draft.highRisk ? "高风险" : "常规审查"}`;
+  const reviewReady = tracking?.state === "REVIEW_PENDING"
+    && currentAttempt?.state === "SUCCEEDED"
+    && currentAttempt.receiptStage === "RESULT_OBSERVED"
+    && !currentAttempt.reviewDecision;
+
+  async function submitReview(decision: ReviewOutcome) {
+    if (!execution || !tracking || !currentAttempt || !reviewReady) {
+      setError("Job 尚未到达可审查状态，请等待 RESULT_OBSERVED。");
+      return;
+    }
+    const reason = reviewReason.trim();
+    if (!reason) {
+      setError("Primary Review 必须填写审查理由。");
+      return;
+    }
+    const evidenceRefs = reviewEvidence
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (evidenceRefs.length < 2 || new Set(evidenceRefs).size !== evidenceRefs.length) {
+      setError("Primary Review 至少需要两条不同的证据引用，每行一条。");
+      return;
+    }
+    if (decision === "REJECT" && !window.confirm(
+      "拒绝会终止当前 Job，并将执行 Thread 移出复用池。确认拒绝？",
+    )) return;
+
+    setReviewBusy(decision);
+    setReviewMessage(null);
+    setError(null);
+    try {
+      await reviewOrchestrationJob({
+        jobId: execution.jobId,
+        attemptId: currentAttempt.attemptId,
+        decision,
+        reviewerThreadId: tracking.parentThreadId,
+        reason,
+        evidenceRefs,
+      });
+      setReviewMessage({
+        APPROVE: "Primary 已批准，本次 Job 将完成并释放执行资源。",
+        REVISION_REQUIRED: "Primary 已要求修订，当前结果不会视为完成。",
+        REJECT: "Primary 已拒绝，本次 Job 已终止。",
+      }[decision]);
+      await loadTracking();
+    } catch (reason: unknown) {
+      setError(errorMessage(reason));
+    } finally {
+      setReviewBusy(null);
+    }
+  }
+
+  return (
+    <section className="delegation-lab" aria-labelledby="delegation-lab-title">
+      <header className="delegation-lab-header">
+        <div>
+          <span className="eyebrow">Delegation Lab</span>
+          <h2 id="delegation-lab-title">委派决策实验室</h2>
+          <p>先做只读评估；只有明确确认后才创建 Job 并启动真实子 Agent。</p>
+        </div>
+        <span className={`delegation-runtime ${runtimeBridge?.status.toLowerCase() ?? "stopped"}`}>
+          Runtime {runtimeBridge?.status ?? "STOPPED"}
+        </span>
+      </header>
+
+      <div className="delegation-lab-grid">
+        <form className="delegation-lab-form" onSubmit={(event) => {
+          event.preventDefault();
+          void assess();
+        }}>
+          <div className="delegation-profile-picker" aria-label="委派策略">
+            {(Object.keys(delegationProfileCopy) as DelegationAssessmentProfile[]).map((profile) => (
+              <button
+                aria-pressed={draft.profile === profile}
+                className={draft.profile === profile ? "active" : ""}
+                key={profile}
+                onClick={() => updateDraft("profile", profile)}
+                type="button"
+              >
+                <strong>{delegationProfileCopy[profile].label}</strong>
+                <small>{delegationProfileCopy[profile].description}</small>
+              </button>
+            ))}
+          </div>
+
+          <div className="delegation-fields two-column">
+            <label className="field">
+              <span>任务阶段</span>
+              <select
+                onChange={(event) => updateDraft("phase", event.target.value as OrchestrationPhase)}
+                value={draft.phase}
+              >
+                {(Object.keys(delegationPhaseLabels) as OrchestrationPhase[]).map((phase) => (
+                  <option key={phase} value={phase}>{delegationPhaseLabels[phase]}</option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>预计耗时（分钟）</span>
+              <input
+                min={0}
+                onChange={(event) => updateDraft("estimatedMinutes", Number(event.target.value))}
+                type="number"
+                value={draft.estimatedMinutes}
+              />
+            </label>
+          </div>
+
+          <label className="field">
+            <span>Workspace 绝对路径</span>
+            <input
+              onChange={(event) => updateDraft("workspaceScopeKey", event.target.value)}
+              placeholder="C:\项目目录"
+              value={draft.workspaceScopeKey}
+            />
+          </label>
+          <label className="field">
+            <span>任务目标</span>
+            <textarea
+              onChange={(event) => updateDraft("objective", event.target.value)}
+              placeholder="描述子 Agent 需要交付的单一、明确任务"
+              rows={3}
+              value={draft.objective}
+            />
+          </label>
+          <label className="field">
+            <span>验收标准（每行一条）</span>
+            <textarea
+              onChange={(event) => updateDraft("successCriteria", event.target.value)}
+              placeholder={"相关测试通过\n仅修改约定范围"}
+              rows={3}
+              value={draft.successCriteria}
+            />
+          </label>
+
+          <div className="delegation-fields compact">
+            {draft.phase === "DISCOVERY" && (
+              <>
+                <DelegationNumberField label="涉及模块" onChange={(value) => updateDraft("modules", value)} value={draft.modules} />
+                <DelegationNumberField label="调用链" onChange={(value) => updateDraft("callChains", value)} value={draft.callChains} />
+              </>
+            )}
+            {draft.phase === "EXECUTION" && (
+              <>
+                <DelegationNumberField label="独立工作单元" onChange={(value) => updateDraft("workUnits", value)} value={draft.workUnits} />
+                <DelegationNumberField label="涉及模块" onChange={(value) => updateDraft("modules", value)} value={draft.modules} />
+              </>
+            )}
+            {draft.phase === "VERIFICATION" && (
+              <>
+                <DelegationNumberField label="验证环境" onChange={(value) => updateDraft("environments", value)} value={draft.environments} />
+                <DelegationNumberField label="验证阶段" onChange={(value) => updateDraft("stages", value)} value={draft.stages} />
+              </>
+            )}
+          </div>
+
+          <div className="delegation-guard-list">
+            <DelegationCheck checked={draft.bounded} label="范围边界明确" onChange={(value) => updateDraft("bounded", value)} />
+            <DelegationCheck checked={draft.independent} label="可由子 Agent 独立完成" onChange={(value) => updateDraft("independent", value)} />
+            <DelegationCheck checked={draft.handoffSmall} label="交接材料简短" onChange={(value) => updateDraft("handoffSmall", value)} />
+            {draft.phase === "EXECUTION" && (
+              <DelegationCheck checked={draft.testsDefined} label="测试或验证方式已定义" onChange={(value) => updateDraft("testsDefined", value)} />
+            )}
+            {draft.phase === "REVIEW" && (
+              <DelegationCheck checked={draft.highRisk} label="属于高风险审查" onChange={(value) => updateDraft("highRisk", value)} />
+            )}
+          </div>
+
+          <button className="primary-button delegation-preview-button" disabled={busy !== null} type="submit">
+            {busy === "PREVIEW" ? "评估中…" : "只读评估"}
+          </button>
+        </form>
+
+        <div className="delegation-lab-result" aria-live="polite">
+          {!preview && (
+            <div className="delegation-empty">
+              <UiIcon name="dashboard" />
+              <strong>尚未评估</strong>
+              <p>评估不会创建 Job、租约或子 Agent。</p>
+            </div>
+          )}
+          {preview && (
+            <>
+              <div className={`delegation-verdict ${preview.assessment.action.toLowerCase()}`}>
+                <span>{preview.assessment.action}</span>
+                <strong>{preview.assessment.score} / {preview.assessment.threshold}</strong>
+                <p>{delegationReasonLabel(preview.assessment.reasonCode)}</p>
+              </div>
+              <dl className="delegation-summary">
+                <div><dt>策略</dt><dd>{delegationProfileCopy[preview.assessment.profile].label}</dd></div>
+                <div><dt>阶段</dt><dd>{delegationPhaseLabels[preview.assessment.phase as OrchestrationPhase] ?? preview.assessment.phase}</dd></div>
+                <div><dt>Primary 路线</dt><dd>当前会话直接完成</dd></div>
+                <div><dt>委派路线</dt><dd>{preview.recommendation?.decision ?? "不调度"}</dd></div>
+                <div><dt>推荐 Agent</dt><dd>{selectedAgent?.name ?? "—"}</dd></div>
+                <div><dt>模型</dt><dd>{selectedAgent?.model?.displayName ?? "—"}</dd></div>
+                <div><dt>推理等级</dt><dd>{selectedAgent?.reasoningPolicy ?? "—"}</dd></div>
+                <div><dt>任务估算</dt><dd>{workloadSummary}</dd></div>
+              </dl>
+              {preview.recommendation && (
+                <p className="delegation-route-note">
+                  {preview.recommendation.message}
+                </p>
+              )}
+              {preview.assessment.action === "SUGGEST" && (!execution || Boolean(tracking?.terminalAt)) && (
+                <div className="delegation-confirm">
+                  <label>
+                    <input
+                      checked={confirmed}
+                      onChange={(event) => setConfirmed(event.target.checked)}
+                      type="checkbox"
+                    />
+                    我确认创建真实 Job 并启动子 Agent
+                  </label>
+                  <button
+                    className="primary-button"
+                    disabled={
+                      !confirmed
+                      || busy !== null
+                      || runtimeBridge?.status !== "RUNNING"
+                      || !parentThreadId
+                      || runtimeBridge?.managedSession?.status !== "IDLE"
+                    }
+                    onClick={() => void execute()}
+                    type="button"
+                  >
+                    {busy === "EXECUTE" ? "正在委派…" : "确认并委派"}
+                  </button>
+                  {(runtimeBridge?.status !== "RUNNING"
+                    || !parentThreadId
+                    || runtimeBridge?.managedSession?.status !== "IDLE") && (
+                    <small>请先启动 Runtime Bridge，并连接状态为 IDLE 的 Primary Session。</small>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+          {execution && (
+            <div className="delegation-evidence">
+              <strong>真实执行证据</strong>
+              <small>此区域会从 CAS 数据库恢复，切换页面后仍可继续检查和 Review。</small>
+              <dl>
+                <div><dt>实际路由</dt><dd>{execution.action}</dd></div>
+                <div><dt>Job</dt><dd><code>{execution.jobId}</code></dd></div>
+                <div>
+                  <dt>Thread</dt>
+                  <dd><code>{execution.threadId ? shortThreadId(execution.threadId) : "等待回填"}</code></dd>
+                </div>
+                <div><dt>状态</dt><dd>{currentAttempt?.state ?? execution.status}</dd></div>
+                <div><dt>任务结果</dt><dd>{currentAttempt?.taskResult ?? "未识别"}</dd></div>
+                <div><dt>实际 Token</dt><dd>{currentAttempt?.totalTokens == null ? "等待回填" : formatTokenCount(currentAttempt.totalTokens)}</dd></div>
+                <div><dt>耗时</dt><dd>{durationSeconds == null ? "等待回填" : `${durationSeconds}s`}</dd></div>
+                <div><dt>Review</dt><dd>{currentAttempt?.reviewDecision ?? "PENDING"}</dd></div>
+                <div><dt>Primary 对照</dt><dd>本次未采样</dd></div>
+              </dl>
+              {currentAttempt?.taskResultText && (
+                <details className="delegation-result-details" open>
+                  <summary>子 Agent 最终回复</summary>
+                  <pre>{currentAttempt.taskResultText}</pre>
+                </details>
+              )}
+              <small>质量只采用 Primary Review 结论，CAS 不自动猜测结果质量。</small>
+              {reviewReady && (
+                <section className="delegation-review" aria-labelledby="delegation-review-title">
+                  <div>
+                    <strong id="delegation-review-title">Primary Review</strong>
+                    <small>请核对源码、测试与任务范围后再提交。决定一经写入不可覆盖。</small>
+                  </div>
+                  <label className="field">
+                    <span>审查理由</span>
+                    <textarea
+                      onChange={(event) => setReviewReason(event.target.value)}
+                      placeholder="例如：变更仅位于测试模块，目标用例通过，未修改生产评分逻辑。"
+                      rows={3}
+                      value={reviewReason}
+                    />
+                  </label>
+                  <label className="field">
+                    <span>证据引用（每行一条，至少两条）</span>
+                    <textarea
+                      onChange={(event) => setReviewEvidence(event.target.value)}
+                      rows={4}
+                      value={reviewEvidence}
+                    />
+                  </label>
+                  <div className="delegation-review-actions">
+                    {currentAttempt.taskResult !== "DONE" && (
+                      <div className="delegation-review-warning">
+                        子 Agent 未返回 RESULT: DONE，本次不能批准；请选择“要求修订”或“拒绝”。
+                      </div>
+                    )}
+                    <button
+                      className="primary-button"
+                      disabled={reviewBusy !== null || currentAttempt.taskResult !== "DONE"}
+                      onClick={() => void submitReview("APPROVE")}
+                      type="button"
+                    >
+                      {reviewBusy === "APPROVE" ? "提交中…" : "批准"}
+                    </button>
+                    <button
+                      className="secondary-button"
+                      disabled={reviewBusy !== null}
+                      onClick={() => void submitReview("REVISION_REQUIRED")}
+                      type="button"
+                    >
+                      {reviewBusy === "REVISION_REQUIRED" ? "提交中…" : "要求修订"}
+                    </button>
+                    <button
+                      className="danger-button"
+                      disabled={reviewBusy !== null}
+                      onClick={() => void submitReview("REJECT")}
+                      type="button"
+                    >
+                      {reviewBusy === "REJECT" ? "提交中…" : "拒绝"}
+                    </button>
+                  </div>
+                </section>
+              )}
+              {reviewMessage && <div className="inline-success">{reviewMessage}</div>}
+            </div>
+          )}
+          {error && <div className="inline-error" role="alert">{error}</div>}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function DelegationNumberField({
+  label,
+  onChange,
+  value,
+}: {
+  label: string;
+  onChange: (value: number) => void;
+  value: number;
+}) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <input min={0} onChange={(event) => onChange(Number(event.target.value))} type="number" value={value} />
+    </label>
+  );
+}
+
+function DelegationCheck({
+  checked,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <label>
+      <input checked={checked} onChange={(event) => onChange(event.target.checked)} type="checkbox" />
+      <span>{label}</span>
+    </label>
   );
 }
 
@@ -2802,7 +3543,16 @@ function UsageMonitorCard({
   onMonitorChange: (status: RuntimeBridgeStatusResponse) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const [sessionBusy, setSessionBusy] = useState<"START" | "RESUME" | null>(null);
+  const [primaryCwd, setPrimaryCwd] = useState("");
+  const [resumeThreadId, setResumeThreadId] = useState("");
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!monitor?.managedSession) return;
+    setPrimaryCwd((current) => current || monitor.managedSession?.cwd || "");
+    setResumeThreadId((current) => current || monitor.managedSession?.threadId || "");
+  }, [monitor?.managedSession?.cwd, monitor?.managedSession?.threadId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -2823,6 +3573,42 @@ function UsageMonitorCard({
       await refresh();
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function startPrimarySession() {
+    const cwd = primaryCwd.trim();
+    if (!cwd) {
+      setError("创建 Primary Session 前请填写 Workspace 绝对路径。");
+      return;
+    }
+    setSessionBusy("START");
+    setError(null);
+    try {
+      await startManagedUsageSession(cwd);
+      await refresh();
+    } catch (reason: unknown) {
+      setError(runtimeBridgeErrorMessage(reason));
+    } finally {
+      setSessionBusy(null);
+    }
+  }
+
+  async function resumePrimarySession() {
+    const threadId = resumeThreadId.trim();
+    if (!threadId) {
+      setError("恢复 Primary Session 前请填写 Thread ID。");
+      return;
+    }
+    setSessionBusy("RESUME");
+    setError(null);
+    try {
+      await resumeManagedUsageSession(threadId, primaryCwd.trim() || undefined);
+      await refresh();
+    } catch (reason: unknown) {
+      setError(runtimeBridgeErrorMessage(reason));
+    } finally {
+      setSessionBusy(null);
     }
   }
 
@@ -2918,6 +3704,68 @@ function UsageMonitorCard({
               <strong>{monitor.lastEventAt ? formatDataAge(monitor.lastEventAt) : "—"}</strong>
             </div>
           </div>
+          {monitor.status === "RUNNING"
+            && monitor.managedSessionCapability === "SUPPORTED"
+            && (!monitor.managedSession
+              || ["DETACHED", "FAILED"].includes(monitor.managedSession.status)) && (
+            <section className="managed-primary-control" aria-labelledby="managed-primary-title">
+              <div>
+                <strong id="managed-primary-title">连接 Primary Session</strong>
+                <small>新建 Primary，或恢复一个已有 Codex Thread；真实委派必须先完成此步骤。</small>
+              </div>
+              <div className="managed-primary-fields">
+                <label className="field">
+                  <span>Workspace 绝对路径</span>
+                  <input
+                    onChange={(event) => setPrimaryCwd(event.target.value)}
+                    placeholder="C:\项目目录"
+                    value={primaryCwd}
+                  />
+                </label>
+                <label className="field">
+                  <span>已有 Primary Thread ID（恢复时填写）</span>
+                  <input
+                    onChange={(event) => setResumeThreadId(event.target.value)}
+                    placeholder="thread_…"
+                    value={resumeThreadId}
+                  />
+                </label>
+              </div>
+              <div className="managed-primary-actions">
+                <button
+                  className="primary-button"
+                  disabled={sessionBusy !== null || !primaryCwd.trim()}
+                  onClick={() => void startPrimarySession()}
+                  type="button"
+                >
+                  {sessionBusy === "START" ? "创建中…" : "创建 Primary Session"}
+                </button>
+                <button
+                  className="secondary-button"
+                  disabled={sessionBusy !== null || !resumeThreadId.trim()}
+                  onClick={() => void resumePrimarySession()}
+                  type="button"
+                >
+                  {sessionBusy === "RESUME" ? "恢复中…" : "恢复 Primary Session"}
+                </button>
+              </div>
+            </section>
+          )}
+          {monitor.status === "RUNNING"
+            && monitor.managedSession
+            && !["DETACHED", "FAILED"].includes(monitor.managedSession.status) && (
+            <div className="managed-primary-connected">
+              <span>
+                <strong>Primary 已连接</strong>
+                <small>
+                  {shortThreadId(monitor.managedSession.threadId)}
+                  {" · "}{monitor.managedSession.status}
+                  {monitor.managedSession.cwd ? ` · ${monitor.managedSession.cwd}` : ""}
+                </small>
+              </span>
+              <CopyIconButton label="复制 Primary Thread ID" value={monitor.managedSession.threadId} />
+            </div>
+          )}
           <details className="runtime-monitor-details">
             <summary>
               <span>

@@ -7,7 +7,7 @@ use std::path::Path;
 
 use cas_scheduler::hard_gates::{CacheRequirement, Capability};
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::orchestration_contract::{
     ExecutionKindPolicy, IdempotencyOutcome, OutputContract, PermissionPolicy, ReviewOutcome,
@@ -35,19 +35,31 @@ pub struct NativeReviewResult {
     pub state: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeControlError {
     pub code: String,
     pub message: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NativeAssessmentProfile {
+    #[default]
+    Conservative,
+    Balanced,
+    Aggressive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeAssessmentResult {
     pub action: &'static str,
     pub score: u8,
     pub threshold: u8,
     pub reason_code: &'static str,
     pub phase: String,
+    pub profile: NativeAssessmentProfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,13 +113,15 @@ pub fn plan_native_task(
     .map(NativePlanResult::Scheduled)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeAssessmentDraft {
+pub struct NativeAssessmentDraft {
     bounded: bool,
     acceptance_defined: bool,
     independent: bool,
     handoff_small: bool,
+    #[serde(default)]
+    profile: NativeAssessmentProfile,
     #[serde(default)]
     delegation_forbidden: bool,
     #[serde(default)]
@@ -143,6 +157,15 @@ pub fn assess_native_task(
             message: "委派评估需要冻结的 JSON 字段。".to_owned(),
         }
     })?;
+    assess_native_draft(database_path, agent_key, workspace_scope_key, draft)
+}
+
+pub fn assess_native_draft(
+    database_path: &Path,
+    agent_key: &str,
+    workspace_scope_key: &str,
+    draft: NativeAssessmentDraft,
+) -> Result<NativeAssessmentResult, NativeControlError> {
     let workspace_scope_key = cas_scheduler::normalize_workspace_scope_key(workspace_scope_key)
         .ok_or_else(|| input_error("workspace_scope_key 不是可规范化的绝对路径。"))?;
     let connection = Connection::open_with_flags(database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -167,6 +190,7 @@ pub fn assess_native_task(
             0,
             "AGENT_NOT_EXECUTABLE",
             "-",
+            draft.profile,
         ));
     };
     let mut excluded = connection
@@ -181,41 +205,65 @@ pub fn assess_native_task(
         cas_scheduler::normalize_workspace_scope_key(path)
             .is_some_and(|path| cas_scheduler::workspace_is_within(&workspace_scope_key, &path))
     }) {
-        return Ok(assessment_result("PRIMARY", 0, "PROJECT_EXCLUDED", &phase));
+        return Ok(assessment_result(
+            "PRIMARY",
+            0,
+            "PROJECT_EXCLUDED",
+            &phase,
+            draft.profile,
+        ));
     }
     Ok(score_assessment(&phase, &draft))
 }
 
 fn score_assessment(phase: &str, draft: &NativeAssessmentDraft) -> NativeAssessmentResult {
     if draft.delegation_forbidden {
-        return assessment_result("PRIMARY", 0, "USER_FORBIDDEN", phase);
+        return assessment_result("PRIMARY", 0, "USER_FORBIDDEN", phase, draft.profile);
     }
     if !draft.bounded || !draft.acceptance_defined || !draft.independent {
-        return assessment_result("PRIMARY", 0, "TASK_NOT_INDEPENDENT", phase);
+        return assessment_result("PRIMARY", 0, "TASK_NOT_INDEPENDENT", phase, draft.profile);
     }
     if !draft.handoff_small {
-        return assessment_result("PRIMARY", 0, "HANDOFF_COST_HIGH", phase);
+        return assessment_result("PRIMARY", 0, "HANDOFF_COST_HIGH", phase, draft.profile);
     }
     let role_evidence = draft.explicit_request
         || match phase {
-            "DISCOVERY" => draft.call_chains >= 2 || draft.modules >= 3,
-            "EXECUTION" => draft.work_units >= 2 || (draft.modules >= 2 && draft.tests_defined),
+            "DISCOVERY" => match draft.profile {
+                NativeAssessmentProfile::Conservative => {
+                    draft.call_chains >= 2 || draft.modules >= 3
+                }
+                NativeAssessmentProfile::Balanced => draft.call_chains >= 1 || draft.modules >= 2,
+                NativeAssessmentProfile::Aggressive => draft.call_chains >= 1 || draft.modules >= 1,
+            },
+            "EXECUTION" => match draft.profile {
+                NativeAssessmentProfile::Conservative => {
+                    draft.work_units >= 2 || (draft.modules >= 2 && draft.tests_defined)
+                }
+                NativeAssessmentProfile::Balanced => draft.work_units >= 2 || draft.modules >= 2,
+                NativeAssessmentProfile::Aggressive => draft.work_units >= 1 || draft.modules >= 1,
+            },
             "REVIEW" => draft.high_risk,
-            "VERIFICATION" => draft.environments >= 2 || draft.stages >= 2,
+            "VERIFICATION" => match draft.profile {
+                NativeAssessmentProfile::Conservative | NativeAssessmentProfile::Balanced => {
+                    draft.environments >= 2 || draft.stages >= 2
+                }
+                NativeAssessmentProfile::Aggressive => draft.environments >= 1 || draft.stages >= 1,
+            },
             _ => false,
         };
     if !matches!(phase, "DISCOVERY" | "EXECUTION" | "REVIEW" | "VERIFICATION") {
-        return assessment_result("UNAVAILABLE", 0, "PHASE_UNSUPPORTED", phase);
+        return assessment_result("UNAVAILABLE", 0, "PHASE_UNSUPPORTED", phase, draft.profile);
     }
     // 时长和工作单元强相关，只计一次；审查的高风险不受时长门槛限制。
-    let amortized = draft.estimated_minutes >= 15
+    let amortized = draft.estimated_minutes >= profile_minimum_minutes(draft.profile)
         || draft.work_units >= 2
         || (phase == "REVIEW" && draft.high_risk)
         || draft.explicit_request;
     let score = u8::from(role_evidence) * 3 + u8::from(amortized) + 1;
-    let action = if score >= 5 && draft.explicit_request {
+    let threshold = profile_threshold(draft.profile);
+    let action = if score >= threshold && draft.explicit_request {
         "DELEGATE"
-    } else if score >= 5 {
+    } else if score >= threshold {
         "SUGGEST"
     } else {
         "PRIMARY"
@@ -229,7 +277,29 @@ fn score_assessment(phase: &str, draft: &NativeAssessmentDraft) -> NativeAssessm
     } else {
         "BENEFIT_NOT_PROVEN"
     };
-    assessment_result(action, score, reason_code, phase)
+    NativeAssessmentResult {
+        action,
+        score,
+        threshold,
+        reason_code,
+        phase: phase.to_owned(),
+        profile: draft.profile,
+    }
+}
+
+fn profile_threshold(profile: NativeAssessmentProfile) -> u8 {
+    match profile {
+        NativeAssessmentProfile::Conservative | NativeAssessmentProfile::Balanced => 5,
+        NativeAssessmentProfile::Aggressive => 4,
+    }
+}
+
+fn profile_minimum_minutes(profile: NativeAssessmentProfile) -> u16 {
+    match profile {
+        NativeAssessmentProfile::Conservative => 15,
+        NativeAssessmentProfile::Balanced => 10,
+        NativeAssessmentProfile::Aggressive => 5,
+    }
 }
 
 fn assessment_result(
@@ -237,13 +307,15 @@ fn assessment_result(
     score: u8,
     reason_code: &'static str,
     phase: &str,
+    profile: NativeAssessmentProfile,
 ) -> NativeAssessmentResult {
     NativeAssessmentResult {
         action,
         score,
-        threshold: 5,
+        threshold: profile_threshold(profile),
         reason_code,
         phase: phase.to_owned(),
+        profile,
     }
 }
 
@@ -596,6 +668,95 @@ mod tests {
     }
 
     #[test]
+    fn assessment_profiles_change_only_the_delegation_sensitivity() {
+        let draft = |profile, estimated_minutes, work_units, modules| {
+            serde_json::from_value::<NativeAssessmentDraft>(serde_json::json!({
+                "bounded": true,
+                "acceptance_defined": true,
+                "independent": true,
+                "handoff_small": true,
+                "profile": profile,
+                "estimated_minutes": estimated_minutes,
+                "work_units": work_units,
+                "modules": modules
+            }))
+            .unwrap()
+        };
+        let conservative = score_assessment("EXECUTION", &draft("CONSERVATIVE", 10, 1, 1));
+        let balanced = score_assessment("EXECUTION", &draft("BALANCED", 10, 1, 2));
+        let aggressive = score_assessment("EXECUTION", &draft("AGGRESSIVE", 0, 1, 1));
+
+        assert_eq!(
+            (conservative.action, conservative.threshold),
+            ("PRIMARY", 5)
+        );
+        assert_eq!((balanced.action, balanced.threshold), ("SUGGEST", 5));
+        assert_eq!((aggressive.action, aggressive.threshold), ("SUGGEST", 4));
+    }
+
+    #[test]
+    fn unbounded_assessment_is_primary_for_every_profile() {
+        for profile in [
+            NativeAssessmentProfile::Conservative,
+            NativeAssessmentProfile::Balanced,
+            NativeAssessmentProfile::Aggressive,
+        ] {
+            let draft = NativeAssessmentDraft {
+                bounded: false,
+                acceptance_defined: true,
+                independent: true,
+                handoff_small: true,
+                profile,
+                delegation_forbidden: false,
+                explicit_request: true,
+                estimated_minutes: 120,
+                work_units: 2,
+                modules: 3,
+                call_chains: 2,
+                tests_defined: true,
+                high_risk: true,
+                environments: 2,
+                stages: 2,
+            };
+            let result = score_assessment("EXECUTION", &draft);
+
+            assert_eq!(result.action, "PRIMARY");
+            assert_eq!(result.reason_code, "TASK_NOT_INDEPENDENT");
+        }
+    }
+
+    #[test]
+    fn undefined_acceptance_is_primary_for_every_profile() {
+        for profile in [
+            NativeAssessmentProfile::Conservative,
+            NativeAssessmentProfile::Balanced,
+            NativeAssessmentProfile::Aggressive,
+        ] {
+            let draft = NativeAssessmentDraft {
+                bounded: true,
+                acceptance_defined: false,
+                independent: true,
+                handoff_small: true,
+                profile,
+                delegation_forbidden: false,
+                explicit_request: true,
+                estimated_minutes: 120,
+                work_units: 2,
+                modules: 3,
+                call_chains: 2,
+                tests_defined: true,
+                high_risk: true,
+                environments: 2,
+                stages: 2,
+            };
+            let result = score_assessment("EXECUTION", &draft);
+
+            assert_eq!(result.action, "PRIMARY");
+            assert_eq!(result.reason_code, "TASK_NOT_INDEPENDENT");
+        }
+    }
+
+    #[test]
     fn assessment_checks_active_agent_and_project_exclusion() {
         let root = std::env::temp_dir().join(format!("cas-native-assess-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -879,6 +1040,37 @@ mod tests {
             true,
         )
         .unwrap();
+        let raw_event = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "child-native",
+                "turn": {
+                    "id": "native-result:child-native:1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "RESULT: DONE\n\nVERIFIED: native chain"
+                    }]
+                }
+            }
+        })
+        .to_string();
+        open_database(&database_path)
+            .unwrap()
+            .execute(
+                "INSERT INTO runtime_receipt_events (
+                    event_id, event_key, event_type, raw_event, schema_profile,
+                    codex_thread_id, codex_turn_id, successful, observed_at, processed_at
+                 ) VALUES (
+                    'event-native-result',
+                    'TURN_FINISHED:child-native:native-result:child-native:1:true',
+                    'TURN_FINISHED', ?1, 'NATIVE_STATE_V1', 'child-native',
+                    'native-result:child-native:1', 1, ?2, ?2
+                 )",
+                params![raw_event, NOW],
+            )
+            .unwrap();
         let review = review_native_task(
             &database_path,
             "job-native-1",

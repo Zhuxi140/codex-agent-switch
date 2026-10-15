@@ -379,6 +379,8 @@ export interface OrchestrationAttemptTracking {
   receiptStage: string | null;
   reviewDecision: string | null;
   totalTokens: number | null;
+  taskResult: "DONE" | "NEEDS_DECISION" | "PARTIAL" | "BLOCKED" | null;
+  taskResultText: string | null;
   updatedAt: string;
 }
 
@@ -1261,6 +1263,46 @@ export function focusMainWindow(): Promise<void> {
   return invoke<void>("project_monitor_focus_main");
 }
 
+export type DelegationAssessmentProfile =
+  | "CONSERVATIVE"
+  | "BALANCED"
+  | "AGGRESSIVE";
+
+export interface DelegationAssessmentFacts {
+  bounded: boolean;
+  acceptance_defined: boolean;
+  independent: boolean;
+  handoff_small: boolean;
+  profile: DelegationAssessmentProfile;
+  delegation_forbidden: boolean;
+  explicit_request: boolean;
+  estimated_minutes: number;
+  work_units: number;
+  modules: number;
+  call_chains: number;
+  tests_defined: boolean;
+  high_risk: boolean;
+  environments: number;
+  stages: number;
+}
+
+export interface DelegationAssessmentResult {
+  action: "PRIMARY" | "SUGGEST" | "DELEGATE" | "UNAVAILABLE";
+  score: number;
+  threshold: number;
+  reasonCode: string;
+  phase: string;
+  profile: DelegationAssessmentProfile;
+}
+
+export function assessDelegation(request: {
+  agentKey: string;
+  workspaceScopeKey: string;
+  facts: DelegationAssessmentFacts;
+}): Promise<DelegationAssessmentResult> {
+  return invoke<DelegationAssessmentResult>("delegation_assess", { request });
+}
+
 export interface ScheduleDecisionResponse {
   id: string;
   createdAt: string;
@@ -1355,6 +1397,17 @@ export function recommendAgentThreadInstance(
   taskScopeKey: string | null = null,
 ): Promise<AgentThreadInstanceRecommendation> {
   return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_recommend", {
+    request: { agentId, workspaceScopeKey, parentThreadId, taskScopeKey },
+  });
+}
+
+export function inspectAgentThreadInstance(
+  agentId: string,
+  workspaceScopeKey: string,
+  parentThreadId: string | null = null,
+  taskScopeKey: string | null = null,
+): Promise<AgentThreadInstanceRecommendation> {
+  return invoke<AgentThreadInstanceRecommendation>("agent_thread_instance_inspect", {
     request: { agentId, workspaceScopeKey, parentThreadId, taskScopeKey },
   });
 }

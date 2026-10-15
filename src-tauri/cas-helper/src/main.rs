@@ -603,6 +603,7 @@ struct RuntimeLease {
     state: String,
     expires_at: String,
     admission_tool_use_id: Option<String>,
+    admission_confirmed_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1586,10 +1587,10 @@ fn validate_execution_lease(
             "EXECUTION Agent 的 CAS 委派租约已结束，已拒绝写入。",
         ));
     }
-    if lease.admission_tool_use_id.is_none() {
+    if lease.admission_tool_use_id.is_none() && lease.admission_confirmed_at.is_none() {
         return Err((
             "DELEGATION_ADMISSION_MISSING",
-            "当前 CAS 委派租约未通过工具调用准入，已拒绝写入。",
+            "当前 CAS 委派租约尚未确认准入，已拒绝写入。",
         ));
     }
     if identity.agent_id.as_deref() != Some(lease.agent_id.as_str())
@@ -1862,7 +1863,8 @@ fn load_runtime_lease(
     connection
         .query_row(
             "SELECT id, agent_id, parent_thread_id, codex_agent_id, workspace_scope_key,
-                    task_scope_key, state, expires_at, admission_tool_use_id
+                    task_scope_key, state, expires_at, admission_tool_use_id,
+                    admission_confirmed_at
              FROM runtime_delegation_leases WHERE id = ?1",
             [lease_id],
             runtime_lease_from_row,
@@ -1877,7 +1879,8 @@ fn load_runtime_leases<const N: usize>(
 ) -> Result<Vec<RuntimeLease>, rusqlite::Error> {
     let mut statement = connection.prepare(&format!(
         "SELECT id, agent_id, parent_thread_id, codex_agent_id, workspace_scope_key,
-                task_scope_key, state, expires_at, admission_tool_use_id
+                task_scope_key, state, expires_at, admission_tool_use_id,
+                admission_confirmed_at
          FROM runtime_delegation_leases WHERE {condition}
          ORDER BY created_at DESC, rowid DESC"
     ))?;
@@ -1912,6 +1915,7 @@ fn runtime_lease_from_row(row: &rusqlite::Row<'_>) -> Result<RuntimeLease, rusql
         state: row.get(6)?,
         expires_at: row.get(7)?,
         admission_tool_use_id: row.get(8)?,
+        admission_confirmed_at: row.get(9)?,
     })
 }
 
@@ -4433,6 +4437,66 @@ mod tests {
             "shell_command",
             "Get-Content package.json"
         ));
+    }
+
+    #[test]
+    fn managed_runtime_confirmation_allows_execution_write_without_tool_use_id() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE project_orchestration_exclusions (
+                    project_path TEXT NOT NULL,
+                    normalized_path TEXT NOT NULL
+                 );
+                 CREATE TABLE runtime_delegation_leases (
+                    id TEXT PRIMARY KEY,
+                    updated_at TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                 );
+                 INSERT INTO runtime_delegation_leases VALUES (
+                    'lease-managed',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    'ACTIVE',
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+120 seconds')
+                 );",
+            )
+            .unwrap();
+        let lease = RuntimeLease {
+            id: "lease-managed".to_owned(),
+            agent_id: "agent-executor".to_owned(),
+            parent_thread_id: "parent-managed".to_owned(),
+            codex_agent_id: Some("child-managed".to_owned()),
+            workspace_scope_key: "c:/workspace".to_owned(),
+            task_scope_key: Some("task-managed".to_owned()),
+            state: "ACTIVE".to_owned(),
+            expires_at: "2099-01-01T00:00:00.000Z".to_owned(),
+            admission_tool_use_id: None,
+            admission_confirmed_at: Some("2026-10-14T00:00:00.000Z".to_owned()),
+        };
+        let identity = RuntimeIdentity {
+            agent_id: Some(lease.agent_id.clone()),
+            codex_agent_id: lease.codex_agent_id.clone(),
+            lease: Some(lease.clone()),
+            ..RuntimeIdentity::default()
+        };
+        assert_eq!(
+            validate_execution_lease(&connection, &identity, Some("C:/workspace")),
+            Ok(())
+        );
+
+        let unconfirmed = RuntimeIdentity {
+            lease: Some(RuntimeLease {
+                admission_confirmed_at: None,
+                ..lease
+            }),
+            ..identity
+        };
+        assert_eq!(
+            validate_execution_lease(&connection, &unconfirmed, Some("C:/workspace"))
+                .map_err(|error| error.0),
+            Err("DELEGATION_ADMISSION_MISSING")
+        );
     }
 
     #[test]

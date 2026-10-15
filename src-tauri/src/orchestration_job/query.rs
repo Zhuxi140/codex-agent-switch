@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use super::OrchestrationJobService;
 use crate::orchestration_contract::OrchestrationError;
+use crate::runtime_adapter::parse_task_result;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +61,8 @@ pub(crate) struct OrchestrationAttemptTracking {
     pub(crate) receipt_stage: Option<String>,
     pub(crate) review_decision: Option<String>,
     pub(crate) total_tokens: Option<i64>,
+    pub(crate) task_result: Option<String>,
+    pub(crate) task_result_text: Option<String>,
     pub(crate) updated_at: String,
 }
 
@@ -188,7 +191,15 @@ fn load_attempt_tracking(
                      ORDER BY rv.created_at DESC
                      LIMIT 1),
                     (SELECT i.total_tokens FROM agent_thread_instances i
-                     WHERE i.id = a.thread_instance_id)
+                     WHERE i.id = a.thread_instance_id),
+                    (SELECT e.raw_event FROM runtime_receipt_events e
+                     JOIN agent_thread_instances result_instance
+                       ON result_instance.id = a.thread_instance_id
+                     WHERE e.event_type = 'TURN_FINISHED'
+                       AND e.codex_thread_id = result_instance.codex_thread_id
+                       AND (a.codex_turn_id IS NULL OR e.codex_turn_id = a.codex_turn_id)
+                     ORDER BY e.observed_at DESC, e.event_id DESC
+                     LIMIT 1)
              FROM job_attempts a
              WHERE a.job_id = ?1
              ORDER BY a.attempt_no ASC",
@@ -196,6 +207,8 @@ fn load_attempt_tracking(
         .map_err(|_| super::persistence_error())?;
     let attempts = statement
         .query_map([job_id], |row| {
+            let raw_event = row.get::<_, Option<String>>(13)?;
+            let task_result = raw_event.as_deref().and_then(parse_task_result);
             Ok(OrchestrationAttemptTracking {
                 attempt_id: row.get(0)?,
                 attempt_no: row.get(1)?,
@@ -210,6 +223,11 @@ fn load_attempt_tracking(
                 receipt_stage: row.get(10)?,
                 review_decision: row.get(11)?,
                 total_tokens: row.get(12)?,
+                task_result: task_result
+                    .as_ref()
+                    .and_then(|result| result.outcome)
+                    .map(|outcome| outcome.as_str().to_owned()),
+                task_result_text: task_result.map(|result| result.final_response),
             })
         })
         .map_err(|_| super::persistence_error())?
@@ -310,6 +328,35 @@ mod tests {
         insert_job(&connection, "job-a", "2026-09-11T10:00:00.000Z", "agent-1");
         insert_job(&connection, "job-b", "2026-09-11T10:01:00.000Z", "agent-1");
         insert_job(&connection, "job-c", "2026-09-11T10:01:00.000Z", "agent-1");
+        connection
+            .execute_batch(
+                r#"INSERT INTO agent_thread_instances (
+                     id, agent_id, agent_name_snapshot, codex_thread_id, parent_thread_id,
+                     scope_key, status, created_at, last_used_at, last_observed_at,
+                     task_scope_key, reuse_state, execution_kind
+                   ) VALUES (
+                     'instance-result', 'agent-1', 'Executor', 'thread-result', 'parent-1',
+                     'c:/workspace', 'IDLE', '2026-09-11T10:01:00.000Z',
+                     '2026-09-11T10:01:00.000Z', '2026-09-11T10:01:00.000Z',
+                     'task-1', 'ACTIVE', 'MANAGED_WORKER'
+                   );
+                   UPDATE job_attempts
+                   SET thread_instance_id='instance-result',
+                       execution_kind='MANAGED_WORKER',
+                       codex_turn_id='turn-result'
+                   WHERE job_id='job-b';
+                   INSERT INTO runtime_receipt_events (
+                     event_id, event_key, event_type, raw_event, schema_profile,
+                     codex_thread_id, codex_turn_id, successful, observed_at, processed_at
+                   ) VALUES (
+                     'event-result', 'TURN_FINISHED:thread-result:turn-result:true',
+                     'TURN_FINISHED',
+                     '{"method":"turn/completed","params":{"threadId":"thread-result","turn":{"id":"turn-result","status":"completed","items":[{"type":"agentMessage","phase":"final_answer","text":"RESULT: DONE\n\nVERIFIED: query"}]}}}',
+                     'MODERN', 'thread-result', 'turn-result', 1,
+                     '2026-09-11T10:01:00.000Z', '2026-09-11T10:01:00.000Z'
+                   );"#,
+            )
+            .unwrap();
         drop(connection);
 
         let first = service
@@ -351,5 +398,10 @@ mod tests {
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].state, "SUCCEEDED");
         assert_eq!(attempts[0].route_action, "SPAWN");
+        assert_eq!(attempts[0].task_result.as_deref(), Some("DONE"));
+        assert_eq!(
+            attempts[0].task_result_text.as_deref(),
+            Some("RESULT: DONE\n\nVERIFIED: query")
+        );
     }
 }

@@ -51,6 +51,9 @@ use model::{
     ModelGetRequest, ModelListRequest, ModelService, ModelSetEnabledRequest, ModelSummary,
     ModelTestConnectionRequest, ModelUpdateRequest,
 };
+use native_control::{
+    NativeAssessmentDraft, NativeAssessmentResult, NativeControlError, assess_native_draft,
+};
 use orchestration_job::{
     OrchestrationJobCreateRequest, OrchestrationJobCreateResponse, OrchestrationJobDetailResponse,
     OrchestrationJobGetRequest, OrchestrationJobListRequest, OrchestrationJobPageResponse,
@@ -82,6 +85,8 @@ use usage::{
 };
 
 const PROJECT_MONITOR_WINDOW_LABEL: &str = "project-monitor";
+
+struct AppDatabasePath(std::path::PathBuf);
 
 #[derive(Default)]
 struct NativeObserverService {
@@ -746,6 +751,14 @@ fn agent_thread_instance_recommend(
 }
 
 #[tauri::command]
+fn agent_thread_instance_inspect(
+    state: tauri::State<'_, UsageService>,
+    request: AgentThreadInstanceRecommendRequest,
+) -> Result<AgentThreadInstanceRecommendation, ApiError> {
+    state.inspect_agent_instance(request)
+}
+
+#[tauri::command]
 fn agent_schedule_decision_list(
     state: tauri::State<'_, UsageService>,
     request: AgentScheduleDecisionListRequest,
@@ -914,6 +927,27 @@ fn orchestration_diagnostics_export(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DelegationAssessmentRequest {
+    agent_key: String,
+    workspace_scope_key: String,
+    facts: NativeAssessmentDraft,
+}
+
+#[tauri::command]
+fn delegation_assess(
+    database: tauri::State<'_, AppDatabasePath>,
+    request: DelegationAssessmentRequest,
+) -> Result<NativeAssessmentResult, NativeControlError> {
+    assess_native_draft(
+        &database.0,
+        &request.agent_key,
+        &request.workspace_scope_key,
+        request.facts,
+    )
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -926,6 +960,7 @@ pub fn run() {
             )?;
             let database_path = data_home.join("cas.db");
             eprintln!("CAS 数据文件：{}", database_path.display());
+            app.manage(AppDatabasePath(database_path.clone()));
             app.manage(ProviderService::open(&database_path)?);
             chat_gateway::start(database_path.clone())?;
             app.manage(ModelService::open(&database_path)?);
@@ -1005,6 +1040,7 @@ pub fn run() {
             agent_thread_instance_set_reuse_state,
             agent_thread_instance_cleanup,
             agent_thread_instance_recommend,
+            agent_thread_instance_inspect,
             agent_thread_instance_execute,
             usage_monitor_start,
             usage_monitor_stop,
@@ -1020,7 +1056,8 @@ pub fn run() {
             orchestration_job_review,
             orchestration_diagnostics_export,
             orchestration_reviewer_create,
-            orchestration_reviewer_report_submit
+            orchestration_reviewer_report_submit,
+            delegation_assess
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Codex Agent Switch");

@@ -418,6 +418,21 @@ impl UsageService {
         &self,
         request: AgentThreadInstanceRecommendRequest,
     ) -> Result<AgentThreadInstanceRecommendation, ApiError> {
+        self.recommend_agent_instance_with_audit(request, true)
+    }
+
+    pub(crate) fn inspect_agent_instance(
+        &self,
+        request: AgentThreadInstanceRecommendRequest,
+    ) -> Result<AgentThreadInstanceRecommendation, ApiError> {
+        self.recommend_agent_instance_with_audit(request, false)
+    }
+
+    fn recommend_agent_instance_with_audit(
+        &self,
+        request: AgentThreadInstanceRecommendRequest,
+        record_audit: bool,
+    ) -> Result<AgentThreadInstanceRecommendation, ApiError> {
         let agent_id = validate_runtime_key(&request.agent_id, "agentId")?;
         let scope_key = normalize_workspace_scope_key(&request.workspace_scope_key)?;
         let parent_thread_id = request
@@ -439,16 +454,18 @@ impl UsageService {
             task_scope_key.as_deref(),
         )?;
         let recommendation = recommend_instance(scope_key.clone(), candidates, profile.clone());
-        repository.record_schedule_decision(
-            "DESKTOP_PREVIEW",
-            Some(&agent_id),
-            &scope_key,
-            parent_thread_id.as_deref(),
-            &recommendation,
-            profile.runtime_fingerprint.as_deref(),
-            recommendation.reason_code == "THREAD_CLAIMED",
-            task_scope_key.as_deref(),
-        )?;
+        if record_audit {
+            repository.record_schedule_decision(
+                "DESKTOP_PREVIEW",
+                Some(&agent_id),
+                &scope_key,
+                parent_thread_id.as_deref(),
+                &recommendation,
+                profile.runtime_fingerprint.as_deref(),
+                recommendation.reason_code == "THREAD_CLAIMED",
+                task_scope_key.as_deref(),
+            )?;
+        }
         Ok(recommendation)
     }
 
@@ -4014,7 +4031,23 @@ mod tests {
             )
             .unwrap();
 
-        // 预览决策也写入审计记录，但来源必须是 DESKTOP_PREVIEW。
+        let inspected = service
+            .inspect_agent_instance(AgentThreadInstanceRecommendRequest {
+                agent_id: "agent-1".to_owned(),
+                workspace_scope_key: "c:/workspace/project".to_owned(),
+                parent_thread_id: None,
+                task_scope_key: None,
+            })
+            .unwrap();
+        assert_eq!(inspected.decision, "REUSE");
+        assert!(
+            service
+                .list_schedule_decisions(AgentScheduleDecisionListRequest::default())
+                .unwrap()
+                .is_empty()
+        );
+
+        // 通用预览决策仍写入审计记录，但实验室的只读检查不会写入。
         service
             .recommend_agent_instance(AgentThreadInstanceRecommendRequest {
                 agent_id: "agent-1".to_owned(),

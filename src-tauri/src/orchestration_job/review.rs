@@ -12,6 +12,7 @@ use crate::orchestration_contract::{
     AttemptState, ExecutionKind, JobState, OrchestrationError, OrchestrationErrorCode,
     OrchestrationJob, ReceiptEvidenceSource, ReceiptStage, ReviewDecision, ReviewOutcome,
 };
+use crate::runtime_adapter::{TaskResult, TaskResultOutcome, parse_task_result};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -94,6 +95,21 @@ impl OrchestrationJobService {
             || execution.reuse_state != "HELD_FOR_REVIEW"
         {
             return Err(invariant_error(&request.job_id, &request.attempt_id));
+        }
+        if request.decision == ReviewOutcome::Approve {
+            let task_result = load_task_result(&transaction, &execution)?;
+            if task_result.as_ref().and_then(|result| result.outcome)
+                != Some(TaskResultOutcome::Done)
+            {
+                return Err(result_not_approvable(
+                    &request.job_id,
+                    &request.attempt_id,
+                    task_result
+                        .as_ref()
+                        .and_then(|result| result.outcome)
+                        .map(TaskResultOutcome::as_str),
+                ));
+            }
         }
 
         let now = timestamp(&transaction)?;
@@ -301,6 +317,27 @@ fn load_execution(
         )
         .optional()
         .map_err(|_| persistence_error())
+}
+
+fn load_task_result(
+    connection: &Connection,
+    execution: &ReviewExecution,
+) -> Result<Option<TaskResult>, OrchestrationError> {
+    let raw_event = connection
+        .query_row(
+            "SELECT raw_event
+             FROM runtime_receipt_events
+             WHERE event_type='TURN_FINISHED'
+               AND codex_thread_id=?1
+               AND (?2 IS NULL OR codex_turn_id=?2)
+             ORDER BY observed_at DESC, event_id DESC
+             LIMIT 1",
+            params![execution.codex_thread_id, execution.codex_turn_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| persistence_error())?;
+    Ok(raw_event.as_deref().and_then(parse_task_result))
 }
 
 fn release_execution(
@@ -511,6 +548,25 @@ fn result_not_observed(job_id: &str, attempt_id: &str) -> OrchestrationError {
     }
 }
 
+fn result_not_approvable(
+    job_id: &str,
+    attempt_id: &str,
+    outcome: Option<&str>,
+) -> OrchestrationError {
+    OrchestrationError {
+        code: OrchestrationErrorCode::ReviewRequired,
+        message: match outcome {
+            Some(outcome) => {
+                format!("Child 返回 RESULT: {outcome}，不能批准；请选择要求修订或拒绝。")
+            }
+            None => "Child 最终回复缺少有效 RESULT: DONE，不能批准。".to_owned(),
+        },
+        field_path: None,
+        job_id: Some(job_id.to_owned()),
+        attempt_id: Some(attempt_id.to_owned()),
+    }
+}
+
 fn review_conflict(job_id: &str, attempt_id: &str) -> OrchestrationError {
     OrchestrationError {
         code: OrchestrationErrorCode::ReviewDecisionConflict,
@@ -644,7 +700,15 @@ mod tests {
                     'receipt-3', 'job-1', 'attempt-1', 'RESULT_OBSERVED',
                     'MANAGED_WORKER', 'RUNTIME_EVENT', 'result-1', 'parent-1',
                     'thread-1', 'turn-1', 'MODERN', '{NOW}', '{NOW}'
-                  );"#,
+                   );
+                  INSERT INTO runtime_receipt_events (
+                     event_id, event_key, event_type, raw_event, schema_profile,
+                     codex_thread_id, codex_turn_id, successful, observed_at, processed_at
+                  ) VALUES (
+                     'event-1', 'TURN_FINISHED:thread-1:turn-1:true', 'TURN_FINISHED',
+                     '{{"method":"turn/completed","params":{{"threadId":"thread-1","turn":{{"id":"turn-1","status":"completed","items":[{{"type":"agentMessage","phase":"final_answer","text":"RESULT: DONE\n\nVERIFIED: pass"}}]}}}}}}',
+                     'MODERN', 'thread-1', 'turn-1', 1, '{NOW}', '{NOW}'
+                   );"#,
                 hash = "0".repeat(64)
             ))
             .unwrap();
@@ -719,6 +783,44 @@ mod tests {
             service.review(conflict).unwrap_err().code,
             OrchestrationErrorCode::ReviewDecisionConflict
         );
+    }
+
+    #[test]
+    fn approve_requires_done_task_result() {
+        let service = service_with_observed_result();
+        let raw_event = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": "RESULT: NEEDS_DECISION\n\nREMAINING: workspace missing"
+                    }]
+                }
+            }
+        })
+        .to_string();
+        service
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE runtime_receipt_events SET raw_event=?1 WHERE event_id='event-1'",
+                [raw_event],
+            )
+            .unwrap();
+
+        let error = service.review(request(ReviewOutcome::Approve)).unwrap_err();
+        assert_eq!(error.code, OrchestrationErrorCode::ReviewRequired);
+        assert_eq!(count(&service, "SELECT COUNT(*) FROM review_decisions"), 0);
+
+        let response = service
+            .review(request(ReviewOutcome::RevisionRequired))
+            .unwrap();
+        assert_eq!(response.job.state, JobState::RevisionRequired);
     }
 
     #[test]
