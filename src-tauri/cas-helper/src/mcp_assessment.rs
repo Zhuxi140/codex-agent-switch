@@ -142,7 +142,7 @@ fn runtime_hook_tool(database_path: &Path, params: Option<&Value>) -> Result<Val
 fn tool_definition() -> Value {
     json!({
         "name": TOOL_NAME,
-        "description": "只读评估一个有边界、可独立验收的委派候选。仅在明显可能受益时调用；结果是建议，不是分发许可。",
+        "description": "只读评估一个有边界、可独立验收的委派候选。PRIMARY 留给主 Agent，SUGGEST 请求用户确认，DELEGATE 允许主 Agent 按 CAS Runtime 协议自主委派。",
         "inputSchema": {
             "type": "object",
             "required": ["agent_key", "workspace_scope", "assessment"],
@@ -159,6 +159,11 @@ fn tool_definition() -> Value {
                         "acceptance_defined": {"type": "boolean"},
                         "independent": {"type": "boolean"},
                         "handoff_small": {"type": "boolean"},
+                        "profile": {
+                            "type": "string",
+                            "enum": ["CONSERVATIVE", "BALANCED", "AGGRESSIVE"],
+                            "description": "Primary 自主判断固定使用 CONSERVATIVE；其余档位供显式策略实验使用"
+                        },
                         "delegation_forbidden": {"type": "boolean"},
                         "estimated_minutes": {"type": "integer", "minimum": 0, "maximum": 65535},
                         "work_units": {"type": "integer", "minimum": 0, "maximum": 255},
@@ -304,7 +309,7 @@ mod tests {
         );
         assert_eq!(
             responses[2]["result"]["structuredContent"]["action"],
-            "SUGGEST"
+            "DELEGATE"
         );
         assert_eq!(responses[3]["result"]["isError"], true);
         let connection = Connection::open(&database_path).unwrap();
@@ -380,8 +385,8 @@ mod tests {
                 "task-qualified-as-two-units",
                 "executor",
                 json!({"work_units":2,"estimated_minutes":10}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "task-qualified-as-one-unit",
@@ -391,11 +396,18 @@ mod tests {
                 "ROLE_GATE_NOT_MET",
             ),
             (
+                "borderline-execution",
+                "executor",
+                json!({"work_units":1,"modules":2,"tests_defined":true,"estimated_minutes":10}),
+                "SUGGEST",
+                "CANDIDATE_RECOMMENDED",
+            ),
+            (
                 "large-execution",
                 "executor",
                 json!({"work_units":2,"modules":2,"tests_defined":true,"estimated_minutes":30}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "long-single-unit",
@@ -450,36 +462,36 @@ mod tests {
                 "discovery",
                 "discoverer",
                 json!({"call_chains":2,"estimated_minutes":20}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "discovery-at-benefit-threshold",
                 "discoverer",
                 json!({"call_chains":2,"estimated_minutes":15}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "high-risk-review",
                 "reviewer",
                 json!({"high_risk":true,"estimated_minutes":5}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "short-verification",
                 "verifier",
                 json!({"environments":2,"estimated_minutes":5}),
-                "PRIMARY",
-                "BENEFIT_NOT_PROVEN",
+                "SUGGEST",
+                "CANDIDATE_RECOMMENDED",
             ),
             (
                 "large-verification",
                 "verifier",
                 json!({"environments":2,"estimated_minutes":20}),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
             (
                 "disabled",
@@ -532,8 +544,8 @@ mod tests {
             (
                 "excluded-prefix-sibling",
                 format!("{excluded_scope}-sibling"),
-                "SUGGEST",
-                "CANDIDATE_RECOMMENDED",
+                "DELEGATE",
+                "AUTO_DELEGATION_APPROVED",
             ),
         ];
         let workspace_scope = std::env::temp_dir().to_string_lossy().into_owned();

@@ -261,15 +261,17 @@ fn score_assessment(phase: &str, draft: &NativeAssessmentDraft) -> NativeAssessm
         || draft.explicit_request;
     let score = u8::from(role_evidence) * 3 + u8::from(amortized) + 1;
     let threshold = profile_threshold(draft.profile);
-    let action = if score >= threshold && draft.explicit_request {
+    let action = if score >= threshold {
         "DELEGATE"
-    } else if score >= threshold {
+    } else if role_evidence && score.saturating_add(1) >= threshold {
         "SUGGEST"
     } else {
         "PRIMARY"
     };
-    let reason_code = if action == "DELEGATE" {
+    let reason_code = if action == "DELEGATE" && draft.explicit_request {
         "USER_REQUESTED"
+    } else if action == "DELEGATE" {
+        "AUTO_DELEGATION_APPROVED"
     } else if action == "SUGGEST" {
         "CANDIDATE_RECOMMENDED"
     } else if !role_evidence {
@@ -625,7 +627,7 @@ mod tests {
         let execution = score_assessment("EXECUTION", &draft(facts.clone()));
         assert_eq!(
             (execution.action, execution.score, execution.reason_code),
-            ("SUGGEST", 5, "CANDIDATE_RECOMMENDED")
+            ("DELEGATE", 5, "AUTO_DELEGATION_APPROVED")
         );
         facts["explicit_request"] = true.into();
         let requested = score_assessment("EXECUTION", &draft(facts.clone()));
@@ -651,19 +653,19 @@ mod tests {
         facts["high_risk"] = true.into();
         assert_eq!(
             score_assessment("REVIEW", &draft(facts.clone())).action,
-            "SUGGEST"
+            "DELEGATE"
         );
         facts["high_risk"] = false.into();
         facts["call_chains"] = 2.into();
         facts["estimated_minutes"] = 15.into();
         assert_eq!(
             score_assessment("DISCOVERY", &draft(facts.clone())).action,
-            "SUGGEST"
+            "DELEGATE"
         );
         facts["environments"] = 2.into();
         assert_eq!(
             score_assessment("VERIFICATION", &draft(facts)).action,
-            "SUGGEST"
+            "DELEGATE"
         );
     }
 
@@ -690,8 +692,19 @@ mod tests {
             (conservative.action, conservative.threshold),
             ("PRIMARY", 5)
         );
-        assert_eq!((balanced.action, balanced.threshold), ("SUGGEST", 5));
-        assert_eq!((aggressive.action, aggressive.threshold), ("SUGGEST", 4));
+        assert_eq!((balanced.action, balanced.threshold), ("DELEGATE", 5));
+        assert_eq!((aggressive.action, aggressive.threshold), ("DELEGATE", 4));
+
+        let borderline = score_assessment("EXECUTION", &draft("BALANCED", 0, 1, 2));
+        assert_eq!(
+            (
+                borderline.action,
+                borderline.score,
+                borderline.threshold,
+                borderline.reason_code
+            ),
+            ("SUGGEST", 4, 5, "CANDIDATE_RECOMMENDED")
+        );
     }
 
     #[test]
@@ -781,7 +794,7 @@ mod tests {
         let assess = |key| {
             assess_native_task(&database_path, key, &root.to_string_lossy(), payload).unwrap()
         };
-        assert_eq!(assess("executor").action, "SUGGEST");
+        assert_eq!(assess("executor").action, "DELEGATE");
         assert_eq!(assess("missing").action, "UNAVAILABLE");
         connection
             .execute(
@@ -909,7 +922,8 @@ mod tests {
             "assessment": {
                 "bounded": true, "acceptance_defined": true,
                 "independent": true, "handoff_small": true,
-                "work_units": 2
+                "work_units": 1, "modules": 2, "tests_defined": true,
+                "estimated_minutes": 10
             }
         });
         let mut schedule_prepared = false;
@@ -954,7 +968,7 @@ mod tests {
             "assessment": {
                 "bounded": true, "acceptance_defined": true,
                 "independent": true, "handoff_small": true,
-                "work_units": 2, "explicit_request": true
+                "work_units": 2
             }
         });
         let error = plan_native_task(
@@ -975,7 +989,7 @@ mod tests {
             "assessment": {
                 "bounded": true, "acceptance_defined": true,
                 "independent": true, "handoff_small": true,
-                "work_units": 2, "explicit_request": true
+                "work_units": 2
             },
             "task_packet": packet
         });
@@ -987,7 +1001,7 @@ mod tests {
             || Ok("parent-native".to_owned()),
         )
         .unwrap() else {
-            panic!("explicitly requested eligible plan should schedule a native child");
+            panic!("automatically approved plan should schedule a native child");
         };
         assert_eq!(schedule.action, "SPAWN");
         let attempt_id = schedule.attempt_id.unwrap();

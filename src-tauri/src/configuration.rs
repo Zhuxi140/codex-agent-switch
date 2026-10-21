@@ -57,6 +57,7 @@ const CONFIG_RELATIVE_PATH: &str = "config.toml";
 const GLOBAL_INSTRUCTIONS_PATH: &str = "AGENTS.md";
 const GLOBAL_OVERRIDE_INSTRUCTIONS_PATH: &str = "AGENTS.override.md";
 const ORCHESTRATION_RULES_RELATIVE_PATH: &str = "cas/CAS_ORCHESTRATION.md";
+const ORCHESTRATION_RUNTIME_RELATIVE_PATH: &str = "cas/CAS_DELEGATION_RUNTIME.md";
 const DELEGATION_SKILL_RELATIVE_PATH: &str = "skills/cas-delegate/SKILL.md";
 const DELEGATION_SKILL_POLICY_RELATIVE_PATH: &str = "skills/cas-delegate/agents/openai.yaml";
 const DELEGATION_SKILL: &str = include_str!("../bundled-skills/cas-delegate/SKILL.md");
@@ -557,6 +558,20 @@ impl ConfigurationService {
                     content
                         .replace("\r\n", "\n")
                         .starts_with("# CAS Runtime First 调用规则\n")
+                },
+                &mut changes,
+                &mut warnings,
+            )?;
+            include_orphan_file(
+                &codex_home,
+                ORCHESTRATION_RUNTIME_RELATIVE_PATH,
+                ORCHESTRATION_RULES_RESOURCE,
+                ORCHESTRATION_RUNTIME_RELATIVE_PATH,
+                "移除 CAS 委派执行协议",
+                |content| {
+                    content
+                        .replace("\r\n", "\n")
+                        .starts_with("# CAS Runtime First 委派执行协议\n")
                 },
                 &mut changes,
                 &mut warnings,
@@ -3009,10 +3024,10 @@ fn load_desired_resources(
                 serde_json::from_str::<OrchestrationBaseline>(&json)
                     .map_err(ConfigurationError::from)
             })?;
-        let protocol =
-            render_orchestration_instructions(&agents, failure_policy, helper_path, database_path);
         let rules_path = safe_join(codex_home, ORCHESTRATION_RULES_RELATIVE_PATH)?;
-        let rules_document = render_orchestration_rules_document(&protocol);
+        let runtime_path = safe_join(codex_home, ORCHESTRATION_RUNTIME_RELATIVE_PATH)?;
+        let gate = render_orchestration_gate(&agents, failure_policy, &runtime_path);
+        let rules_document = render_orchestration_rules_document(&gate);
         resources.push(DesiredResource {
             resource_type: ORCHESTRATION_RULES_RESOURCE.to_owned(),
             logical_key: ORCHESTRATION_RULES_RELATIVE_PATH.to_owned(),
@@ -3023,6 +3038,22 @@ fn load_desired_resources(
             summary: "配置 CAS Runtime First 按需调用规则".to_owned(),
             origin_entity_type: "RUNTIME".to_owned(),
             origin_entity_id: "cas-runtime-orchestration-rules".to_owned(),
+            provider: None,
+            session_catalog_path: None,
+        });
+        let runtime_protocol =
+            render_orchestration_instructions(&agents, failure_policy, helper_path, database_path);
+        let runtime_document = render_orchestration_runtime_document(&runtime_protocol);
+        resources.push(DesiredResource {
+            resource_type: ORCHESTRATION_RULES_RESOURCE.to_owned(),
+            logical_key: ORCHESTRATION_RUNTIME_RELATIVE_PATH.to_owned(),
+            relative_path: ORCHESTRATION_RUNTIME_RELATIVE_PATH.to_owned(),
+            target_path: runtime_path,
+            semantic: runtime_document.clone(),
+            content: Some(runtime_document),
+            summary: "配置 CAS 委派后的详细执行协议".to_owned(),
+            origin_entity_type: "RUNTIME".to_owned(),
+            origin_entity_id: "cas-runtime-delegation-protocol".to_owned(),
             provider: None,
             session_catalog_path: None,
         });
@@ -3226,6 +3257,37 @@ prefix_rule(\n\
     )
 }
 
+fn render_orchestration_gate(
+    agents: &[ActiveAgentProjectionRow],
+    failure_policy: OrchestrationFailurePolicy,
+    runtime_path: &Path,
+) -> String {
+    let active_agents = agents
+        .iter()
+        .map(|agent| {
+            format!(
+                "- `{}` phase=`{}`",
+                agent.agent_key,
+                agent.phase.as_deref().unwrap_or("UNCLASSIFIED")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "CAS Primary 委派门禁（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\
+当前失败策略：{}\n\n\
+- 仅约束 Primary/root；Child 不递归委派。用户或项目禁委派优先，`CAS:OFF` 时全部由 Primary 完成。\n\
+- 默认直接完成小任务。仅当任务有明确边界、独立验收、低交接成本，且可能达到角色门槛时，调用 CAS MCP `assess_delegation`；自主判断使用 `CONSERVATIVE`，不要为凑分扩大调查。\n\
+- `PRIMARY`/`UNAVAILABLE`：Primary 完成。`SUGGEST`：只向用户建议，得到明确同意后可用 `$cas-delegate`。`DELEGATE`：允许 Primary 自主委派；先读取 `{}`，再按同一评估事实创建 TaskPacket 并调用 Runtime。\n\
+- 角色门槛：DISCOVERY 多调用链/多模块；EXECUTION 至少两个独立工作单元，或跨模块且已有测试；REVIEW 高风险；VERIFICATION 跨环境/多阶段。普通检索、单点修复、单命令测试留给 Primary。\n\
+- `CAS:ON` 恢复保守自主评估，不代表跳过硬门禁。模型始终来自当前 Agent 绑定，不硬编码。\n\n\
+当前 Active Agent：\n\
+{active_agents}",
+        orchestration_failure_policy_value(failure_policy),
+        runtime_path.to_string_lossy(),
+    )
+}
+
 fn render_orchestration_instructions(
     agents: &[ActiveAgentProjectionRow],
     failure_policy: OrchestrationFailurePolicy,
@@ -3264,17 +3326,17 @@ fn render_orchestration_instructions(
         "CAS Primary 编排协议（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\
 当前失败策略：{failure_policy_label}\n\n\
 - 规则只约束 Primary/root；Child 不读本块、不递归委派。\n\
-- 默认由 Primary 完成；用户/项目禁委派优先。评分和优先级均不授权委派。\n\
-- 小任务直接做；仅有界、独立验收、低交接成本的候选调用 CAS MCP `assess_delegation`，只选 phase 匹配的 Active Agent。\n\
-- `CAS2|ASSESS|SUGGEST|5|5|<reason>|<phase>` 只建议、不调度；Primary 继续完成任务，禁创建 Job/Child 或改字段重试。用户明确要求本次委派时才使用 `$cas-delegate` Skill，提交 `explicit_request=true`；`CAS:ON`/评分不授权。模型由当前绑定决定，不硬编码型号。\n\
+- 默认由 Primary 完成；用户/项目禁委派优先。只有 MCP 返回 `DELEGATE` 或用户通过 `$cas-delegate` 明确委派时，才进入本协议。\n\
+- `PRIMARY`/`UNAVAILABLE` 留给 Primary；`SUGGEST` 只请求用户确认，禁创建 Job/Child 或改字段重试；`DELEGATE` 允许 Primary 自主进入 Runtime 调度，但评估本身不创建 Job。\n\
+- 自主判断固定使用 `CONSERVATIVE`；用户明确委派提交 `explicit_request=true`。模型由当前绑定决定，不硬编码型号。\n\
 - 角色门槛：DISCOVERY 两条调用链/三模块（文件行号证据）；EXECUTION 两个独立验收目标（共享实现算1）或跨模块且有测试；REVIEW 高风险或用户明确要求；VERIFICATION 跨环境/多阶段。普通检索、单点修复、单命令测试留 Primary。\n\
 - Child 继承权限；父任务必须使用 Auto 或 Workspace；Read Only 写前用 `/permissions`。\n\
-- 仅直输 `CAS:OFF`/`CAS:ON` 生效：OFF 由 Primary 负责，ON 恢复候选建议，不代表本次委派。\n\n\
+- 仅直输 `CAS:OFF`/`CAS:ON` 生效：OFF 由 Primary 负责，ON 恢复保守自主评估。\n\n\
 {active_agents}\n\n\
 CAS2\n\
 1. H=`\"{}\"`、D=`\"{}\"`、W=绝对 `cwd`；`workdir=\"{}\"`（禁用项目目录）；`sandbox_permissions=require_escalated`；Parent=`CODEX_THREAD_ID`。\n\
-2. 仅明确委派时提交 JSON：`{{\"assessment\":{{\"bounded\":true,\"acceptance_defined\":true,\"independent\":true,\"handoff_small\":true}},\"task_packet\":{{\"schema_version\":1,\"job_id\":\"...\",\"idempotency_key\":\"...\",\"task_scope_key\":\"...\",\"objective\":\"...\",\"allowed_scope\":[\"...\"],\"constraints\":[],\"success_criteria\":[\"...\"],\"allowed_tools\":[],\"permission_policy\":\"INHERIT\",\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\",\"context_references\":[],\"output_contract\":\"STANDARD_V1\",\"review_policy\":\"PRIMARY_REQUIRED\"}}}}`。assessment 按需填 `call_chains/modules/work_units/tests_defined/high_risk/environments/stages`；ID 稳定，task_scope_key=`[a-z0-9][a-z0-9_-]{{0,63}}`；Runtime 补身份，禁止猜 Scope。\n\
-3. PTY：`H job-plan D <agent-key> W`；`write_stdin` 发单行 JSON，禁管道/重定向/临时文件。ASSESS=PRIMARY/UNAVAILABLE：无 Job；SUGGEST：不调度；其余 `CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>|<thread>|<reason>|<job>|<attempt>` 依 Runtime 执行。评分非准入。\n\
+2. 收到 `DELEGATE` 或用户明确委派后提交 JSON：`{{\"assessment\":{{\"bounded\":true,\"acceptance_defined\":true,\"independent\":true,\"handoff_small\":true,\"profile\":\"CONSERVATIVE\"}},\"task_packet\":{{\"schema_version\":1,\"job_id\":\"...\",\"idempotency_key\":\"...\",\"task_scope_key\":\"...\",\"objective\":\"...\",\"allowed_scope\":[\"...\"],\"constraints\":[],\"success_criteria\":[\"...\"],\"allowed_tools\":[],\"permission_policy\":\"INHERIT\",\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\",\"context_references\":[],\"output_contract\":\"STANDARD_V1\",\"review_policy\":\"PRIMARY_REQUIRED\"}}}}`。assessment 必须沿用评估事实，按需填 `call_chains/modules/work_units/tests_defined/high_risk/environments/stages`；仅手动入口填 `explicit_request=true`。ID 稳定，task_scope_key=`[a-z0-9][a-z0-9_-]{{0,63}}`；Runtime 补身份，禁止猜 Scope。\n\
+3. PTY：`H job-plan D <agent-key> W`；`write_stdin` 发单行 JSON，禁管道/重定向/临时文件。ASSESS=PRIMARY/UNAVAILABLE：无 Job；SUGGEST：不调度；其余 `CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>|<thread>|<reason>|<job>|<attempt>` 依 Runtime 执行。最终准入仍以 job-plan 的 Runtime 判定为准。\n\
 4. SPAWN：使用 `agent_type=<name>`、`fork_turns=\"none\"` 和完整任务调 `spawn_agent`→bind；禁占位/补发；不得覆盖 `model` / `reasoning_effort`。REUSE=bind→`send_input(target=<child>,message=<任务>)`；缺搜 `multi_agent_v1.send_input`。bind=`H job-bind D <job-id> <attempt-id> <child-thread-id> W`；验 NATIVE_STATE_DB。bind 失败不算已委派；无 Job/Attempt 准入则 Hook 拒绝。\n\
 5. Child prompt 仅含 `GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`；`TOOLS` 只列名；不附对话、工具说明或控制协议。首行 `RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED`。同一任务同时只运行一个 Child；等待超时不等于失败。{write_rule}\n\
 6. Child 结束：`H job-observe D <job-id> <attempt-id> <child-thread-id> W`；只接受 `CAS2|RESULT_OBSERVED|<child>|RECOVERY_READ|<job>|<attempt>` 才 Review。\n\
@@ -3297,12 +3359,22 @@ fn render_orchestration_rules_document(instructions: &str) -> String {
     )
 }
 
+fn render_orchestration_runtime_document(instructions: &str) -> String {
+    format!(
+        "# CAS Runtime First 委派执行协议\n\n\
+> 仅在评估返回 `DELEGATE`，或用户通过 `$cas-delegate` 明确委派后读取。\n\
+> 状态以 Runtime/Hook/数据库为准。\n\
+> 不要把本文复制回 `AGENTS.md`、`config.toml` 或普通任务上下文。\n\n\
+{instructions}\n"
+    )
+}
+
 fn render_orchestration_bootstrap(rules_path: &Path) -> String {
     format!(
         "## CAS Primary delegation gate（{ORCHESTRATION_RUNTIME_CONTRACT}）\n\n\
 - 仅适用于 Primary/root；Child 忽略本入口并执行自身 Agent 配置，不递归委派同职责 Agent。\n\
-- 默认由 Primary 处理；优先级或耗时不单独触发委派。用户明确要求，或任务可能需要跨模块调查/有界实现、多阶段验证、高风险独立审查时，先读取 `{}` 的角色门槛再决定；单点修复、少量检索、单命令测试直接由 Primary 完成。用户/项目禁令优先。\n\
-- `CAS:OFF`/`CAS:ON` 是显式会话逃生口：OFF 由 Primary 负责，ON 恢复。\n\
+- 默认由 Primary 处理；优先级或耗时不单独触发委派。任务可能适合独立委派时读取 `{}`，按其短门禁调用 CAS MCP；返回 `DELEGATE` 时可自主委派。单点修复、少量检索、单命令测试直接由 Primary 完成。用户/项目禁令优先。\n\
+- `CAS:OFF`/`CAS:ON` 是显式会话逃生口：OFF 由 Primary 负责，ON 恢复保守自主评估。\n\
 - 本入口与规则文件都不是强制事实源；调度、准入、权限、租约和审计以 CAS Runtime、Hook 与数据库为准，且不替代 Codex 沙箱或用户审批。",
         rules_path.to_string_lossy()
     )
@@ -3894,7 +3966,10 @@ fn desired_resource_replaceable(resource: &DesiredResource) -> bool {
         || (resource.resource_type == EXEC_POLICY_RESOURCE
             && resource.relative_path == EXEC_POLICY_RELATIVE_PATH)
         || (resource.resource_type == ORCHESTRATION_RULES_RESOURCE
-            && resource.relative_path == ORCHESTRATION_RULES_RELATIVE_PATH)
+            && matches!(
+                resource.relative_path.as_str(),
+                ORCHESTRATION_RULES_RELATIVE_PATH | ORCHESTRATION_RUNTIME_RELATIVE_PATH
+            ))
 }
 
 fn managed_resource_replaceable(resource: &ManagedResource) -> bool {
@@ -4805,9 +4880,12 @@ fn managed_relative_path(resource: &ManagedResource) -> Option<String> {
             Some(EXEC_POLICY_RELATIVE_PATH.to_owned())
         }
         ORCHESTRATION_RULES_RESOURCE
-            if resource.logical_key == ORCHESTRATION_RULES_RELATIVE_PATH =>
+            if matches!(
+                resource.logical_key.as_str(),
+                ORCHESTRATION_RULES_RELATIVE_PATH | ORCHESTRATION_RUNTIME_RELATIVE_PATH
+            ) =>
         {
-            Some(ORCHESTRATION_RULES_RELATIVE_PATH.to_owned())
+            Some(resource.logical_key.clone())
         }
         GLOBAL_INSTRUCTIONS_RESOURCE
             if matches!(
@@ -4976,8 +5054,10 @@ fn validate_manifest_paths(manifest: &SnapshotManifest) -> Result<(), Configurat
             return Err(ConfigurationError::InvalidSnapshot);
         }
         if resource.resource_type == ORCHESTRATION_RULES_RESOURCE
-            && (resource.relative_path != ORCHESTRATION_RULES_RELATIVE_PATH
-                || resource.logical_key != ORCHESTRATION_RULES_RELATIVE_PATH)
+            && (!matches!(
+                resource.relative_path.as_str(),
+                ORCHESTRATION_RULES_RELATIVE_PATH | ORCHESTRATION_RUNTIME_RELATIVE_PATH
+            ) || resource.logical_key != resource.relative_path)
         {
             return Err(ConfigurationError::InvalidSnapshot);
         }
@@ -6470,7 +6550,7 @@ command = "user-hook"
             fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap(),
             config_before
         );
-        assert_eq!(managed_resource_count(&context.database), 11);
+        assert_eq!(managed_resource_count(&context.database), 12);
     }
 
     #[test]
@@ -6539,7 +6619,7 @@ command = "user-hook"
         );
         let global = fs::read_to_string(context.codex_home.join(GLOBAL_INSTRUCTIONS_PATH)).unwrap();
         assert!(global.contains("CAS Primary delegation gate"));
-        assert_eq!(managed_resource_count(&context.database), 11);
+        assert_eq!(managed_resource_count(&context.database), 12);
     }
 
     #[test]
@@ -6980,16 +7060,20 @@ command = "user-hook"
         assert!(!global.contains("H job-schedule"));
         let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
         let rules = fs::read_to_string(&rules_path).unwrap();
-        assert!(rules.contains("CAS Primary 编排协议（"));
-        assert!(rules.contains("默认由 Primary 完成"));
-        assert!(rules.contains("单点修复、单命令测试留 Primary"));
-        assert!(rules.contains("普通检索、单点修复、单命令测试留 Primary"));
-        assert!(rules.contains("单命令测试留 Primary"));
-        assert!(rules.contains("只选 phase 匹配的 Active Agent"));
-        assert!(rules.contains("同一任务同时只运行一个 Child"));
-        assert!(rules.contains("REVIEW 高风险或用户明确要求"));
+        let runtime_path = context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH);
+        let runtime = fs::read_to_string(&runtime_path).unwrap();
+        assert!(rules.contains("CAS Primary 委派门禁（"));
+        assert!(rules.contains("默认直接完成小任务"));
+        assert!(rules.contains("允许 Primary 自主委派"));
+        assert!(rules.contains(ORCHESTRATION_RUNTIME_RELATIVE_PATH));
+        assert!(!rules.contains("H job-plan"));
+        assert!(runtime.contains("CAS Primary 编排协议（"));
+        assert!(rules.contains("单点修复、单命令测试留给 Primary"));
+        assert!(runtime.contains("普通检索、单点修复、单命令测试留 Primary"));
+        assert!(runtime.contains("同一任务同时只运行一个 Child"));
+        assert!(runtime.contains("REVIEW 高风险或用户明确要求"));
         assert!(!rules.contains("30 分钟"));
-        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
+        assert!(runtime.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
 
         context
             .service
@@ -6999,6 +7083,7 @@ command = "user-hook"
             .unwrap();
         assert!(!global_path.exists());
         assert!(!rules_path.exists());
+        assert!(!runtime_path.exists());
     }
 
     #[test]
@@ -7065,11 +7150,17 @@ command = "user-hook"
         assert!(!active_global.contains("旧版完整 Primary 编排协议"));
         let rules =
             fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH)).unwrap();
-        assert!(rules.contains("CAS Primary 编排协议（"));
-        assert!(rules.contains("默认由 Primary 完成"));
-        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
-        assert!(rules.contains("send_input(target=<child>"));
-        assert!(rules.contains("禁占位/补发"));
+        let runtime =
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH))
+                .unwrap();
+        assert!(rules.contains("CAS Primary 委派门禁（"));
+        assert!(rules.contains("允许 Primary 自主委派"));
+        assert!(rules.contains(ORCHESTRATION_RUNTIME_RELATIVE_PATH));
+        assert!(!rules.contains("send_input(target=<child>"));
+        assert!(runtime.contains("CAS Primary 编排协议（"));
+        assert!(runtime.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
+        assert!(runtime.contains("send_input(target=<child>"));
+        assert!(runtime.contains("禁占位/补发"));
         let primary = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH))
             .unwrap()
             .parse::<DocumentMut>()
@@ -7228,10 +7319,16 @@ command = "user-hook"
         assert!(!active_global.contains("H job-schedule"));
         let rules_path = context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH);
         let rules = fs::read_to_string(&rules_path).unwrap();
-        assert!(rules.contains("CAS Primary 编排协议（"));
-        assert!(rules.contains("默认由 Primary 完成"));
-        assert!(rules.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
-        assert!(rules.contains("CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>"));
+        let runtime_path = context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH);
+        let runtime = fs::read_to_string(&runtime_path).unwrap();
+        assert!(rules.contains("CAS Primary 委派门禁（"));
+        assert!(rules.contains("允许 Primary 自主委派"));
+        assert!(rules.contains(ORCHESTRATION_RUNTIME_RELATIVE_PATH));
+        assert!(!rules.contains("H job-plan"));
+        assert!(!rules.contains(&context.database.to_string_lossy().to_string()));
+        assert!(runtime.contains("CAS Primary 编排协议（"));
+        assert!(runtime.contains("已选中委派的写入/外部变更交给 phase=EXECUTION"));
+        assert!(runtime.contains("CAS2|<REUSE/SPAWN/WAIT/BLOCK/EXISTING/UNCERTAIN>"));
         let exec_policy_path = context.codex_home.join(EXEC_POLICY_RELATIVE_PATH);
         assert_eq!(
             fs::read_to_string(&exec_policy_path).unwrap(),
@@ -7240,58 +7337,57 @@ command = "user-hook"
                 &context.database,
             )
         );
-        assert!(rules.contains("规则只约束 Primary/root"));
-        assert!(!rules.contains("model=`"));
-        assert!(!rules.contains("reasoning_effort=`"));
-        assert!(rules.contains("使用 `agent_type=<name>`"));
-        assert!(rules.contains("`fork_turns=\"none\"`"));
-        assert!(rules.contains("不得覆盖 `model` / `reasoning_effort`"));
-        assert!(rules.contains("Child prompt 仅含"));
-        assert!(rules.contains("`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`"));
-        assert!(rules.contains("`TOOLS` 只列名"));
-        assert!(rules.contains("不附对话、工具说明或控制协议"));
-        assert!(rules.contains("RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED"));
-        assert!(rules.contains("禁止未审查就追加"));
-        assert!(rules.contains("严禁 `close_agent`"));
-        assert!(rules.contains("成功保留 Thread"));
-        assert!(!rules.contains("CAS1|"));
-        assert!(rules.contains("CODEX_THREAD_ID"));
-        assert!(rules.contains("Primary 不读 Thread、Token、Cache"));
+        assert!(runtime.contains("规则只约束 Primary/root"));
+        assert!(!runtime.contains("model=`"));
+        assert!(!runtime.contains("reasoning_effort=`"));
+        assert!(runtime.contains("使用 `agent_type=<name>`"));
+        assert!(runtime.contains("`fork_turns=\"none\"`"));
+        assert!(runtime.contains("不得覆盖 `model` / `reasoning_effort`"));
+        assert!(runtime.contains("Child prompt 仅含"));
+        assert!(runtime.contains("`GOAL/DECISIONS/ALLOW/DENY/TOOLS/CWD/ACCEPT/STOP`"));
+        assert!(runtime.contains("`TOOLS` 只列名"));
+        assert!(runtime.contains("不附对话、工具说明或控制协议"));
+        assert!(runtime.contains("RESULT: DONE|NEEDS_DECISION|PARTIAL|BLOCKED"));
+        assert!(runtime.contains("禁止未审查就追加"));
+        assert!(runtime.contains("严禁 `close_agent`"));
+        assert!(runtime.contains("成功保留 Thread"));
+        assert!(!runtime.contains("CAS1|"));
+        assert!(runtime.contains("CODEX_THREAD_ID"));
+        assert!(runtime.contains("Primary 不读 Thread、Token、Cache"));
         let database_argument = format!("\"{}\"", context.database.to_string_lossy());
-        assert!(rules.contains(&format!("D=`{database_argument}`")));
-        assert!(rules.contains("H job-plan D <agent-key> W"));
-        assert!(!rules.contains("H job-assess D <agent-key> W"));
-        assert!(!rules.contains("H job-schedule D <agent-key> W"));
-        assert!(rules.contains("候选调用 CAS MCP `assess_delegation`"));
-        assert!(rules.contains("用户明确要求本次委派时才使用 `$cas-delegate` Skill"));
-        assert!(rules.contains("Primary 继续完成任务"));
-        assert!(rules.contains("`CAS2|ASSESS|SUGGEST|5|5|<reason>|<phase>` 只建议、不调度"));
-        assert!(rules.contains("模型由当前绑定决定，不硬编码型号"));
-        assert!(rules.contains("H job-bind D <job-id> <attempt-id> <child-thread-id> W"));
-        assert!(rules.contains("H job-observe D <job-id> <attempt-id> <child-thread-id> W"));
-        assert!(rules.contains("H job-review D <job-id> <attempt-id>"));
-        assert!(rules.contains("\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\""));
-        assert!(rules.contains("NATIVE_STATE_DB"));
-        assert!(rules.contains("RECOVERY_READ"));
-        assert!(rules.contains("至少两个不同非空证据"));
-        assert!(rules.contains("禁用项目目录"));
-        assert!(rules.contains(&format!(
+        assert!(runtime.contains(&format!("D=`{database_argument}`")));
+        assert!(runtime.contains("H job-plan D <agent-key> W"));
+        assert!(!runtime.contains("H job-assess D <agent-key> W"));
+        assert!(!runtime.contains("H job-schedule D <agent-key> W"));
+        assert!(rules.contains("调用 CAS MCP `assess_delegation`"));
+        assert!(rules.contains("`SUGGEST`：只向用户建议"));
+        assert!(rules.contains("`DELEGATE`：允许 Primary 自主委派"));
+        assert!(runtime.contains("模型由当前绑定决定，不硬编码型号"));
+        assert!(runtime.contains("H job-bind D <job-id> <attempt-id> <child-thread-id> W"));
+        assert!(runtime.contains("H job-observe D <job-id> <attempt-id> <child-thread-id> W"));
+        assert!(runtime.contains("H job-review D <job-id> <attempt-id>"));
+        assert!(runtime.contains("\"execution_kind_policy\":\"NATIVE_CHILD_REQUIRED\""));
+        assert!(runtime.contains("NATIVE_STATE_DB"));
+        assert!(runtime.contains("RECOVERY_READ"));
+        assert!(runtime.contains("至少两个不同非空证据"));
+        assert!(runtime.contains("禁用项目目录"));
+        assert!(runtime.contains(&format!(
             "workdir=\"{}\"",
             context.database.parent().unwrap().to_string_lossy()
         )));
-        assert!(rules.contains("bind 失败不算已委派"));
-        assert!(rules.contains("task_scope_key"));
-        assert!(rules.contains("禁止猜 Scope"));
-        assert!(rules.contains(ORCHESTRATION_RUNTIME_CONTRACT));
-        assert!(rules.contains("父任务必须使用 Auto 或 Workspace"));
-        assert!(rules.contains("sandbox_permissions=require_escalated"));
-        assert!(!rules.contains("显式传入 model"));
+        assert!(runtime.contains("bind 失败不算已委派"));
+        assert!(runtime.contains("task_scope_key"));
+        assert!(runtime.contains("禁止猜 Scope"));
+        assert!(runtime.contains(ORCHESTRATION_RUNTIME_CONTRACT));
+        assert!(runtime.contains("父任务必须使用 Auto 或 Workspace"));
+        assert!(runtime.contains("sandbox_permissions=require_escalated"));
+        assert!(!runtime.contains("显式传入 model"));
         // E-03 去侵入：Runtime 已证明的事实不再投影到提示词。
-        assert!(rules.contains("本协议只是调用提醒，不是强制来源"));
-        assert!(!rules.contains("排除（优先）"));
-        assert!(!rules.contains("multi_agent_version=v2"));
-        assert!(!rules.contains("encrypted_content"));
-        assert!(!rules.contains("无 `commandExecution`"));
+        assert!(runtime.contains("本协议只是调用提醒，不是强制来源"));
+        assert!(!runtime.contains("排除（优先）"));
+        assert!(!runtime.contains("multi_agent_version=v2"));
+        assert!(!runtime.contains("encrypted_content"));
+        assert!(!runtime.contains("无 `commandExecution`"));
         assert!(active_global.contains("不替代 Codex 沙箱或用户审批"));
         assert!(!active_global.contains("排除（优先）"));
 
@@ -7327,6 +7423,7 @@ command = "user-hook"
             "# 用户全局规则\n\n保留这段内容。\n"
         );
         assert!(!rules_path.exists());
+        assert!(!runtime_path.exists());
         assert!(!exec_policy_path.exists());
         assert!(
             !context
@@ -7490,6 +7587,11 @@ command = "user-hook"
         assert!(
             fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH))
                 .unwrap()
+                .contains("允许 Primary 自主委派")
+        );
+        assert!(
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH))
+                .unwrap()
                 .contains("已选中委派的写入/外部变更交给 phase=EXECUTION")
         );
         assert!(
@@ -7577,6 +7679,8 @@ command = "user-hook"
         let pointer = render_global_orchestration_pointer(&rules_path);
         assert!(pointer.chars().count() * 2 < bootstrap.chars().count());
         let strict = fs::read_to_string(&rules_path).unwrap();
+        let runtime_path = context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH);
+        let strict_runtime = fs::read_to_string(&runtime_path).unwrap();
         let helper_path = context.service.helper_path().unwrap();
         let dynamic_path_chars = helper_path.to_string_lossy().chars().count()
             + context.database.to_string_lossy().chars().count()
@@ -7586,21 +7690,33 @@ command = "user-hook"
                 .to_string_lossy()
                 .chars()
                 .count();
-        // 独立规则文件按需读取；包含四角色门槛，但限制固定协议膨胀。
-        let protocol_chars = strict.chars().count() - dynamic_path_chars;
+        // 短门禁不携带命令和数据库路径；详细协议仅在真正委派后读取。
         assert!(
-            protocol_chars <= 3_100 && strict.lines().count() <= 50,
-            "按需规则固定文本重新膨胀：{} chars / {} lines（含运行时路径共 {} chars）",
-            protocol_chars,
-            strict.lines().count(),
+            strict.chars().count() <= 1_200 && strict.lines().count() <= 20,
+            "短门禁重新膨胀：{} chars / {} lines",
             strict.chars().count(),
+            strict.lines().count(),
         );
-        assert!(strict.contains("当前失败策略：Strict Stop"));
-        assert!(strict.contains("失败后严禁 Primary 自行接管"));
-        assert!(strict.contains("无 Job/Attempt 准入则 Hook 拒绝"));
-        assert!(strict.contains("同一任务同时只运行一个 Child"));
-        assert!(strict.contains("等待超时不等于失败"));
-        assert!(strict.contains("排除、Agent 可用性、复用、并发、租约与恢复由 CAS Runtime"));
+        assert!(!strict.contains(&context.database.to_string_lossy().to_string()));
+        assert!(!strict.contains("H job-plan"));
+        let protocol_chars = strict_runtime.chars().count() - dynamic_path_chars;
+        assert!(
+            protocol_chars <= 3_400 && strict_runtime.lines().count() <= 55,
+            "详细协议固定文本重新膨胀：{} chars / {} lines（含运行时路径共 {} chars）",
+            protocol_chars,
+            strict_runtime.lines().count(),
+            strict_runtime.chars().count(),
+        );
+        assert!(strict.contains("当前失败策略：STRICT_STOP"));
+        assert!(strict.contains("允许 Primary 自主委派"));
+        assert!(strict.contains(ORCHESTRATION_RUNTIME_RELATIVE_PATH));
+        assert!(strict_runtime.contains("失败后严禁 Primary 自行接管"));
+        assert!(strict_runtime.contains("无 Job/Attempt 准入则 Hook 拒绝"));
+        assert!(strict_runtime.contains("同一任务同时只运行一个 Child"));
+        assert!(strict_runtime.contains("等待超时不等于失败"));
+        assert!(
+            strict_runtime.contains("排除、Agent 可用性、复用、并发、租约与恢复由 CAS Runtime")
+        );
 
         open_database(&context.database)
             .unwrap()
@@ -7632,11 +7748,13 @@ command = "user-hook"
             .unwrap();
         let fallback_bootstrap = fallback_config["developer_instructions"].as_str().unwrap();
         assert_eq!(fallback_bootstrap, bootstrap);
-        let fallback = fs::read_to_string(rules_path).unwrap();
-        assert!(fallback.contains("当前失败策略：Primary Fallback"));
-        assert!(fallback.contains("Primary 可以接管同一任务"));
-        assert!(fallback.contains("最终结果必须记录回退原因"));
-        assert!(fallback.contains("续接/replacement、spawn、bind、验证失败"));
+        let fallback_gate = fs::read_to_string(rules_path).unwrap();
+        let fallback_runtime = fs::read_to_string(runtime_path).unwrap();
+        assert!(fallback_gate.contains("当前失败策略：PRIMARY_FALLBACK"));
+        assert!(fallback_runtime.contains("当前失败策略：Primary Fallback"));
+        assert!(fallback_runtime.contains("Primary 可以接管同一任务"));
+        assert!(fallback_runtime.contains("最终结果必须记录回退原因"));
+        assert!(fallback_runtime.contains("续接/replacement、spawn、bind、验证失败"));
         assert_eq!(
             context.service.runtime_mode().unwrap().active_bindings[0].agent_id,
             executor_id
@@ -7744,7 +7862,7 @@ command = "user-hook"
         assert!(primary.contains("CAS:ON"));
         assert!(!primary.contains("/permissions"));
         assert!(
-            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RULES_RELATIVE_PATH))
+            fs::read_to_string(context.codex_home.join(ORCHESTRATION_RUNTIME_RELATIVE_PATH))
                 .unwrap()
                 .contains("/permissions")
         );

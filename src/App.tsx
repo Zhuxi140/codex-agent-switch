@@ -2629,9 +2629,9 @@ const delegationProfileCopy: Record<
   DelegationAssessmentProfile,
   { label: string; description: string }
 > = {
-  CONSERVATIVE: { label: "保守", description: "证据和收益都明确时才建议委派" },
+  CONSERVATIVE: { label: "保守", description: "仅在证据和收益都明确时自主委派" },
   BALANCED: { label: "均衡", description: "适合日常多步骤任务" },
-  AGGRESSIVE: { label: "积极", description: "更早建议，但仍保留全部硬门槛" },
+  AGGRESSIVE: { label: "积极", description: "更早自主委派，但仍保留全部硬门槛" },
 };
 
 const delegationPhaseLabels: Record<OrchestrationPhase, string> = {
@@ -2644,6 +2644,7 @@ const delegationPhaseLabels: Record<OrchestrationPhase, string> = {
 function delegationReasonLabel(reasonCode: string): string {
   return {
     AGENT_NOT_EXECUTABLE: "该阶段没有可执行的 Active Agent",
+    AUTO_DELEGATION_APPROVED: "已达到所选策略门槛，允许 Primary 自主委派",
     BENEFIT_NOT_PROVEN: "委派收益尚未达到所选策略门槛",
     CANDIDATE_RECOMMENDED: "任务边界与收益证据足以建议委派",
     HANDOFF_COST_HIGH: "交接成本过高，Primary 直接完成更合适",
@@ -2833,7 +2834,7 @@ function DelegationDecisionLab({
         workspaceScopeKey: draft.workspaceScopeKey.trim(),
         facts: facts(false),
       });
-      const recommendation = assessment.action === "SUGGEST"
+      const recommendation = ["SUGGEST", "DELEGATE"].includes(assessment.action)
         ? await inspectAgentThreadInstance(
           selectedAgent!.id,
           draft.workspaceScopeKey.trim(),
@@ -2850,8 +2851,12 @@ function DelegationDecisionLab({
 
   const execute = async () => {
     const validation = validate();
-    if (validation || !preview || preview.assessment.action !== "SUGGEST") {
-      setError(validation ?? "当前评估没有建议委派。");
+    if (
+      validation
+      || !preview
+      || !["SUGGEST", "DELEGATE"].includes(preview.assessment.action)
+    ) {
+      setError(validation ?? "当前评估不允许委派。");
       return;
     }
     if (!confirmed) {
@@ -2872,7 +2877,7 @@ function DelegationDecisionLab({
       const confirmedAssessment = await assessDelegation({
         agentKey: selectedAgent!.agentKey,
         workspaceScopeKey: draft.workspaceScopeKey.trim(),
-        facts: facts(true),
+        facts: facts(preview.assessment.action === "SUGGEST"),
       });
       if (confirmedAssessment.action !== "DELEGATE") {
         setPreview((current) => current
@@ -3158,7 +3163,16 @@ function DelegationDecisionLab({
               <dl className="delegation-summary">
                 <div><dt>策略</dt><dd>{delegationProfileCopy[preview.assessment.profile].label}</dd></div>
                 <div><dt>阶段</dt><dd>{delegationPhaseLabels[preview.assessment.phase as OrchestrationPhase] ?? preview.assessment.phase}</dd></div>
-                <div><dt>Primary 路线</dt><dd>当前会话直接完成</dd></div>
+                <div>
+                  <dt>Primary 路线</dt>
+                  <dd>
+                    {preview.assessment.action === "DELEGATE"
+                      ? "自主委派"
+                      : preview.assessment.action === "SUGGEST"
+                        ? "等待用户确认"
+                        : "当前会话直接完成"}
+                  </dd>
+                </div>
                 <div><dt>委派路线</dt><dd>{preview.recommendation?.decision ?? "不调度"}</dd></div>
                 <div><dt>推荐 Agent</dt><dd>{selectedAgent?.name ?? "—"}</dd></div>
                 <div><dt>模型</dt><dd>{selectedAgent?.model?.displayName ?? "—"}</dd></div>
@@ -3170,7 +3184,8 @@ function DelegationDecisionLab({
                   {preview.recommendation.message}
                 </p>
               )}
-              {preview.assessment.action === "SUGGEST" && (!execution || Boolean(tracking?.terminalAt)) && (
+              {["SUGGEST", "DELEGATE"].includes(preview.assessment.action)
+                && (!execution || Boolean(tracking?.terminalAt)) && (
                 <div className="delegation-confirm">
                   <label>
                     <input
@@ -3178,7 +3193,9 @@ function DelegationDecisionLab({
                       onChange={(event) => setConfirmed(event.target.checked)}
                       type="checkbox"
                     />
-                    我确认创建真实 Job 并启动子 Agent
+                    {preview.assessment.action === "DELEGATE"
+                      ? "自动准入已通过，确认现在创建真实 Job"
+                      : "我确认创建真实 Job 并启动子 Agent"}
                   </label>
                   <button
                     className="primary-button"

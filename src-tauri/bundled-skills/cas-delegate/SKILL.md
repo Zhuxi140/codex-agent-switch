@@ -5,7 +5,7 @@ description: 用户明确要求本次任务通过 CAS 委派子 Agent 时使用�
 
 # CAS 用户委派
 
-只处理用户本次明确提出的委派；`CAS:ON` 和评分建议不等于授权。`CAS:OFF` 或用户/项目禁委派时不分发。
+这是用户明确要求委派时的手动入口，不替代 Primary 的保守自主委派。`SUGGEST` 不等于授权；`CAS:OFF` 或用户/项目禁委派时不分发。
 
 1. 提取一个范围明确、可独立验收的子任务。缺少会改变范围的关键信息时先问用户。读取当前 CAS 编排规则，选匹配 phase 的 Active Agent；不猜模型。
 2. 用 `job-plan` 提交 `explicit_request=true` 和完整 TaskPacket。返回 `PRIMARY`、`UNAVAILABLE`、`BLOCK` 或 `UNCERTAIN` 时停止分发并说明原因；不得改写评估事实或直调 `job-schedule` 绕过门槛。
