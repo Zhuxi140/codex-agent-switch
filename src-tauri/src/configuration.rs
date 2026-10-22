@@ -2860,10 +2860,25 @@ fn load_desired_resources(
     let (catalog_resources, catalog_paths, catalog_models) =
         load_model_catalog_resources(connection, codex_home, &valid_agent_ids)?;
     resources.extend(catalog_resources);
-    match load_mixed_catalog_resources(codex_home, &catalog_models) {
-        Ok(mixed_resources) => {
-            resources.extend(mixed_resources);
-            warnings.push(DiagnosticIssue::warning(
+    let mixed_catalog_ready = if agents
+        .iter()
+        .any(|agent| agent.provider_preset_id.as_deref() != Some("codex-native"))
+    {
+        match load_mixed_catalog_resources(codex_home, &catalog_models) {
+            Ok(mixed_resources) => {
+                resources.extend(mixed_resources);
+                true
+            }
+            Err(issue) => {
+                blockers.push(issue);
+                false
+            }
+        }
+    } else {
+        true
+    };
+    if mixed_catalog_ready {
+        warnings.push(DiagnosticIssue::warning(
                 "SUBAGENT_RUNTIME_RESTART_REQUIRED",
                 if runtime_hooks_available {
                     "CAS 已配置 V1 明文委派、Workspace 权限与 Hook Guard。请完全退出并重启 Codex，再新建任务；首次加载 Hook 时请核对命令指向 cas-helper 后再确认信任。"
@@ -2871,8 +2886,6 @@ fn load_desired_resources(
                     "CAS 已配置 V1 明文委派与 Workspace 权限。请完全退出并重启 Codex，再新建任务；现有任务不会原地切换 Multi-Agent 版本或权限。"
                 },
             ));
-        }
-        Err(issue) => blockers.push(issue),
     }
 
     let mut projected_providers = HashSet::new();
@@ -2925,15 +2938,20 @@ fn load_desired_resources(
             });
         }
 
-        let Some(model_catalog_path) = catalog_paths.get(provider_entity_id) else {
-            blockers.push(DiagnosticIssue::error(
-                "MODEL_CATALOG_UNAVAILABLE",
-                format!(
-                    "Agent {} 缺少 Codex Runtime Model Catalog。",
-                    agent.agent_key
-                ),
-            ));
-            continue;
+        let model_catalog_path = if native_provider {
+            None
+        } else {
+            let Some(model_catalog_path) = catalog_paths.get(provider_entity_id) else {
+                blockers.push(DiagnosticIssue::error(
+                    "MODEL_CATALOG_UNAVAILABLE",
+                    format!(
+                        "Agent {} 缺少 Codex Runtime Model Catalog。",
+                        agent.agent_key
+                    ),
+                ));
+                continue;
+            };
+            Some(model_catalog_path.as_path())
         };
         let reasoning_effort = agent.effective_reasoning_effort.as_deref();
         let sandbox_mode = match agent.sandbox_policy.as_str() {
@@ -2992,7 +3010,7 @@ fn load_desired_resources(
             sandbox_mode,
             developer_instructions: &agent.instruction,
             orchestration_phase: agent.phase.as_deref(),
-            model_catalog_path: Some(model_catalog_path),
+            model_catalog_path,
             skill_paths: &skill_paths,
             disabled_mcp_server_ids: &agent.disabled_mcp_server_ids,
             mcp_tool_policies: &agent.mcp_tool_policies,
@@ -3408,7 +3426,7 @@ fn load_model_catalog_resources(
         .collect::<Vec<_>>()
         .join(",");
     let mut statement = connection.prepare(&format!(
-        "SELECT DISTINCT p.id, p.provider_key, m.id, m.model_id, m.display_name,
+        "SELECT DISTINCT p.id, p.provider_key, p.preset_id, m.id, m.model_id, m.display_name,
                 m.context_window, m.reasoning_supported, m.default_reasoning,
                 EXISTS(
                     SELECT 1 FROM model_capabilities c
@@ -3428,13 +3446,14 @@ fn load_model_catalog_resources(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, Option<i64>>(5)?,
-                row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, i64>(8)? != 0,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<i64>>(7)?.map(|value| value != 0),
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, i64>(9)? != 0,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -3444,6 +3463,7 @@ fn load_model_catalog_resources(
     for (
         provider_entity_id,
         provider_key,
+        provider_preset_id,
         model_entity_id,
         model_id,
         display_name,
@@ -3453,6 +3473,9 @@ fn load_model_catalog_resources(
         supports_parallel_tools,
     ) in rows
     {
+        if provider_preset_id.as_deref() == Some("codex-native") {
+            continue;
+        }
         let reasoning_efforts = load_model_reasoning_efforts(connection, &model_entity_id)?;
         let model = render_model_catalog_entry(
             &model_id,
@@ -3526,8 +3549,8 @@ fn load_mixed_catalog_resources(
 
     let mut models = Vec::new();
     let mut slugs = HashSet::new();
-    for mut model in upstream_models.iter().cloned() {
-        let object = model.as_object_mut().ok_or_else(|| {
+    for model in upstream_models.iter().cloned() {
+        let object = model.as_object().ok_or_else(|| {
             DiagnosticIssue::error(
                 "PRIMARY_MODEL_CATALOG_INVALID",
                 "Codex models_cache.json 包含无效 Model 条目。",
@@ -3543,12 +3566,6 @@ fn load_mixed_catalog_resources(
                 )
             })?
             .to_owned();
-        object.insert("multi_agent_version".to_owned(), "v1".into());
-        object.remove("tool_mode");
-        object.insert("shell_type".to_owned(), "shell_command".into());
-        object
-            .entry("supports_parallel_tool_calls".to_owned())
-            .or_insert_with(|| false.into());
         if slugs.insert(slug) {
             models.push(model);
         }
@@ -3560,6 +3577,17 @@ fn load_mixed_catalog_resources(
         if slugs.insert(slug.to_owned()) {
             models.push(model.clone());
         }
+    }
+
+    if let Some(primary_model) = load_selected_primary_model(codex_home)?
+        && !slugs.contains(&primary_model)
+    {
+        return Err(DiagnosticIssue::error(
+            "PRIMARY_MODEL_CATALOG_INCOMPLETE",
+            format!(
+                "Codex models_cache.json 不包含当前选定 Model {primary_model}，已阻止生成跨 Provider Catalog。请先在 Codex Desktop 刷新模型目录后重试。"
+            ),
+        ));
     }
 
     let relative_path = format!("cas/model-catalogs/{MIXED_CATALOG_KEY}.json");
@@ -3583,7 +3611,7 @@ fn load_mixed_catalog_resources(
             target_path: target_path.clone(),
             semantic,
             content: Some(content),
-            summary: "生成 Primary 与第三方 Subagent 共用的 V1 兼容 Catalog".to_owned(),
+            summary: "生成 Primary 与第三方 Subagent 共用的跨 Provider Catalog".to_owned(),
             origin_entity_type: "RUNTIME".to_owned(),
             origin_entity_id: MIXED_CATALOG_KEY.to_owned(),
             provider: None,
@@ -3596,13 +3624,42 @@ fn load_mixed_catalog_resources(
             target_path: codex_home.join(CONFIG_RELATIVE_PATH),
             semantic: session_semantic,
             content: None,
-            summary: "让 Primary Session 加载跨 Provider V1 兼容 Catalog".to_owned(),
+            summary: "让 Primary Session 加载跨 Provider Catalog".to_owned(),
             origin_entity_type: "RUNTIME".to_owned(),
             origin_entity_id: MIXED_CATALOG_KEY.to_owned(),
             provider: None,
             session_catalog_path: Some(target_path),
         },
     ])
+}
+
+fn load_selected_primary_model(codex_home: &Path) -> Result<Option<String>, DiagnosticIssue> {
+    let config_path = codex_home.join(CONFIG_RELATIVE_PATH);
+    let content = match fs::read_to_string(config_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(DiagnosticIssue::error(
+                "PRIMARY_MODEL_CONFIG_UNAVAILABLE",
+                "无法读取 Codex config.toml，不能安全生成跨 Provider Catalog。",
+            ));
+        }
+    };
+    let document = content.parse::<DocumentMut>().map_err(|_| {
+        DiagnosticIssue::error(
+            "PRIMARY_MODEL_CONFIG_INVALID",
+            "Codex config.toml 无法解析，不能安全生成跨 Provider Catalog。",
+        )
+    })?;
+    match document.get("model") {
+        Some(model) => model.as_str().map(str::to_owned).map(Some).ok_or_else(|| {
+            DiagnosticIssue::error(
+                "PRIMARY_MODEL_CONFIG_INVALID",
+                "Codex config.toml 的 model 不是字符串，不能安全生成跨 Provider Catalog。",
+            )
+        }),
+        None => Ok(None),
+    }
 }
 
 fn load_model_reasoning_efforts(
@@ -5750,9 +5807,14 @@ mod tests {
                     "models": [{
                         "slug": "gpt-5.6-sol",
                         "display_name": "GPT-5.6 Sol",
-                        "shell_type": "shell_command",
+                        "shell_type": "unified_exec",
                         "tool_mode": "code_mode_only",
-                        "multi_agent_version": "v2"
+                        "multi_agent_version": "v2",
+                        "supports_parallel_tool_calls": true,
+                        "supports_search_tool": true,
+                        "use_responses_lite": true,
+                        "web_search_tool_type": "text_and_image",
+                        "future_capability": { "mode": "enabled" }
                     }]
                 }))
                 .unwrap(),
@@ -6187,13 +6249,23 @@ command = "user-hook"
             serde_json::from_str(&fs::read_to_string(&mixed_catalog_path).unwrap()).unwrap();
         assert_eq!(mixed_catalog["models"].as_array().unwrap().len(), 2);
         assert_eq!(mixed_catalog["models"][0]["slug"], "gpt-5.6-sol");
-        assert_eq!(mixed_catalog["models"][0]["multi_agent_version"], "v1");
-        assert_eq!(mixed_catalog["models"][0]["shell_type"], "shell_command");
+        assert_eq!(mixed_catalog["models"][0]["multi_agent_version"], "v2");
+        assert_eq!(mixed_catalog["models"][0]["shell_type"], "unified_exec");
         assert_eq!(
             mixed_catalog["models"][0]["supports_parallel_tool_calls"],
-            false
+            true
         );
-        assert!(mixed_catalog["models"][0].get("tool_mode").is_none());
+        assert_eq!(mixed_catalog["models"][0]["tool_mode"], "code_mode_only");
+        assert_eq!(mixed_catalog["models"][0]["supports_search_tool"], true);
+        assert_eq!(mixed_catalog["models"][0]["use_responses_lite"], true);
+        assert_eq!(
+            mixed_catalog["models"][0]["web_search_tool_type"],
+            "text_and_image"
+        );
+        assert_eq!(
+            mixed_catalog["models"][0]["future_capability"]["mode"],
+            "enabled"
+        );
         assert_eq!(mixed_catalog["models"][1]["slug"], "deepseek-v4-flash");
 
         assert!(!context.service.preview_apply().unwrap().has_changes);
@@ -6333,7 +6405,13 @@ command = "user-hook"
 
     #[test]
     fn codex_native_agent_omits_provider_projection_and_credential() {
-        for model_id in ["gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna", "gpt-6-astra"] {
+        for model_id in [
+            "gpt-5.6-luna",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+        ] {
             let context = TestContext::new();
             let connection = open_database(&context.database).unwrap();
             connection
@@ -6356,6 +6434,7 @@ command = "user-hook"
                 )
                 .unwrap();
             drop(connection);
+            fs::remove_file(context.codex_home.join("models_cache.json")).unwrap();
 
             let preview = context.service.preview_apply().unwrap();
             assert!(preview.blockers.is_empty(), "{model_id}");
@@ -6366,7 +6445,8 @@ command = "user-hook"
                 })
                 .unwrap();
 
-            let config = fs::read_to_string(context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
+            let config =
+                read_optional_utf8(&context.codex_home.join(CONFIG_RELATIVE_PATH)).unwrap();
             let config = config.parse::<DocumentMut>().unwrap();
             assert!(config.get("model_providers").is_none());
             let agent = fs::read_to_string(context.codex_home.join("agents/cas-executor.toml"))
@@ -6376,6 +6456,20 @@ command = "user-hook"
             assert_eq!(agent["model"].as_str(), Some(model_id));
             assert_eq!(agent["model_reasoning_effort"].as_str(), Some("high"));
             assert!(agent.get("model_provider").is_none());
+            assert!(agent.get("model_catalog_json").is_none());
+            assert!(config.get("model_catalog_json").is_none());
+            assert!(
+                !context
+                    .codex_home
+                    .join("cas/model-catalogs/mixed-v1.json")
+                    .exists()
+            );
+            assert!(
+                !context
+                    .codex_home
+                    .join("cas/model-catalogs/codex-native.json")
+                    .exists()
+            );
         }
     }
 
@@ -6749,6 +6843,28 @@ command = "user-hook"
                 .blockers
                 .iter()
                 .any(|issue| issue.code == "PRIMARY_MODEL_CATALOG_UNAVAILABLE")
+        );
+    }
+
+    #[test]
+    fn stale_primary_catalog_blocks_cross_provider_apply() {
+        let context = TestContext::new();
+        fs::write(
+            context.codex_home.join(CONFIG_RELATIVE_PATH),
+            "model = \"gpt-6.1-sol\"\n",
+        )
+        .unwrap();
+
+        let preview = context.service.preview_apply().unwrap();
+        assert!(preview.blockers.iter().any(|issue| {
+            issue.code == "PRIMARY_MODEL_CATALOG_INCOMPLETE"
+                && issue.message.contains("gpt-6.1-sol")
+        }));
+        assert!(
+            !context
+                .codex_home
+                .join("cas/model-catalogs/mixed-v1.json")
+                .exists()
         );
     }
 
