@@ -8,7 +8,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cas_native_lifecycle::{
-    ThreadState as NativeThreadState, rollout_state, thread_state_from_rollout,
+    ThreadState as NativeThreadState, rollout_final_response, rollout_state,
+    thread_state_from_rollout,
 };
 use cas_scheduler::{
     Candidate, Profile, REUSE_CLAIM_TTL_SECONDS, Recommendation, SPAWN_RESERVATION_TTL_SECONDS,
@@ -2569,6 +2570,13 @@ fn job_observe(
         eprintln!("Native Child has no terminal result newer than Attempt dispatch.");
         return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
     }
+    let final_response = match rollout_final_response(Path::new(&record.rollout_path)) {
+        Ok(Some(value)) => value,
+        _ => {
+            eprintln!("Native Child terminal result has no final response.");
+            return ExitCode::from(EXIT_SCHEDULING_UNAVAILABLE);
+        }
+    };
     let evidence_ref = format!("native-result:{child_thread_id}:{}", record.updated_at);
     match native_control::observe_native_result(
         &database_path,
@@ -2578,6 +2586,10 @@ fn job_observe(
         &evidence_ref,
         "NATIVE_STATE_V1",
         reusable,
+        record.total_tokens,
+        state.and_then(|state| state.current_context_tokens),
+        state.and_then(|state| state.model_context_window),
+        &final_response,
     ) {
         Ok(()) => {
             println!("CAS2|RESULT_OBSERVED|{child_thread_id}|RECOVERY_READ|{job_id}|{attempt_id}");

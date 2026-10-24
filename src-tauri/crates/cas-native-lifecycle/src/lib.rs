@@ -84,6 +84,46 @@ pub fn rollout_state(rollout_path: &Path) -> io::Result<RolloutState> {
     }
 }
 
+/// 读取最近一次成功完成任务时 Codex 记录的最终回复。
+pub fn rollout_final_response(rollout_path: &Path) -> io::Result<Option<String>> {
+    let mut file = File::open(rollout_path)?;
+    let length = file.metadata()?.len();
+    let offset = length.saturating_sub(ROLLOUT_TAIL_BYTES);
+    file.seek(SeekFrom::Start(offset))?;
+
+    let mut reader = BufReader::new(file);
+    if offset > 0 {
+        let mut discarded = Vec::new();
+        reader.read_until(b'\n', &mut discarded)?;
+    }
+
+    let mut final_response = None;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(final_response);
+        }
+        let Some(value) = serde_json::from_slice::<Value>(&line).ok() else {
+            continue;
+        };
+        let payload = value.get("payload").and_then(Value::as_object);
+        if value.get("type").and_then(Value::as_str) == Some("event_msg")
+            && payload
+                .and_then(|payload| payload.get("type"))
+                .and_then(Value::as_str)
+                == Some("task_complete")
+        {
+            final_response = payload
+                .and_then(|payload| payload.get("last_agent_message"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message| !message.is_empty())
+                .map(str::to_owned);
+        }
+    }
+}
+
 fn lifecycle_event(value: &Value) -> Option<LifecycleEvent> {
     if value.get("type").and_then(Value::as_str) != Some("event_msg") {
         return None;
@@ -154,6 +194,25 @@ mod tests {
         fs::write(root.join("thread-writer-locks/thread-child.lock"), "").unwrap();
 
         assert_eq!(thread_state("open", &rollout), ThreadState::Idle);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn completed_task_exposes_its_last_agent_message() {
+        let root = temporary_directory("final-response");
+        fs::create_dir_all(&root).unwrap();
+        let rollout = root.join("rollout.jsonl");
+        fs::write(
+            &rollout,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"last_agent_message\":\"RESULT: DONE\\n\\nVERIFIED: native rollout\"}}\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            rollout_final_response(&rollout).unwrap().as_deref(),
+            Some("RESULT: DONE\n\nVERIFIED: native rollout")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -501,6 +501,10 @@ pub fn observe_native_result(
     evidence_ref: &str,
     schema_profile: &str,
     reusable: bool,
+    total_tokens: i64,
+    current_context_tokens: Option<i64>,
+    context_window: Option<i64>,
+    final_response: &str,
 ) -> Result<(), NativeControlError> {
     OrchestrationJobService::open(database_path)
         .map_err(|_| persistence_error())?
@@ -511,6 +515,10 @@ pub fn observe_native_result(
             evidence_ref: evidence_ref.to_owned(),
             schema_profile: schema_profile.to_owned(),
             reusable,
+            total_tokens,
+            current_context_tokens,
+            context_window,
+            final_response: final_response.to_owned(),
         })
         .map_err(NativeControlError::from)
 }
@@ -1052,39 +1060,12 @@ mod tests {
             "native-result:child-native:1",
             "NATIVE_STATE_V1",
             true,
+            12_345,
+            Some(50_000),
+            Some(258_400),
+            "RESULT: DONE\n\nVERIFIED: native chain",
         )
         .unwrap();
-        let raw_event = serde_json::json!({
-            "method": "turn/completed",
-            "params": {
-                "threadId": "child-native",
-                "turn": {
-                    "id": "native-result:child-native:1",
-                    "status": "completed",
-                    "items": [{
-                        "type": "agentMessage",
-                        "phase": "final_answer",
-                        "text": "RESULT: DONE\n\nVERIFIED: native chain"
-                    }]
-                }
-            }
-        })
-        .to_string();
-        open_database(&database_path)
-            .unwrap()
-            .execute(
-                "INSERT INTO runtime_receipt_events (
-                    event_id, event_key, event_type, raw_event, schema_profile,
-                    codex_thread_id, codex_turn_id, successful, observed_at, processed_at
-                 ) VALUES (
-                    'event-native-result',
-                    'TURN_FINISHED:child-native:native-result:child-native:1:true',
-                    'TURN_FINISHED', ?1, 'NATIVE_STATE_V1', 'child-native',
-                    'native-result:child-native:1', 1, ?2, ?2
-                 )",
-                params![raw_event, NOW],
-            )
-            .unwrap();
         let review = review_native_task(
             &database_path,
             "job-native-1",
@@ -1105,6 +1086,8 @@ mod tests {
             .query_row(
                 "SELECT job.state, attempt.state, attempt.execution_kind,
                         instance.execution_kind, instance.reuse_state,
+                         instance.total_tokens, instance.current_context_tokens,
+                         instance.context_window,
                         (SELECT COUNT(*) FROM delivery_receipts receipt
                          WHERE receipt.attempt_id=attempt.attempt_id),
                         (SELECT COUNT(*) FROM review_decisions review
@@ -1122,7 +1105,10 @@ mod tests {
                         row.get::<_, String>(3)?,
                         row.get::<_, String>(4)?,
                         row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 },
             )
@@ -1135,6 +1121,9 @@ mod tests {
                 "NATIVE_CHILD".to_owned(),
                 "NATIVE_CHILD".to_owned(),
                 "ACTIVE".to_owned(),
+                12_345,
+                Some(50_000),
+                Some(258_400),
                 4,
                 1,
             )

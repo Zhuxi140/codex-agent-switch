@@ -2620,7 +2620,7 @@ fn upsert_native_agent_instance(
             last_used_at = MAX(agent_thread_instances.last_used_at, excluded.last_used_at),
             last_observed_at = excluded.last_observed_at,
             closed_at = excluded.closed_at
-         WHERE agent_thread_instances.execution_kind = excluded.execution_kind
+         WHERE agent_thread_instances.execution_kind IN ('OBSERVED_EXTERNAL', 'NATIVE_CHILD')
            AND (
             agent_thread_instances.agent_id IS NOT excluded.agent_id
             OR agent_thread_instances.agent_name_snapshot IS NOT excluded.agent_name_snapshot
@@ -3478,6 +3478,37 @@ mod tests {
         // F-10：原生 threads.updated_at 语义未证明为模型请求时间，只能推进观察时间。
         assert_eq!(instances[0].last_model_usage_at, None);
         assert!(instances[0].last_observed_at.is_some());
+
+        {
+            let repository = service.repository().unwrap();
+            repository
+                .connection
+                .execute(
+                    "UPDATE agent_thread_instances
+                     SET execution_kind = 'NATIVE_CHILD'
+                     WHERE codex_thread_id = 'thread-child-native'",
+                    [],
+                )
+                .unwrap();
+        }
+        let source = Connection::open(&source_path).unwrap();
+        source
+            .execute(
+                "UPDATE threads SET tokens_used = 23456, updated_at = 1786600400
+                 WHERE id = 'thread-child-native'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        service.sync_native_subagents(&root).unwrap();
+        let rebound = service
+            .list_agent_instances(AgentThreadInstanceListRequest::default())
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(rebound.execution_kind, ExecutionKind::NativeChild);
+        assert_eq!(rebound.total_tokens, 23456);
+
         let second_rollout = root.join("rollout-second.jsonl");
         fs::copy(root.join("rollout.jsonl"), &second_rollout).unwrap();
         let source = Connection::open(&source_path).unwrap();

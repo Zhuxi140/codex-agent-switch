@@ -25,6 +25,10 @@ pub(crate) struct NativeResultEvidence {
     pub(crate) evidence_ref: String,
     pub(crate) schema_profile: String,
     pub(crate) reusable: bool,
+    pub(crate) total_tokens: i64,
+    pub(crate) current_context_tokens: Option<i64>,
+    pub(crate) context_window: Option<i64>,
+    pub(crate) final_response: String,
 }
 
 struct NativeIdentity {
@@ -217,6 +221,86 @@ impl OrchestrationJobService {
                 &evidence.job_id,
                 &evidence.attempt_id,
             ));
+        }
+        let final_response = evidence.final_response.trim();
+        if final_response.is_empty() {
+            return Err(OrchestrationError {
+                code: OrchestrationErrorCode::TaskPacketFieldInvalid,
+                message: "Native Child 最终回复不能为空。".to_owned(),
+                field_path: Some("final_response".to_owned()),
+                job_id: Some(evidence.job_id.clone()),
+                attempt_id: Some(evidence.attempt_id.clone()),
+            });
+        }
+        if evidence.total_tokens < 0
+            || evidence
+                .current_context_tokens
+                .is_some_and(|tokens| tokens < 0)
+            || evidence.context_window.is_some_and(|window| window <= 0)
+        {
+            return Err(OrchestrationError {
+                code: OrchestrationErrorCode::TaskPacketFieldInvalid,
+                message: "Native Child Token 证据无效。".to_owned(),
+                field_path: Some("native_usage".to_owned()),
+                job_id: Some(evidence.job_id.clone()),
+                attempt_id: Some(evidence.attempt_id.clone()),
+            });
+        }
+        let raw_event = serde_json::json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": evidence.child_thread_id,
+                "turn": {
+                    "status": "completed",
+                    "items": [{
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": final_response
+                    }]
+                }
+            }
+        })
+        .to_string();
+        transaction
+            .execute(
+                "INSERT INTO runtime_receipt_events (
+                    event_id, event_key, event_type, raw_event, schema_profile,
+                    parent_thread_id, codex_thread_id, codex_turn_id,
+                    successful, observed_at, processed_at
+                 ) VALUES (?1, ?2, 'TURN_FINISHED', ?3, ?4, ?5, ?6, NULL, 1, ?7, ?7)
+                 ON CONFLICT(event_key) DO NOTHING",
+                params![
+                    format!("native-result-event:{}", evidence.attempt_id),
+                    format!(
+                        "NATIVE_RESULT:{}:{}",
+                        evidence.attempt_id, evidence.child_thread_id
+                    ),
+                    raw_event,
+                    evidence.schema_profile,
+                    identity.parent_thread_id,
+                    evidence.child_thread_id,
+                    now,
+                ],
+            )
+            .map_err(|_| persistence_error())?;
+        let changed = transaction
+            .execute(
+                "UPDATE agent_thread_instances
+                 SET total_tokens=MAX(total_tokens,?2),
+                     current_context_tokens=?3, context_window=?4,
+                     last_observed_at=?5
+                 WHERE id=?1 AND execution_kind='NATIVE_CHILD'",
+                params![
+                    identity.instance_id,
+                    evidence.total_tokens,
+                    evidence.current_context_tokens,
+                    evidence.context_window,
+                    now,
+                ],
+            )
+            .map_err(|_| persistence_error())?;
+        if changed != 1 {
+            return Err(invariant_error(&evidence.job_id, &evidence.attempt_id));
         }
 
         if matches!(identity.attempt_state.as_str(), "ACCEPTED" | "RUNNING")
